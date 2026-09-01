@@ -1,7 +1,21 @@
 /** Shared reporting for experiments. Each experiment is a falsification attempt against a claim. */
 import { JsonRpcProvider, Network, Wallet } from "ethers";
 import { Rpc, Receipt, waitFor } from "../src/client.js";
-import { RPC_A, RPC_B, CHAIN_ID, COW_KEY } from "../src/config.js";
+import { RPC_A, RPC_B, CHAIN_ID, COW_KEY, SETTLEMENT_ADDR } from "../src/config.js";
+
+/** Guard for m3 settlement experiments: the settlement contract must be genesis-deployed. */
+export async function requireSettlement(rpc: Rpc): Promise<void> {
+  const code = await rpc.getCode(SETTLEMENT_ADDR).catch(() => "0x");
+  if (!code || code === "0x") {
+    console.error(
+      `\nSettlement contract not deployed at ${SETTLEMENT_ADDR}.\n` +
+      `The m3 genesis adds it, but genesis only applies to a FRESH chain — your node is on a persisted DB.\n` +
+      `Recreate with wiped volumes:\n` +
+      `  docker-compose -f stack/podman-compose.yml down -v && docker-compose -f stack/podman-compose.yml up -d\n`
+    );
+    process.exit(2);
+  }
+}
 
 export const rpcA = new Rpc(RPC_A);
 export const rpcB = new Rpc(RPC_B);

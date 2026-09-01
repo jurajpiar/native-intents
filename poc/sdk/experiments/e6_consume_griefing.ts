@@ -14,9 +14,8 @@
  */
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
 import { Solver } from "../src/solver.js";
-import { Report, preflight, rpcA, waitReceipt, fundAccount } from "./_harness.js";
-// rskj reports a throwing precompile as status=0x1, so we judge success/failure by EFFECTS
-// (was H consumed? was the user paid?), not by receipt status.
+import { Report, preflight, requireSettlement, rpcA, waitReceipt, succeeded, reverted, fundAccount } from "./_harness.js";
+// m3: settlement is a VM contract, so a failed grief reverts visibly (status 0x0) AND has no effect.
 import { cowWallet } from "../src/config.js";
 
 const MINOUT = 1_000_000_000_000_000n; // 1e15 wei
@@ -24,6 +23,7 @@ const GAS_MONEY = 1_000_000_000_000n;  // 1e12 wei — covers gas, far below min
 
 async function main(): Promise<number> {
   await preflight(rpcA);
+  await requireSettlement(rpcA);
   const r = new Report("E6 consume-griefing closed", "m2: consumption requires delivery; a failed solve leaves H intact");
 
   if (!r.check("honest solver payer (cow) funded", BigInt(await rpcA.getBalance(cowWallet().address)) > MINOUT)) return r.done();
@@ -40,15 +40,17 @@ async function main(): Promise<number> {
   await waitReceipt(rpcA, await fundAccount(adversary.address, GAS_MONEY));
   r.check("adversary funded below minOut", BigInt(await rpcA.getBalance(adversary.address)) < MINOUT);
 
+  // grief: try to consume H while delivering nothing (attach 0 < minOut)
   const adversarySolver = new Solver(rpcA.url, adversary.privateKey);
-  await waitReceipt(rpcA, await adversarySolver.solve(intent.rawHex));
-  // grief failed iff it had no effect: H untouched and the user unpaid
+  const griefRec = await waitReceipt(rpcA, await adversarySolver.solve(intent.rawHex, 0n));
+  r.check("grief solve reverted (under minOut)", reverted(griefRec));
   r.check("H still unconsumed after grief attempt", !(await isConsumed((to, d) => rpcA.ethCall(to, d), H)));
   r.check("user not paid by the grief attempt", BigInt(await rpcA.getBalance(user.address)) === 0n);
 
-  // honest solver can still serve the intent
+  // honest solver can still serve the intent (delivers minOut)
   const honest = new Solver(rpcA.url);
-  await waitReceipt(rpcA, await honest.solve(intent.rawHex));
+  const okRec = await waitReceipt(rpcA, await honest.solve(intent.rawHex, MINOUT));
+  r.check("honest solve succeeded", succeeded(okRec));
   r.check("user now paid >= minOut", BigInt(await rpcA.getBalance(user.address)) >= MINOUT);
   r.check("H now consumed", await isConsumed((to, d) => rpcA.ethCall(to, d), H));
 

@@ -30,6 +30,8 @@ The rest of the suite probes the design's own admitted soft spots (the pressure 
 | E8 | Anti-spam (negative) | Without a confirmed BTC peg-in ticket, an intent is rejected | it is accepted with a bogus btcTxid | 1 node, ticket **on** |
 | E8+ | Anti-spam (positive) | An intent referencing a real processed peg-in is admitted | the valid-ticket intent is rejected | ticket **on** + `npm run pegin` |
 | E9 | Reorg | A reorg that drops the solve reverts H + delivery; the intent is re-solvable | H stays consumed, delivery kept, or not re-solvable | 1 node (evm_snapshot/revert) |
+| E10 | Token output (m3) | Settlement delivers an ERC-20 output to the user and consumes H | user isn't credited the token, or H consumed without delivery | 1 node, ticket off |
+| E11 | Visible revert (m3) | A failed solve reverts visibly (status 0x0) and leaves H intact | it reports success, consumes H, or pays the user | 1 node, ticket off |
 
 ## Status (2026-09-01)
 
@@ -45,9 +47,10 @@ E6 changed meaning in m2. In milestone 1 it demonstrated the griefing hole (cons
 delivery). Milestone 2's atomic solve closes it: E6 now passes when the grief *fails* — an
 under-delivering solve has no effect and H stays intact, so the honest solver can still serve the intent.
 
-The m2 experiments judge success by state effects (was the user paid? is H consumed?), not by receipt
-status: in the current rskj executor a throwing precompile still reports status 0x1 (see the RSKIP
-implementation notes), so `solve` writes only after all checks pass and a failed solve is a clean no-op.
+Milestone 3 moved settlement into a VM contract (`Settlement.sol`, genesis-deployed): it delivers RBTC
+or ERC-20 output and records H, and — because it runs in the VM — a failed solve now reverts *visibly*
+(status 0x0), fixing the m2 caveat where a throwing raw precompile reported success. E10 exercises an
+ERC-20 output; E11 confirms visible reverts. Experiments assert on receipt status again, plus effects.
 
 ## What the PoC does not yet test (honest gaps)
 
@@ -56,10 +59,8 @@ These are real and belong in the write-up, not buried:
 - Solver repayment and spread. Milestone 2's atomic solve now binds consumption to delivering ≥ minOut
   (E7, E6), but the solver is not repaid or paid a spread — it simply delivers minOut and pays gas. The
   fee mechanics (how a solver profits) are a planned companion RSKIP, untested here.
-- Non-RBTC outputs. Settlement models the output as RBTC moved through the registry; arbitrary token
-  outputs are future work.
-- Consensus-level bundle. Settlement is one atomic solve transaction, not a miner-assembled intent+
-  solution bundle; MEV/ordering concerns of a true bundle are untested.
+- Consensus-level bundle. Settlement is one atomic solve transaction (now a VM contract call), not a
+  miner-assembled intent+solution bundle; MEV/ordering concerns of a true bundle are untested.
 - Non-fresh-chain peg-in. The `pegin` driver relays from the Bridge's SPV genesis, so it assumes a
   fresh chain (`docker-compose down -v` if bitcoind and rskj ever diverge). Re-running against an
   already-populated Bridge is untested.

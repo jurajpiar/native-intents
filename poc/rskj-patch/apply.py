@@ -9,6 +9,7 @@ Usage:
     python3 apply.py /path/to/rskj            # apply
     python3 apply.py /path/to/rskj --check    # dry run, report only
 """
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -117,6 +118,29 @@ EDITS = [
 ]
 
 
+# m3: genesis-deploy the settlement contract (its runtime bytecode) at a fixed address
+GENESIS_JSON = "rskj-core/src/main/resources/genesis/rsk-dev.json"
+SETTLEMENT_ADDR_KEY = "0000000000000000000000000000000001000021"
+RUNTIME_HEX = HERE / "genesis" / "settlement.runtime.hex"
+
+
+def inject_genesis(root: Path, check: bool):
+    path = root / GENESIS_JSON
+    if not path.exists():
+        print(f"  [MISSING] {GENESIS_JSON} — wrong base branch?")
+        sys.exit(2)
+    genesis = json.loads(path.read_text())
+    alloc = genesis.setdefault("alloc", {})
+    if SETTLEMENT_ADDR_KEY in alloc:
+        print(f"  [skip]  genesis: settlement contract already at 0x{SETTLEMENT_ADDR_KEY}")
+        return
+    code = RUNTIME_HEX.read_text().strip()
+    print(f"  [add]   genesis: settlement contract at 0x{SETTLEMENT_ADDR_KEY} ({len(code)//2} bytes of code)")
+    if not check:
+        alloc[SETTLEMENT_ADDR_KEY] = {"balance": "0", "contract": {"code": code, "data": {}}}
+        path.write_text(json.dumps(genesis, indent=2) + "\n")
+
+
 def copy_newfiles(root: Path, check: bool):
     dest_dir = root / SRC / "co" / "rsk" / "intent"
     for src in sorted(NEWFILES.rglob("*.java")):
@@ -164,6 +188,8 @@ def main():
     copy_newfiles(root, check)
     print("== edits ==")
     apply_edits(root, check)
+    print("== genesis ==")
+    inject_genesis(root, check)
     print("done." + (" (dry run)" if check else ""))
 
 

@@ -14,7 +14,7 @@
  */
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
 import { Solver } from "../src/solver.js";
-import { Report, preflight, rpcA, waitReceipt } from "./_harness.js";
+import { Report, preflight, requireSettlement, rpcA, waitReceipt } from "./_harness.js";
 import { cowWallet } from "../src/config.js";
 import { sleep } from "../src/client.js";
 
@@ -22,6 +22,7 @@ const MINOUT = 1_000_000_000_000_000n; // 1e15 wei
 
 async function main(): Promise<number> {
   await preflight(rpcA);
+  await requireSettlement(rpcA);
   const r = new Report("E9 reorg reverts a solve", "claim 2: a dropped solve reverts with its block; consumed set follows state reversion");
   const isC = (H: Uint8Array) => isConsumed((to, d) => rpcA.ethCall(to, d), H);
   const bal = (a: string) => rpcA.getBalance(a).then(BigInt);
@@ -36,7 +37,7 @@ async function main(): Promise<number> {
 
   // settle on the branch that will be dropped
   await rpcA.sendRaw(intent.rawHex);
-  await waitReceipt(rpcA, await new Solver(rpcA.url).solve(intent.rawHex));
+  await waitReceipt(rpcA, await new Solver(rpcA.url).solve(intent.rawHex, MINOUT));
   r.check("before reorg: H consumed", await isC(H));
   r.check("before reorg: user paid >= minOut", (await bal(user.address)) >= MINOUT);
 
@@ -48,7 +49,7 @@ async function main(): Promise<number> {
 
   // the intent is solvable again on the new branch
   await rpcA.sendRaw(intent.rawHex);
-  await waitReceipt(rpcA, await new Solver(rpcA.url).solve(intent.rawHex));
+  await waitReceipt(rpcA, await new Solver(rpcA.url).solve(intent.rawHex, MINOUT));
   r.check("re-solve after reorg: H consumed again", await isC(H));
   r.check("re-solve after reorg: user paid again", (await bal(user.address)) >= MINOUT);
   return r.done();

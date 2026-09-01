@@ -4,7 +4,7 @@
  */
 import { Rpc } from "../src/client.js";
 import { buildIntent, freshWallet, randomH } from "../src/intent.js";
-import { RPC_A, REGISTRY_ADDR, cowWallet } from "../src/config.js";
+import { RPC_A, REGISTRY_ADDR, SETTLEMENT_ADDR, cowWallet } from "../src/config.js";
 import { isIntentTx } from "../src/solver.js";
 
 async function main(): Promise<void> {
@@ -21,8 +21,13 @@ async function main(): Promise<void> {
   console.log(`  nonce             ${await rpc.txCount(cow)}`);
 
   const regCode = await rpc.getCode(REGISTRY_ADDR).catch((e) => `error: ${(e as Error).message}`);
-  console.log(`registry ${REGISTRY_ADDR}`);
+  console.log(`parse precompile ${REGISTRY_ADDR}`);
   console.log(`  eth_getCode       ${regCode === "0x" ? "0x (precompiles have no code — expected)" : regCode}`);
+
+  const settleCode = await rpc.getCode(SETTLEMENT_ADDR).catch((e) => `error: ${(e as Error).message}`);
+  const settleLen = settleCode.startsWith("0x") ? (settleCode.length - 2) / 2 : 0;
+  console.log(`settlement ${SETTLEMENT_ADDR}`);
+  console.log(`  eth_getCode       ${settleLen} bytes  ${settleLen > 0 ? "(deployed ✓)" : "(NOT DEPLOYED — recreate with `down -v` to apply the m3 genesis)"}`);
 
   // live mempool round-trip
   const intent = buildIntent(freshWallet(), { H: randomH(), btcTxid: new Uint8Array(32), expiry: height + 50, minOut: 0n });

@@ -3,6 +3,10 @@
 Design notes for the two larger items left after the v1 PoC. Both are scoped here rather than built,
 because each is its own milestone and the first one changes the settlement architecture.
 
+> Status: item 1 (the settlement-contract turn) is IMPLEMENTED as milestone 3 — token outputs and
+> visible reverts both landed (experiments E10, E11). The input-claim (fee mechanics) and the
+> consensus-level bundle remain future work. The rest of this note is kept as the original design record.
+
 ## 1. Non-RBTC (token) outputs — the settlement-contract turn
 
 ### Why the raw precompile is the wrong home for this

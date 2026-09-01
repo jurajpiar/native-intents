@@ -14,6 +14,8 @@ const suite = [
   "e3_replay_after_consume.ts",
   "e7_atomic_settlement.ts",
   "e6_consume_griefing.ts",
+  "e10_token_output.ts",
+  "e11_visible_revert.ts",
 ];
 
 const results: { name: string; code: number }[] = [];

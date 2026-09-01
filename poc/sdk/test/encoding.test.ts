@@ -21,8 +21,9 @@ const btcTxid = new Uint8Array(32);
 const built = buildIntent(wallet, { H, btcTxid, expiry: 1000, minOut: 0n });
 
 const data = encodeIntentData({ H, btcTxid, expiry: 1000, minOut: 0n });
-check("data is 128 bytes", data.length === 128, `${data.length}`);
+check("data is 160 bytes (H|btcTxid|E|minOut|outputToken)", data.length === 160, `${data.length}`);
 check("data[0:32] == H", hexlify(data.slice(0, 32)) === hexlify(H));
+check("outputToken word defaults to zero (RBTC)", hexlify(data.slice(128, 160)) === "0x" + "00".repeat(32));
 
 check("wire prefix 0x0249", built.rawHex.startsWith("0x0249"));
 

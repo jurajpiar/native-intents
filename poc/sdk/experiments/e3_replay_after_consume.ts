@@ -9,13 +9,14 @@
  */
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
 import { Solver } from "../src/solver.js";
-import { Report, preflight, rpcA, waitReceipt, errMsg } from "./_harness.js";
+import { Report, preflight, requireSettlement, rpcA, waitReceipt, errMsg } from "./_harness.js";
 import { cowWallet } from "../src/config.js";
 
 const MINOUT = 1_000_000_000_000_000n; // 1e15 wei
 
 async function main(): Promise<number> {
   await preflight(rpcA);
+  await requireSettlement(rpcA);
   const r = new Report("E3 replay after consume", "consumed-set: a consumed H cannot be re-submitted");
 
   if (!r.check("solver payer (cow) funded", BigInt(await rpcA.getBalance(cowWallet().address)) > MINOUT)) return r.done();
@@ -27,7 +28,7 @@ async function main(): Promise<number> {
   r.check("first intent admitted", true, intentA.hash);
 
   const solver = new Solver(rpcA.url);
-  await waitReceipt(rpcA, await solver.solve(intentA.rawHex));
+  await waitReceipt(rpcA, await solver.solve(intentA.rawHex, MINOUT));
   r.check("isConsumed(H) == true after solve", await isConsumed((to, d) => rpcA.ethCall(to, d), H));
 
   // replay: a brand-new intent (fresh sender) committing to the SAME H

@@ -18,6 +18,8 @@
     "pegin": "tsx experiments/pegin.ts",
     "e8pos": "tsx experiments/e8_positive_ticket.ts",
     "e9": "tsx experiments/e9_reorg.ts",
+    "e10": "tsx experiments/e10_token_output.ts",
+    "e11": "tsx experiments/e11_visible_revert.ts",
     "all": "tsx experiments/run_all.ts"
   },
   "dependencies": {

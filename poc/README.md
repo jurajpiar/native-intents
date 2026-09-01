@@ -14,9 +14,10 @@ carries signed constraints: a pipeline commitment H, a referenced BTC txid, an e
 minimum output. The user signs constraints, not calldata.
 
 The intent is **mempool-only: admitted, gossiped, never mined**; it exists to prove the two
-pre-inclusion properties. Settlement is a single EVM-atomic solver transaction, `solve(intent)`, which
-delivers ≥ min-out to the user and records H consumed together, or reverts (milestone 2). Both
-milestones are implemented and verified; see `experiments/README.md`.
+pre-inclusion properties. Settlement is a single EVM-atomic solver transaction that calls a
+genesis-deployed **settlement contract** (`contracts/Settlement.sol`): it authenticates the intent via
+a stateless parse precompile, delivers ≥ min-out of the output asset (RBTC or ERC-20) to the user, and
+records H consumed — or reverts visibly (milestones 2–3). See `experiments/README.md` for status.
 
 What that buys, precisely:
 
@@ -30,7 +31,8 @@ What that buys, precisely:
 
 ```
 poc/
-  rskj-patch/        the rskj change (base: PR #3558). apply.py + 3 new files + 6 anchored edits
+  rskj-patch/        the rskj change (base: PR #3558). apply.py + 3 new files + 7 edits + genesis deploy
+  contracts/         Settlement.sol (settlement contract) + TestToken.sol, and compile.js
   stack/             podman: bitcoind regtest + two patched rskj regtest nodes
   sdk/               TypeScript: intent codec, toy solver, and the experiments
   experiments/       methodology + the map from each experiment to a claim (code is in sdk/experiments)

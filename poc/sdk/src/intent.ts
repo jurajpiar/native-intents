@@ -3,15 +3,18 @@
  * drive the consumed-set registry. The signing scheme mirrors rskj pr3558's Type2RSKTransactionEncoder
  * for chainId != 0, and is verified in poc/sdk/test/encoding.test.ts.
  */
-import { getBytes, hexlify, keccak256, recoverAddress, SigningKey, Wallet, BaseWallet, concat, zeroPadValue, toBeHex, randomBytes } from "ethers";
+import { getBytes, hexlify, keccak256, recoverAddress, SigningKey, Wallet, BaseWallet, Interface, zeroPadValue, toBeHex, randomBytes } from "ethers";
 import {
   cat, encByte, encElem, encList, encNonce, encGasPrice, encValue, encGasLimit, encAddress, encData,
   stripLeadingZeros,
 } from "./rlp.js";
-import { CHAIN_ID, INTENT_SUBTYPE, REGISTRY_ADDR, SEL_SOLVE, SEL_IS_CONSUMED, SEL_CONSUMED_HEIGHT, INTENT_DATA_LEN } from "./config.js";
+import { CHAIN_ID, INTENT_SUBTYPE, SETTLEMENT_ADDR, RBTC, INTENT_DATA_LEN } from "./config.js";
+import settlementAbi from "./abi/Settlement.json" with { type: "json" };
 
 const PREFIX = new Uint8Array([0x02, INTENT_SUBTYPE]);
 const word = (n: number | bigint): Uint8Array => getBytes(zeroPadValue(toBeHex(BigInt(n)), 32));
+const addrWord = (a: string): Uint8Array => getBytes(zeroPadValue(a, 32));
+const settlementIface = new Interface(settlementAbi as import("ethers").InterfaceAbi);
 
 export interface IntentParams {
   /** 32-byte commitment to the pipeline (any bytes32). */
@@ -20,8 +23,10 @@ export interface IntentParams {
   btcTxid: Uint8Array;
   /** height-relative expiry E (absolute block height). */
   expiry: number;
-  /** minimum output (carried for the solver; not enforced pre-inclusion in m1). */
+  /** minimum output the settlement contract must deliver to the user. */
   minOut: bigint;
+  /** output asset: an ERC-20 address, or omitted/zero for native RBTC. */
+  outputToken?: string;
   /** gasLimit; any value works since intents are free, but keep it sane. */
   gasLimit?: number;
   nonce?: number;
@@ -36,9 +41,9 @@ export interface BuiltIntent {
   data: Uint8Array;
 }
 
-/** Encode the intent data field: H | btcTxid | E | minOut (128 bytes). */
+/** Encode the intent data field: H | btcTxid | E | minOut | outputToken (160 bytes). */
 export function encodeIntentData(p: IntentParams): Uint8Array {
-  const data = cat([p.H, p.btcTxid, word(p.expiry), word(p.minOut)]);
+  const data = cat([p.H, p.btcTxid, word(p.expiry), word(p.minOut), addrWord(p.outputToken ?? RBTC)]);
   if (data.length !== INTENT_DATA_LEN) throw new Error(`intent data must be ${INTENT_DATA_LEN} bytes, got ${data.length}`);
   return data;
 }
@@ -54,7 +59,7 @@ export function buildIntent(signer: SigningKey | BaseWallet, p: IntentParams): B
     encNonce(nonce),
     encGasPrice(0),               // free
     encGasLimit(gasLimit),
-    encAddress(REGISTRY_ADDR),    // addressed to the registry
+    encAddress(SETTLEMENT_ADDR),  // addressed to the settlement contract (cosmetic; intents are never mined)
     encValue(0n),
     encData(data),
   ];
@@ -80,22 +85,13 @@ export function buildIntent(signer: SigningKey | BaseWallet, p: IntentParams): B
   return { rawHex, hash: keccak256(signed), sender, sigHash, H: p.H, data };
 }
 
-// --- registry helpers ---
+// --- settlement helpers ---
 
-/** calldata for solve(bytes rawIntentTx) — m2 atomic settle+consume; call from a funded solver tx. */
-export const solveCalldata = (rawIntentTxHex: string): string => concat([SEL_SOLVE, rawIntentTxHex]);
-
-/** eth_call isConsumed(bytes32) -> boolean */
+/** eth_call Settlement.isConsumed(bytes32) -> boolean */
 export async function isConsumed(ethCall: (to: string, data: string) => Promise<string>, H: Uint8Array): Promise<boolean> {
-  const out = await ethCall(REGISTRY_ADDR, concat([SEL_IS_CONSUMED, H]));
-  return BigInt(out) === 1n;
-}
-
-/** eth_call consumedHeight(bytes32) -> number (0 if not consumed; stored height+1 internally, we return the raw word) */
-export async function consumedHeight(ethCall: (to: string, data: string) => Promise<string>, H: Uint8Array): Promise<number> {
-  const out = await ethCall(REGISTRY_ADDR, concat([SEL_CONSUMED_HEIGHT, H]));
-  const raw = BigInt(out);
-  return raw === 0n ? 0 : Number(raw) - 1; // registry stores height+1 so height 0 is a non-empty marker
+  const data = settlementIface.encodeFunctionData("isConsumed", [hexlify(H)]);
+  const out = await ethCall(SETTLEMENT_ADDR, data);
+  return settlementIface.decodeFunctionResult("isConsumed", out)[0] as boolean;
 }
 
 export const randomH = (): Uint8Array => getBytes(randomBytes(32));
