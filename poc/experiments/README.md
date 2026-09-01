@@ -33,6 +33,28 @@ The rest of the suite probes the design's own admitted soft spots (the pressure 
 | E10 | Token output (m3) | Settlement delivers an ERC-20 output to the user and consumes H | user isn't credited the token, or H consumed without delivery | 1 node, ticket off |
 | E11 | Visible revert (m3) | A failed solve reverts visibly (status 0x0) and leaves H intact | it reports success, consumes H, or pays the user | 1 node, ticket off |
 | E12 | Fee mechanics (m4) | Solver delivers the output and claims the escrowed input (peg-in), keeping the spread | user isn't paid the output, solver doesn't get the input, or escrow not cleared | 1 node, ticket off |
+| E13 | Activation gate | Intents are rejected before the RSKIPINTENT activation height and admitted after | an intent is admitted pre-activation, or rejected post | 1 node; run right after `up` |
+| E14 | Real peg-in binding | A real peg-in credits the contract; settle releases the actual pegged-in input to the solver | Bridge records wrong dest/amount, or solver doesn't get the real input | 1 node + bitcoind; slow (relays headers) |
+| E15 | Competing solvers + bonding | Two bonded solvers race one intent: exactly one settle lands (first-valid-inclusion), user paid once, winner claims the spread; arbiter can slash | both settles succeed (H double-spent), neither lands, or the loser also delivers | 1 node, ticket off |
+| E16 | Cross-node reorg (p2p) | A competing heavier chain from node B makes node A reorg, orphaning the settle: delivery + H revert and the intent is re-solvable | A doesn't adopt B's chain, or the output/H survive the reorg, or the intent can't be re-solved | **reorg stack** (`docker-compose.reorg.yml`) + docker CLI; slow |
+| E17 | Above-minOut auction (off-consensus) | Solvers bid above minOut; outbid escrow refunded; execute pays the user the best bid and the winner the input — but an unenforced auction is bypassable at minOut (shown, honestly) | escrow lost, premature execute lands, user doesn't get the best bid, or the bypass fails | 1 node, ticket off |
+| E17b | Enforced auction (genesis) | Once bid upon, an intent settles only through the genesis auction (0x..22) — direct settles revert during AND after the window; bid-free intents unaffected | a direct settle lands while an auction is open, execute fails, or a bid-free intent can't settle (regression) | 1 node, **E17b genesis** (down -v + rebuild) |
+
+### Running E16 (dedicated reorg stack)
+
+E16 is the genuine-p2p upgrade of E9 (which models a reorg on one node with `evm_snapshot`/`evm_revert`).
+It needs two *mining* nodes that produce blocks on demand, so it runs on a separate stack — different host
+ports (4454/4455) and containers (`rskj-a-reorg`, `rskj-b-reorg`), so it never clashes with the default
+stack. It drives a real reorg by partitioning the nodes with `docker stop`/`start`: mine the settle into
+A's chain, out-mine it on B, then heal so A's own fork-choice adopts B's heavier chain and orphans the
+settle. From `poc/`:
+
+```
+docker-compose -f stack/podman-compose.yml build            # once, if rskj-intent:poc isn't built yet
+docker-compose -f stack/docker-compose.reorg.yml up -d
+( cd sdk && npm run e16 )
+docker-compose -f stack/docker-compose.reorg.yml down -v
+```
 
 ## Status (2026-09-01)
 
@@ -60,6 +82,12 @@ a token; solver delivers the token and claims the RBTC input. Finding recorded i
 RBTC can't be pulled from the user, so the input must be escrowed (a peg-in crediting the contract),
 not authorised-for-transfer from the user's balance.
 
+Productionization then took the three PoC shortcuts to production shape: the activation gate (E13,
+a `RSKIPINTENT` consensus rule), real peg-in binding (E14, a genuine RSKIP170 peg-in credits the
+settlement contract and the Bridge records its destination + amount for `settle` to release), and the
+solver market (E15, a `Bond` contract off the settle path plus a competing-solvers race that confirms
+first-valid-inclusion). E16 then closed the reorg gap with a genuine two-node p2p reorg (see below).
+
 ## What the PoC does not yet test (honest gaps)
 
 These are real and belong in the write-up, not buried:
@@ -72,10 +100,11 @@ These are real and belong in the write-up, not buried:
 - Non-fresh-chain peg-in. The `pegin` driver relays from the Bridge's SPV genesis, so it assumes a
   fresh chain (`docker-compose down -v` if bitcoind and rskj ever diverge). Re-running against an
   already-populated Bridge is untested.
-- Reorgs under real p2p. E9 exercises the reorg story deterministically via evm_snapshot/evm_revert
-  (state reversion is the same code path a real reorg takes), but a genuine two-miner partition/merge
-  under p2p is not tested — deferred as higher-cost, lower-marginal-value since the consumed set is
-  ordinary world state.
+- Reorgs under real p2p. Now covered by E16: two on-demand-mining nodes are partitioned with
+  `docker stop`/`start`, the settle is mined into A's chain, B builds a heavier chain without it, and on
+  healing A's own fork-choice reorgs onto B — orphaning the settle so delivery + H revert and the intent
+  is re-solvable. E9 remains the fast single-node version (evm_snapshot/evm_revert, the same state-
+  reversion code path).
 - "Instant". The design's own pressure point 3 — admission is gated on the Bridge SPV view, so protocol
   latency is BTC confirmation + header registration, not instant. No experiment yet drives the Bridge
   header cadence to measure it; it needs the peg-in path first.

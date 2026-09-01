@@ -83,10 +83,24 @@ These are recorded in the RSKIPs and are worth carrying into any real implementa
 ## Where it stands
 
 Built and verified: the two irreducible claims, gossip, replay protection, the anti-spam ticket backed by
-a real peg-in, reorg reversion, atomic contract settlement, ERC-20 outputs, visible reverts, and the fee
+a real peg-in, reorg reversion (both deterministically on one node via E9 and under a genuine two-node
+p2p partition/merge via E16), atomic contract settlement, ERC-20 outputs, visible reverts, and the fee
 mechanics (solver input-claim + spread). Both RSKIP drafts are current.
+
+Also built and verified beyond the core claims, taking the PoC's three deliberate shortcuts to production
+shape (see `PRODUCTIONIZATION.md`): the **activation gate** (a `RSKIPINTENT` consensus rule instead of
+always-on genesis; E13), **real peg-in binding** (a genuine RSKIP170 peg-in credits the settlement
+contract and the Bridge records its destination + amount, which `settle` releases to the solver; E14),
+and the **solver market** (a `Bond` contract solvers stake into, off the settle path, plus a competing-
+solvers race showing first-valid-inclusion — one settle wins, the user is paid once; E15).
+
+The above-`minOut` auction is built in both shapes (E17/E17b): an off-consensus auction contract —
+bids above the ask, best bid delivered to the user, honestly shown to be bypassable under
+first-valid-inclusion — and an enforced genesis variant where a bid locks the intent to the auction,
+closing the bypass at the cost of making the auction a settlement rule. The trade-off is left explicit
+in `PRODUCTIONIZATION.md` as a governance decision.
 
 Not built (by design): a consensus-level intent+solution bundle — deferred until MEV/ordering or
 batch-solving is a real requirement, since the single-transaction contract model already delivers every
-property above. Productionization (real peg-in crediting, activation gate, solver market) is scoped in
-`PRODUCTIONIZATION.md`.
+property above. Left as specification in `PRODUCTIONIZATION.md`: the off-chain solver reveal/pipeline
+protocol and endorsement/reputation.

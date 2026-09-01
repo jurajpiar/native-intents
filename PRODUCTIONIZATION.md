@@ -11,6 +11,14 @@ escrowed in the settlement contract so `settle` can release it to the solver. Na
 pulled from an account, so the peg-in must credit the contract, not the user. The PoC models this with
 `depositForPegin(btcTxid)`. In production the peg-in itself must do it.
 
+> Status: implemented in the PoC (experiment E14), via option 3 below plus a small Bridge getter. A
+> RSKIP170 v1 peg-in names the settlement contract in its OP_RETURN, so the Bridge credits the contract;
+> `executePegIn` additionally records `(destination, amount)` per btc txid, and a new public
+> `getPeginInfo(bytes32)` Bridge method lets the settlement contract verify the destination is itself and
+> release the exact pegged-in input to the solver. This retires `depositForPegin` (kept as a fallback for
+> non-BTC test paths). Not done: the OP_RETURN peg-in still credits the contract with no callback — the
+> contract pulls the amount via the getter — which is the pragmatic no-VM-callback shape of option 1.
+
 Today an RSK peg-in credits an RSK address derived from the BTC sender key; it does not call contracts.
 Three options, in order of faithfulness:
 
@@ -42,6 +50,12 @@ labelled as such.
 
 ## B. Activation gate (instead of always-on genesis)
 
+> Status: implemented in the PoC (experiment E13). A `RSKIPINTENT` consensus rule now gates the free-tx
+> cost, the mempool admission (pre-activation intents are rejected "not active"), and the parse
+> precompile (moved to `CONSENSUS_ENABLED_ADDRESSES`); regtest activates it at block 40. Still modelled,
+> not productionised: the settlement contract is genesis-deployed rather than deployed at the fork block.
+
+
 The PoC turns everything on at genesis: the parse precompile is in `GENESIS_ADDRESSES`, the settlement
 contract is a genesis alloc, and the free-tx cost, subtype admission, and miner exclusion are
 unconditional. That is fine for a fresh regtest chain but wrong for an existing network — adding the
@@ -66,6 +80,15 @@ coverage should include the pre-activation path (an intent before the fork is a 
 tx) and the activation-block state-root, exactly the shape of the existing RSKIP546 hardfork tests.
 
 ## C. Solver market — spec and bonding
+
+> Status: bonding + competing solvers implemented in the PoC (experiment E15). A standalone `Bond.sol`
+> (SDK-deployed, no genesis change and no consensus rule) lets solvers stake, exposes `bonded(address)`,
+> and lets an arbiter `slash` a stake; E15 stakes two solvers and races them on one intent. The race
+> confirms first-valid-inclusion: settlement records `H` atomically, so exactly one settle lands and the
+> other reverts on the already-consumed `H` — the user is paid once and the winner claims the input
+> spread. Crucially the bond is NOT on the settle path (settle never reads it), keeping entry
+> permissionless — the property the "off-consensus" framing below requires. Not done (stays as spec): the
+> reveal/pipeline protocol, endorsement/reputation, and the above-`minOut` auction refinement.
 
 The protocol delivers pre-inclusion admission and atomic, delivery-bound settlement; it does not deliver
 a solver. The properties only cash out with a competitive solver set, and that is market structure, kept
@@ -95,6 +118,20 @@ addresses two residuals:
 
 An optional refinement, addable later without a consensus change, lets solvers compete to deliver more
 than `minOut` within a short window (an auction above the base first-valid-inclusion rule).
+
+> Status: the auction is implemented in the PoC in BOTH shapes, deliberately, because they disagree on a
+> real trade-off. E17 (off-consensus): a standalone `Auction.sol` any party can deploy — solvers escrow
+> bids above `minOut`, the outbid are refunded, and after a 10-block window `execute()` settles, paying
+> the user the best bid and the winning bidder the claimed input. E17 also demonstrates the honest
+> caveat: under the base first-valid-inclusion rule a solver can bypass an unenforced auction and settle
+> directly at `minOut` (the stranded bidder reclaims). E17b (enforced): the same contract genesis-deployed
+> at `0x..01000022`, with `settle` rejecting every caller but the auction while an OPEN auction exists for
+> `H` — including after the bidding deadline, so the permissionless `execute()` cannot be front-run. That
+> closes the bypass but makes the auction a Settlement rule rather than pure market structure, cutting
+> against this section's own off-consensus framing. Enforcement engages only once someone bids (bid-free
+> intents settle exactly as before — regression-checked), and opening the lock requires escrowing a bid
+> above `minOut`, so the user always nets more than their ask. The trade-off between the two shapes is a
+> governance decision the RSKIP should surface, not bury.
 
 ## Cross-cutting: the executor revert path
 
