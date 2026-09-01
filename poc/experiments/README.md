@@ -24,18 +24,26 @@ The rest of the suite probes the design's own admitted soft spots (the pressure 
 | E1 | Claim 1 | A fresh zero-balance account's intent is admitted to the mempool | send is rejected, or tx never appears in the pool | 1 node, ticket off |
 | E1b | Claim 1 (gossip) | That intent propagates to a second, peered node | it never reaches node B while peered | 2 nodes, ticket off |
 | E2 | Claim 2 | An expired intent is rejected at admission, leaving nothing on chain | it is accepted, or leaves a receipt / consumes gas | 1 node |
-| E3 | Consumed-set | After a solver consumes H, the same H cannot be re-submitted | the replay is accepted, or isConsumed stays false | 1 node, ticket off |
-| E6 | Pressure point 2/4 (residual) | consume(H) is unbound to delivery, so any funded party can grief one H | — (a "pass" confirms the documented hole) | 1 node, ticket off |
+| E3 | Consumed-set | After an intent is solved, the same H cannot be re-submitted | the replay is admitted, or isConsumed stays false | 1 node, ticket off |
+| E7 | Settlement (m2) | solve delivers ≥ minOut to the user and consumes H atomically | user isn't credited ≥ minOut, or H consumed without payment | 1 node, ticket off |
+| E6 | m1 residual closed (m2) | an under-delivering solve reverts and leaves H intact | a solve consumes H without paying, or a failed solve strands H | 1 node, ticket off |
 | E8 | Anti-spam | Without a confirmed BTC peg-in ticket, an intent is rejected | it is accepted with a bogus btcTxid | 1 node, ticket **on** |
 
 ## Status (2026-09-01)
 
-E1, E1b, E2, E3, E6 all pass against the patched pr3558 node (built and run under docker-compose,
-two rskj regtest nodes + bitcoind). Both irreducible claims are demonstrated end to end. E8 is not yet
-run — it needs a node launched with `-Dintent.requireBtcTicket=true`; its positive case additionally
-needs the federation-driven regtest peg-in in `../stack/scripts/pegin.md` (still stretch).
+Milestones 1 and 2 both verified against the patched pr3558 node (docker-compose, two rskj regtest
+nodes + bitcoind). E1, E1b, E2 (m1: the two irreducible claims), E3, E7, and E6 (m2: replay,
+atomic settlement, grief closed) all pass. E8 is not yet run — it needs a node launched with
+`-Dintent.requireBtcTicket=true`; its positive case additionally needs the federation-driven regtest
+peg-in in `../stack/scripts/pegin.md` (still stretch).
 
-E6 is deliberately a demonstration, not a defence. It passes when the grief succeeds, quantifying the
+E6 changed meaning in m2. In milestone 1 it demonstrated the griefing hole (consume was unbound to
+delivery). Milestone 2's atomic solve closes it: E6 now passes when the grief *fails* — an
+under-delivering solve has no effect and H stays intact, so the honest solver can still serve the intent.
+
+The m2 experiments judge success by state effects (was the user paid? is H consumed?), not by receipt
+status: in the current rskj executor a throwing precompile still reports status 0x1 (see the RSKIP
+implementation notes), so `solve` writes only after all checks pass and a failed solve is a clean no-op. It passes when the grief succeeds, quantifying the
 residual the design already flags (milestone 1 has no atomic bundle binding consume to min-out
 delivery). It also shows the grief is bounded: the honest user re-issues under a fresh H.
 
@@ -43,10 +51,13 @@ delivery). It also shows the grief is bounded: the honest user re-issues under a
 
 These are real and belong in the write-up, not buried:
 
-- Atomic settlement. Milestone 1 never mines the intent and never binds consume to delivering min-out.
-  So min-out enforcement, the atomic intent+solution bundle, and solver repayment+spread are untested.
-  That is the whole of milestone 2 and it is where the "solver actually satisfied the intent" guarantee
-  lives. Until then, E3/E6 test the consumed-set mechanics, not honest settlement.
+- Solver repayment and spread. Milestone 2's atomic solve now binds consumption to delivering ≥ minOut
+  (E7, E6), but the solver is not repaid or paid a spread — it simply delivers minOut and pays gas. The
+  fee mechanics (how a solver profits) are a planned companion RSKIP, untested here.
+- Non-RBTC outputs. Settlement models the output as RBTC moved through the registry; arbitrary token
+  outputs are future work.
+- Consensus-level bundle. Settlement is one atomic solve transaction, not a miner-assembled intent+
+  solution bundle; MEV/ordering concerns of a true bundle are untested.
 - The positive BTC path. E8 tests the negative case (no ticket → rejected) which needs no peg-in. The
   positive case (a real processed peg-in as a valid ticket) needs the federation-driven peg-in flow in
   `../stack/scripts/pegin.md`, which is fiddly on regtest and is marked stretch.

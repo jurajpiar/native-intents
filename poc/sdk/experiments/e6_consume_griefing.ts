@@ -1,66 +1,58 @@
 /**
- * E6 — Consume griefing (a KNOWN residual, not a claim to defend).
+ * E6 — The m1 consume-griefing residual is closed (milestone 2).
  *
- * The design doc flags it: in milestone 1 (no atomic bundle) consume(H) is permissionless, so nothing
- * binds consumption to actually delivering min-out. This experiment demonstrates the hole rather than
- * refuting it — a "pass" here means the grief succeeded exactly as documented, which is the point:
- * it quantifies the residual and motivates the milestone-2 atomic bundle.
+ * In m1, consume(H) was permissionless: anyone could burn an intent's H without delivering anything.
+ * m2 removes consume; the only way to record H is solve(intent), which forces delivery of >= minOut to
+ * the user. This experiment shows the grief is now impossible: an adversary that cannot (or will not)
+ * deliver minOut has its solve reverted, and — crucially — H stays unconsumed, so the honest solver
+ * can still serve the intent.
  *
- * Procedure: submit a genuine intent(H) -> an adversary (any funded account) calls consume(H) WITHOUT
- *            solving -> show H is now consumed and the honest intent can never be re-submitted.
- * Cost of the grief: one consume tx's gas, per H, paid by the griefer. Bound: the honest user can
- *            re-issue under a fresh H (new pipeline commitment), so the grief is per-H, not permanent
- *            denial — state that bound explicitly in doc 03.
+ * Procedure: honest intent(H, minOut) admitted -> an under-funded adversary (gas money, but < minOut)
+ *            attempts solve -> assert it reverts and H is still unconsumed -> a funded solver then
+ *            settles it successfully.
+ * Falsifier: the adversary consumes H without paying the user, or a reverted solve strands H.
  */
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
 import { Solver } from "../src/solver.js";
-import { Report, preflight, rpcA, errMsg } from "./_harness.js";
-import { waitFor } from "../src/client.js";
+import { Report, preflight, rpcA, waitReceipt, fundAccount } from "./_harness.js";
+// rskj reports a throwing precompile as status=0x1, so we judge success/failure by EFFECTS
+// (was H consumed? was the user paid?), not by receipt status.
 import { cowWallet } from "../src/config.js";
-import { hexlify } from "ethers";
+
+const MINOUT = 1_000_000_000_000_000n; // 1e15 wei
+const GAS_MONEY = 1_000_000_000_000n;  // 1e12 wei — covers gas, far below minOut
 
 async function main(): Promise<number> {
   await preflight(rpcA);
-  const r = new Report("E6 consume griefing (documented residual)", "m1 residual: consume() is unbound to delivery");
+  const r = new Report("E6 consume-griefing closed", "m2: consumption requires delivery; a failed solve leaves H intact");
 
-  const cowBal = BigInt(await rpcA.getBalance(cowWallet().address));
-  if (!r.check("griefer payer (cow) is funded", cowBal > 0n, cowBal > 0n ? `${cowBal}` : "0 — run 'npm run diag'; node likely not on rsk-dev.json genesis")) return r.done();
+  if (!r.check("honest solver payer (cow) funded", BigInt(await rpcA.getBalance(cowWallet().address)) > MINOUT)) return r.done();
 
+  const user = freshWallet();
   const H = randomH();
   const height = await rpcA.blockNumber();
-  const honest = buildIntent(freshWallet(), { H, btcTxid: new Uint8Array(32), expiry: height + 100, minOut: 1_000_000n });
-  await rpcA.sendRaw(honest.rawHex);
-  r.check("honest intent admitted", true, honest.hash);
+  const intent = buildIntent(user, { H, btcTxid: new Uint8Array(32), expiry: height + 100, minOut: MINOUT });
+  await rpcA.sendRaw(intent.rawHex);
+  r.check("honest intent admitted", true, intent.hash);
 
-  // adversary consumes without delivering anything
-  const adversary = new Solver(rpcA.url);
-  let griefHash = "";
-  try {
-    griefHash = await adversary.consume(hexlify(H));
-  } catch (e) {
-    r.check("grief consume submitted", false, errMsg(e));
-    return r.done();
-  }
-  const mined = await waitFor(async () => {
-    const rec = await rpcA.getReceipt(griefHash).catch(() => null);
-    return rec !== null && rec.blockNumber !== null;
-  }, 20000);
-  r.check("grief consume mined (no delivery)", mined, griefHash);
+  // under-funded adversary: enough for gas, nowhere near minOut
+  const adversary = freshWallet();
+  await waitReceipt(rpcA, await fundAccount(adversary.address, GAS_MONEY));
+  r.check("adversary funded below minOut", BigInt(await rpcA.getBalance(adversary.address)) < MINOUT);
+
+  const adversarySolver = new Solver(rpcA.url, adversary.privateKey);
+  await waitReceipt(rpcA, await adversarySolver.solve(intent.rawHex));
+  // grief failed iff it had no effect: H untouched and the user unpaid
+  r.check("H still unconsumed after grief attempt", !(await isConsumed((to, d) => rpcA.ethCall(to, d), H)));
+  r.check("user not paid by the grief attempt", BigInt(await rpcA.getBalance(user.address)) === 0n);
+
+  // honest solver can still serve the intent
+  const honest = new Solver(rpcA.url);
+  await waitReceipt(rpcA, await honest.solve(intent.rawHex));
+  r.check("user now paid >= minOut", BigInt(await rpcA.getBalance(user.address)) >= MINOUT);
   r.check("H now consumed", await isConsumed((to, d) => rpcA.ethCall(to, d), H));
 
-  // honest user can no longer use this H
-  const reissueSameH = buildIntent(freshWallet(), { H, btcTxid: new Uint8Array(32), expiry: height + 100, minOut: 1_000_000n });
-  let blocked = false;
-  try { await rpcA.sendRaw(reissueSameH.rawHex); } catch (e) { blocked = true; void errMsg(e); }
-  r.check("same-H re-issue is blocked (grief succeeded, as documented)", blocked);
-
-  // ...but a fresh H works — bounding the grief to per-H, not permanent denial
-  const reissueFreshH = buildIntent(freshWallet(), { H: randomH(), btcTxid: new Uint8Array(32), expiry: height + 100, minOut: 1_000_000n });
-  let freshOk = false;
-  try { await rpcA.sendRaw(reissueFreshH.rawHex); freshOk = true; } catch { freshOk = false; }
-  r.check("fresh-H re-issue still works (grief is per-H)", freshOk);
-
-  console.log("\nnote: E6 'passing' confirms the residual the design already flags — fix is the m2 atomic bundle.");
+  console.log("\nnote: E6 now PASSES by the grief FAILING — the m1 residual is closed by atomic solve.");
   return r.done();
 }
 

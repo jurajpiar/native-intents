@@ -8,7 +8,7 @@ import {
   cat, encByte, encElem, encList, encNonce, encGasPrice, encValue, encGasLimit, encAddress, encData,
   stripLeadingZeros,
 } from "./rlp.js";
-import { CHAIN_ID, INTENT_SUBTYPE, REGISTRY_ADDR, SEL_CONSUME, SEL_IS_CONSUMED, SEL_CONSUMED_HEIGHT, INTENT_DATA_LEN } from "./config.js";
+import { CHAIN_ID, INTENT_SUBTYPE, REGISTRY_ADDR, SEL_SOLVE, SEL_IS_CONSUMED, SEL_CONSUMED_HEIGHT, INTENT_DATA_LEN } from "./config.js";
 
 const PREFIX = new Uint8Array([0x02, INTENT_SUBTYPE]);
 const word = (n: number | bigint): Uint8Array => getBytes(zeroPadValue(toBeHex(BigInt(n)), 32));
@@ -82,8 +82,8 @@ export function buildIntent(signer: SigningKey | BaseWallet, p: IntentParams): B
 
 // --- registry helpers ---
 
-/** calldata for consume(bytes32 H) — call from a funded solver tx (to = REGISTRY_ADDR). */
-export const consumeCalldata = (H: Uint8Array): string => concat([SEL_CONSUME, H]);
+/** calldata for solve(bytes rawIntentTx) — m2 atomic settle+consume; call from a funded solver tx. */
+export const solveCalldata = (rawIntentTxHex: string): string => concat([SEL_SOLVE, rawIntentTxHex]);
 
 /** eth_call isConsumed(bytes32) -> boolean */
 export async function isConsumed(ethCall: (to: string, data: string) => Promise<string>, H: Uint8Array): Promise<boolean> {

@@ -44,7 +44,9 @@ public final class IntentConstants {
     /** Registry ABI selectors (keccak256(sig)[:4]); see IntentRegistryContract. */
     public static final int SEL_IS_CONSUMED = 0x6346e832;      // isConsumed(bytes32)
     public static final int SEL_CONSUMED_HEIGHT = 0xc6c79c8b;  // consumedHeight(bytes32)
-    public static final int SEL_CONSUME = 0xaf6f8c1b;          // consume(bytes32)
+    // m2: solve(rawIntentTx) atomically delivers >= minOut and consumes H. The permissionless
+    // consume(bytes32) from m1 is removed — the only way to consume H is to satisfy the intent.
+    public static final int SEL_SOLVE = 0xc000a702;            // solve(bytes)
 
     /**
      * Bridge storage key for the processed-peg-in set, mirroring

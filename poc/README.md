@@ -13,10 +13,10 @@ An intent is a Rootstock-native typed transaction (`0x02 || 0x49 || legacy-body`
 carries signed constraints: a pipeline commitment H, a referenced BTC txid, an expiry height E, and a
 minimum output. The user signs constraints, not calldata.
 
-In this milestone the intent is **mempool-only: admitted, gossiped, never mined**. It exists to prove
-the two pre-inclusion properties. A separate paid solver transaction marks H consumed in a registry
-precompile. Atomic settlement — binding consume to actually delivering min-out — is milestone 2 and is
-deliberately absent here.
+The intent is **mempool-only: admitted, gossiped, never mined**; it exists to prove the two
+pre-inclusion properties. Settlement is a single EVM-atomic solver transaction, `solve(intent)`, which
+delivers ≥ min-out to the user and records H consumed together, or reverts (milestone 2). Both
+milestones are implemented and verified; see `experiments/README.md`.
 
 What that buys, precisely:
 

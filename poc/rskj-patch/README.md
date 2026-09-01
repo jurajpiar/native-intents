@@ -57,4 +57,8 @@ head above: all six anchors match, and a second run is a no-op.
   sets up its storage at the RSKIP126 activation block, which changes the state root there. On a fresh
   regtest genesis (all forks at height 0) every node runs identical code and agrees — fine. But a node
   with this patch **cannot re-sync mainnet/testnet history**, and shipping needs a proper activation gate.
-- **consume() is permissionless.** Documented residual; the fix is milestone 2's atomic bundle. E6 shows it.
+- **Milestone 2 (atomic solve) is applied.** The registry's `solve(rawIntentTx)` authenticates the
+  intent, re-checks admission at inclusion height, delivers ≥ minOut from solver to user, and records H
+  consumed — all in one EVM-atomic transaction. The permissionless m1 `consume()` is removed, so H can
+  only be consumed by satisfying the intent (this closes the m1 grief vector; E6 now passes by the grief
+  failing). Output is modelled as RBTC; solver repayment/spread is a future companion RSKIP.

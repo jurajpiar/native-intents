@@ -12,6 +12,7 @@ const suite = [
   "e1b_gossip.ts",
   "e2_expiry_costs_nothing.ts",
   "e3_replay_after_consume.ts",
+  "e7_atomic_settlement.ts",
   "e6_consume_griefing.ts",
 ];
 

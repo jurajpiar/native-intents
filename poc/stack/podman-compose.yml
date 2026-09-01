@@ -32,7 +32,10 @@ services:
     networks: [intentnet]
 
   rskj-a:
-    image: rskj-intent:poc
+    build:
+      context: ..                         # poc/ — so rskj-patch/ is in the build context
+      dockerfile: stack/Containerfile.rskj
+    image: rskj-intent:poc                 # built here; rskj-b reuses this tag
     depends_on: [bitcoind]
     environment:
       RSK_CONF: /config/node-a.conf

@@ -12,7 +12,7 @@ export const REGISTRY_ADDR = "0x0000000000000000000000000000000001000020";
 /** registry selectors (keccak256(sig)[:4]) */
 export const SEL_IS_CONSUMED = "0x6346e832";
 export const SEL_CONSUMED_HEIGHT = "0xc6c79c8b";
-export const SEL_CONSUME = "0xaf6f8c1b";
+export const SEL_SOLVE = "0xc000a702"; // solve(bytes) — m2 atomic settle+consume
 
 /** pre-funded regtest account, privkey = keccak256("cow"); address 0xcd2a...d826 */
 export const COW_KEY = keccak256(toUtf8Bytes("cow"));

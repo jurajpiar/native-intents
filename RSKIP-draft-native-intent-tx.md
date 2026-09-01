@@ -71,11 +71,11 @@ A native precompiled contract at a fixed address (`0x…01000020` in the PoC) ho
 
 `H` is recorded only on successful execution: the write is made on the transaction's execution track, which is committed only if the transaction succeeds. Reorg handling is ordinary state reversion. The mental model is that the consumed set is to intents what the nonce is to accounts: the registry is readable by `eth_call` and provable by storage proof.
 
-## Settlement: atomic intent+solution bundle (design; not yet implemented)
+## Settlement: atomic solve
 
-At inclusion, an intent is satisfied by an atomic bundle containing the intent and a solver-provided solution, submitted and paid for by the solver. The bundle executes atomically: the node re-checks admission at the inclusion height, executes the pipeline, and requires that every bound holds — in particular that the user receives at least `minOut` — as a condition of the solution recording `H` consumed. If any bound fails, the whole bundle reverts, `H` is not consumed, and the intent returns to the mempool until `E`; the solver forfeits the inclusion fee. Solver repayment and spread accounting are deferred to a companion fee-mechanics RSKIP.
+An intent is satisfied by a single solver transaction that calls the registry's `solve(intent)`. In one transaction the node authenticates the intent (recovering the user from its signature), re-checks admission at the inclusion height (unexpired, `H` unconsumed, valid ticket), delivers at least `minOut` to the user, and only then records `H` consumed. Transaction atomicity is the all-or-nothing guarantee: if any bound fails — delivery short of `minOut`, expired, already consumed, bad ticket — the whole call reverts, `H` is not consumed, the intent remains solvable until `E`, and the solver forfeits the gas. This is what binds consumption to delivery: the only way to consume an intent's `H` is to satisfy it.
 
-This is the part of the design that binds consumption to delivery. It is a block-construction change and is specified here as the target; it is not implemented in milestone 1 (see Implementation status).
+This is realized without a block-construction change. The solver transaction carries the signed intent bytes, so it is self-contained, and EVM transaction atomicity supplies the bundle semantics. A consensus-level bundle object (miner-assembled intent+solution, for MEV and ordering control) remains a possible future refinement. Solver repayment and spread accounting are deferred to a companion fee-mechanics RSKIP.
 
 ## Expiry, replay, and reorg
 
@@ -107,16 +107,17 @@ The experiments each try to falsify a claim:
 - E1b — that intent gossips to a second, peered node. (Property 1, stronger form.)
 - E2 — an expired intent is rejected at admission and leaves nothing on chain. (Property 2.)
 - E3 — after a solver consumes `H`, the same `H` cannot be re-submitted. (Consumed set.)
-- E6 — with no atomic bundle, `consume(H)` is unbound to delivery and can be griefed per-`H`. (Residual.)
+- E7 — a solve delivers ≥ `minOut` to the user and records `H` consumed, atomically. (Settlement.)
+- E6 — an under-delivering solve reverts and leaves `H` intact; consumption requires delivery. (m1 residual closed.)
 - E8 — an intent with no valid Bitcoin ticket is rejected. (Anti-spam.)
 
 # Implementation status
 
-As of 2026-09-01, milestone 1 (mempool-only) is implemented on PR #3558 and verified on a real build: E1, E1b, E2, E3, and E6 pass against two patched rskj regtest nodes under docker-compose. Both motivating properties are demonstrated end to end.
+As of 2026-09-01, milestones 1 (mempool-only admission) and 2 (atomic solve) are implemented on PR #3558 and verified on a real build against two patched rskj regtest nodes under docker-compose. Milestone 1: E1, E1b, E2 demonstrate the two irreducible claims. Milestone 2: E7 demonstrates atomic settlement (a solve delivers ≥ `minOut` to the user and records `H` consumed in one transaction), E3 demonstrates replay protection, and E6 demonstrates that the m1 consume-griefing residual is closed (an under-delivering solve reverts and leaves `H` intact).
 
-Not yet implemented: the atomic intent+solution bundle and `minOut` enforcement (milestone 2 — this is what turns E6 from "grief succeeds" into "grief reverts"); the positive Bitcoin-ticket path (E8 currently exercises only the negative case); and reorg behaviour. Fee mechanics (solver repayment and spread) are a planned companion RSKIP.
+Not yet implemented: the positive Bitcoin-ticket path (E8 exercises only the negative case; the positive case needs the federation-driven regtest peg-in); reorg behaviour; and a consensus-level bundle object (settlement is realized as a single atomic solve transaction). Fee mechanics (solver repayment and spread) are a planned companion RSKIP. The intent output is currently modelled as RBTC delivered through the registry; supporting arbitrary token outputs is future work.
 
-An implementation note surfaced by the PoC, relevant to any SDK: rskj serialises a zero `gasPrice` as a raw `0x00` byte (`RLP.encodeCoinNonNullZero`) while a zero `value` and zero `nonce` serialise as `0x80`; a signer that does not match this recomputes a different signing hash and recovers the wrong sender.
+Two implementation notes surfaced by the PoC. First, relevant to any SDK: rskj serialises a zero `gasPrice` as a raw `0x00` byte (`RLP.encodeCoinNonNullZero`) while a zero `value` and zero `nonce` serialise as `0x80`; a signer that does not match this recomputes a different signing hash and recovers the wrong sender. Second, relevant to the settlement design: in the current executor a precompiled-contract exception is not propagated to the transaction receipt — it sets the internal exception but not the execution error, and the transaction track is committed regardless — so a failing precompile reports success. The PoC works within this by making `solve` write only after all checks pass (a failed solve therefore has no effect: no delivery, `H` unconsumed), and by judging outcomes on state effects rather than receipt status. A production version should either propagate precompile exceptions to the receipt (so an under-delivering `solve` visibly reverts) or return an explicit result code.
 
 # Open questions
 

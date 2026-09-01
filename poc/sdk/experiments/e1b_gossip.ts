@@ -17,6 +17,8 @@ async function main(): Promise<number> {
   await preflight(rpcB);
   const r = new Report("E1b intent gossip A->B", "claim 1: intents propagate as p2p mempool objects");
 
+  // static-IP active peers can take a little while to connect after a fresh recreate
+  await waitFor(async () => (await rpcA.peerCount().catch(() => 0)) >= 1, 40000);
   const peers = await rpcA.peerCount().catch(() => 0);
   r.check("node A has >=1 peer", peers >= 1, `net_peerCount=${peers}`);
 

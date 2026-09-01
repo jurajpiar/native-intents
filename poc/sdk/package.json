@@ -12,6 +12,7 @@
     "e1b": "tsx experiments/e1b_gossip.ts",
     "e2": "tsx experiments/e2_expiry_costs_nothing.ts",
     "e3": "tsx experiments/e3_replay_after_consume.ts",
+    "e7": "tsx experiments/e7_atomic_settlement.ts",
     "e6": "tsx experiments/e6_consume_griefing.ts",
     "e8": "tsx experiments/e8_spam_without_ticket.ts",
     "all": "tsx experiments/run_all.ts"
