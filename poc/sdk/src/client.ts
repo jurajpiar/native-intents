@@ -1,0 +1,72 @@
+/** Minimal JSON-RPC client (Node 22 global fetch). Kept tiny and explicit so experiments read clearly. */
+
+export class RpcError extends Error {
+  constructor(public code: number, message: string) { super(message); }
+}
+
+export class Rpc {
+  private id = 1;
+  constructor(public url: string) {}
+
+  async call<T = unknown>(method: string, params: unknown[] = []): Promise<T> {
+    const res = await fetch(this.url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: this.id++, method, params }),
+    });
+    const json = (await res.json()) as { result?: T; error?: { code: number; message: string } };
+    if (json.error) throw new RpcError(json.error.code, json.error.message);
+    return json.result as T;
+  }
+
+  blockNumber = async (): Promise<number> => parseInt(await this.call<string>("eth_blockNumber"), 16);
+  getBalance = (addr: string): Promise<string> => this.call<string>("eth_getBalance", [addr, "latest"]);
+  getCode = (addr: string): Promise<string> => this.call<string>("eth_getCode", [addr, "latest"]);
+  txCount = async (addr: string): Promise<number> => parseInt(await this.call<string>("eth_getTransactionCount", [addr, "latest"]), 16);
+  sendRaw = (rawHex: string): Promise<string> => this.call<string>("eth_sendRawTransaction", [rawHex]);
+  ethCall = (to: string, data: string): Promise<string> => this.call<string>("eth_call", [{ to, data }, "latest"]);
+  getTx = (hash: string): Promise<TxRpc | null> => this.call<TxRpc | null>("eth_getTransactionByHash", [hash]);
+  getReceipt = (hash: string): Promise<Receipt | null> => this.call<Receipt | null>("eth_getTransactionReceipt", [hash]);
+  peerCount = async (): Promise<number> => parseInt(await this.call<string>("net_peerCount"), 16);
+
+  /** rskj txpool_content -> { pending: {addr: {nonce: [tx,...]}}, queued: {...} } (nonce maps to a LIST) */
+  async pendingTxs(): Promise<TxRpc[]> {
+    const content = await this.call<TxPoolContent>("txpool_content");
+    const out: TxRpc[] = [];
+    for (const byNonce of Object.values(content.pending ?? {})) {
+      for (const list of Object.values(byNonce)) {
+        for (const tx of list ?? []) {
+          if (tx && tx.hash) out.push(tx);
+        }
+      }
+    }
+    return out;
+  }
+}
+
+export interface TxRpc {
+  hash: string;
+  from: string;
+  to: string | null;
+  input: string;
+  type?: string;   // "0x0249" for RSK-namespace intents
+  nonce: string;
+  blockNumber: string | null;
+}
+export interface Receipt { status: string; blockNumber: string | null; }
+interface TxPoolContent {
+  pending?: Record<string, Record<string, TxRpc[]>>;
+  queued?: Record<string, Record<string, TxRpc[]>>;
+}
+
+export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** poll until predicate true or timeout; returns whether it succeeded */
+export async function waitFor(pred: () => Promise<boolean>, timeoutMs = 20000, everyMs = 500): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await pred()) return true;
+    await sleep(everyMs);
+  }
+  return false;
+}

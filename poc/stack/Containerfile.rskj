@@ -1,0 +1,42 @@
+# Native-intent PoC — patched rskj (pr3558 typed-tx branch + milestone-1 intent patch).
+#
+# Build context must be poc/ (so both stack/ and rskj-patch/ are visible):
+#   podman build -f stack/Containerfile.rskj -t rskj-intent:poc .
+#
+# The build needs network egress (GitHub, deps.rsklabs.io for the Gradle wrapper jar,
+# services.gradle.org for Gradle 8.6, Maven Central). It does NOT run rskj's gpg SHA verify,
+# because patching tracked files would fail that check by design.
+
+# ---- build stage ----
+FROM docker.io/library/eclipse-temurin:17-jdk AS build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git curl ca-certificates python3 \
+ && rm -rf /var/lib/apt/lists/*
+
+# pr3558 head (RSKIP543/545/546 typed transactions). Override with --build-arg if needed.
+ARG RSKJ_REF=8d7b0918f7a3b3eaeacbe432b26d985fb22cb4f9
+WORKDIR /src
+# fetch the PR #3558 head ref explicitly (a bare-SHA fetch is not always advertised), then pin the SHA
+RUN git clone --no-checkout https://github.com/rsksmart/rskj.git . \
+ && git fetch origin refs/pull/3558/head \
+ && git checkout ${RSKJ_REF}
+
+# apply the native-intent milestone-1 patch (idempotent)
+COPY rskj-patch /patch
+RUN python3 /patch/apply.py /src
+
+# build the fat jar (skip tests; drop the gpg/sha verify the upstream Dockerfile runs)
+RUN chmod +x configure.sh gradlew \
+ && ./configure.sh \
+ && ./gradlew --no-daemon clean build -x test \
+ && cp $(ls rskj-core/build/libs/rskj-core-*-all.jar | head -n1) /rsk.jar
+
+# ---- runtime stage ----
+FROM docker.io/library/eclipse-temurin:17-jre AS runtime
+WORKDIR /var/lib/rsk
+COPY --from=build /rsk.jar /var/lib/rsk/rsk.jar
+COPY stack/config /config
+COPY stack/scripts/run-node.sh /usr/local/bin/run-node.sh
+RUN chmod +x /usr/local/bin/run-node.sh && mkdir -p /var/lib/rsk/db
+EXPOSE 4444 50501
+ENTRYPOINT ["/usr/local/bin/run-node.sh"]

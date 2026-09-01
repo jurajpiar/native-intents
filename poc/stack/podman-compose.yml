@@ -1,0 +1,69 @@
+# Native-intent PoC stack. Run from poc/:
+#   podman build -f stack/Containerfile.rskj -t rskj-intent:poc .
+#   podman-compose -f stack/podman-compose.yml up -d
+#
+# Services:
+#   bitcoind  regtest BTC node (harness builds BTC txs / drives peg-ins here)
+#   rskj-a    patched rskj, mines regtest blocks, RPC on host :4444
+#   rskj-b    patched rskj, non-mining peer of A, RPC on host :4445 (gossip half of claim 1)
+#
+# INTENT_OPTS default requires a BTC ticket. For the pure pre-inclusion experiments (E1/E2/E3)
+# set -Dintent.requireBtcTicket=false (already done for both nodes below); flip to true for E8.
+
+version: "3.8"
+
+networks:
+  intentnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+services:
+  bitcoind:
+    # externally-sourced image — verify the publisher/digest before trusting it.
+    image: docker.io/bitcoin/bitcoin:28
+    command: ["-conf=/config/bitcoin.conf", "-datadir=/data"]
+    volumes:
+      - ./config/bitcoin.conf:/config/bitcoin.conf:ro
+      - bitcoin-data:/data
+    ports:
+      - "18443:18443"
+    networks: [intentnet]
+
+  rskj-a:
+    image: rskj-intent:poc
+    depends_on: [bitcoind]
+    environment:
+      RSK_CONF: /config/node-a.conf
+      JVM_OPTS: "-Xmx2g"
+      INTENT_OPTS: "-Dintent.requireBtcTicket=false -Dintent.maxExpirySpan=100"
+    ports:
+      - "4444:4444"
+    networks:
+      intentnet:
+        ipv4_address: 172.28.0.10
+    volumes:
+      - ./config:/config:ro          # bind-mount so config edits apply on restart (no image rebuild)
+      - rskj-a-db:/var/lib/rsk/db
+
+  rskj-b:
+    image: rskj-intent:poc
+    depends_on: [rskj-a]
+    environment:
+      RSK_CONF: /config/node-b.conf
+      JVM_OPTS: "-Xmx2g"
+      INTENT_OPTS: "-Dintent.requireBtcTicket=false -Dintent.maxExpirySpan=100"
+    ports:
+      - "4445:4444"
+    networks:
+      intentnet:
+        ipv4_address: 172.28.0.11
+    volumes:
+      - ./config:/config:ro
+      - rskj-b-db:/var/lib/rsk/db
+
+volumes:
+  bitcoin-data:
+  rskj-a-db:
+  rskj-b-db:

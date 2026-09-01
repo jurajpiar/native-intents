@@ -1,0 +1,46 @@
+sequenceDiagram
+    box rgba(140,110,60,0.15) Off-chain
+        actor U as User (BTC wallet)
+        participant SDK as dApp / SDK
+        participant SOL as Solver
+    end
+    box rgba(230,140,50,0.15) Bitcoin
+        participant BTC as Bitcoin network
+    end
+    box rgba(80,120,80,0.15) Rootstock
+        participant BR as Bridge (SPV view)
+        participant N as Node (mempool + consensus)
+    end
+
+    U->>SDK: pipeline + bounds
+    SDK-->>U: H(pipeline) + constraints, ready to sign
+    U->>BTC: sign & broadcast BTC tx (OP_RETURN = H)
+    BTC--)BR: headers relayed (registration cadence)
+
+    Note over SDK,N: submission is unprivileged — anyone holding the bytes may broadcast
+    SDK->>N: broadcast intent tx (0x02 ‖ subtype)
+    N->>BR: BTC event visible?
+    N->>N: ⬛ admission checks
+    N--)SOL: gossip via public mempool
+
+    SOL->>SDK: request payload
+    SDK-->>SOL: reveal off-chain (hidden from third parties only)
+    SOL->>SOL: ⬛ simulate & price
+    SOL->>N: atomic bundle (intent + solution) — solver pays
+
+    N->>N: ⬛ inclusion re-check
+    N->>N: execute pipeline atomically
+
+    alt every bound holds
+        N->>N: record H consumed
+        N-->>U: ≥ min-out delivered
+        N-->>SOL: repaid + spread
+    else any bound fails
+        N->>N: whole bundle reverts — H not consumed
+        N--)SOL: inclusion fee lost
+        Note over N: intent back in mempool, solvable until E
+    end
+
+    Note over U,N: never solved by height E → dropped silently, nothing on chain — slow path / refund
+
+    Note right of N: ⬛ black boxes:<br/>admission = sig · BTC event in Bridge view · unexpired · H unconsumed<br/>re-check = same, at inclusion height<br/>simulate = solver-side profitability, no consensus role

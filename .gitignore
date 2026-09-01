@@ -1,0 +1,7 @@
+# dependencies & build output
+**/node_modules/
+poc/_tmp/
+*.log
+
+# OS cruft
+.DS_Store

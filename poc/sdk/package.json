@@ -1,0 +1,27 @@
+{
+  "name": "native-intent-sdk",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "SDK harness + toy solver for the native-intent PoC (milestone 1)",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx test/encoding.test.ts",
+    "diag": "tsx experiments/diag.ts",
+    "e1": "tsx experiments/e1_zero_balance_admission.ts",
+    "e1b": "tsx experiments/e1b_gossip.ts",
+    "e2": "tsx experiments/e2_expiry_costs_nothing.ts",
+    "e3": "tsx experiments/e3_replay_after_consume.ts",
+    "e6": "tsx experiments/e6_consume_griefing.ts",
+    "e8": "tsx experiments/e8_spam_without_ticket.ts",
+    "all": "tsx experiments/run_all.ts"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
