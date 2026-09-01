@@ -17,6 +17,9 @@ const suite = [
   "e10_token_output.ts",
   "e11_visible_revert.ts",
   "e12_fee_mechanics.ts",
+  "e15_competing_solvers.ts",
+  "e17_offchain_auction.ts",
+  "e17b_enforced_auction.ts", // needs the E17b genesis (auction at 0x..22); exits with instructions if absent
 ];
 
 const results: { name: string; code: number }[] = [];

@@ -12,6 +12,9 @@ export const REGISTRY_ADDR = "0x0000000000000000000000000000000001000020";
 /** settlement contract (m3, genesis-deployed): settle(bytes) + isConsumed(bytes32); owns the consumed set */
 export const SETTLEMENT_ADDR = "0x0000000000000000000000000000000001000021";
 
+/** genesis-deployed auction (E17b): settlement enforces its lock; SDK-deployed instances are unenforced */
+export const AUCTION_ADDR = "0x0000000000000000000000000000000001000022";
+
 /** RSK Bridge precompile (peg-in / SPV) */
 export const BRIDGE_ADDR = "0x0000000000000000000000000000000001000006";
 

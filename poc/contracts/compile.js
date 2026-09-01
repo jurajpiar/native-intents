@@ -8,6 +8,8 @@ const solc = require("solc");
 const sources = {
   "Settlement.sol": { content: fs.readFileSync(path.join(__dirname, "Settlement.sol"), "utf8") },
   "TestToken.sol": { content: fs.readFileSync(path.join(__dirname, "TestToken.sol"), "utf8") },
+  "Bond.sol": { content: fs.readFileSync(path.join(__dirname, "Bond.sol"), "utf8") },
+  "Auction.sol": { content: fs.readFileSync(path.join(__dirname, "Auction.sol"), "utf8") },
 };
 
 const input = {
@@ -42,6 +44,12 @@ for (const [file, contracts] of Object.entries(out.contracts)) {
 }
 
 console.log("compiled:", Object.keys(result).join(", "));
-console.log("\nSettlement runtime bytecode length:", (result.Settlement.deployedBytecode.length - 2) / 2, "bytes");
-console.log("Settlement runtime (for genesis, no 0x):");
-console.log(result.Settlement.deployedBytecode.slice(2));
+
+// genesis runtime bytecode for the fixed-address contracts (consumed by rskj-patch/apply.py)
+const genesisDir = path.join(__dirname, "..", "rskj-patch", "genesis");
+fs.mkdirSync(genesisDir, { recursive: true });
+for (const name of ["Settlement", "Auction"]) {
+  const hex = result[name].deployedBytecode.slice(2);
+  fs.writeFileSync(path.join(genesisDir, name.toLowerCase() + ".runtime.hex"), hex + "\n");
+  console.log(`${name} runtime: ${hex.length / 2} bytes -> rskj-patch/genesis/${name.toLowerCase()}.runtime.hex`);
+}

@@ -21,6 +21,12 @@
     "e10": "tsx experiments/e10_token_output.ts",
     "e11": "tsx experiments/e11_visible_revert.ts",
     "e12": "tsx experiments/e12_fee_mechanics.ts",
+    "e13": "tsx experiments/e13_activation_gate.ts",
+    "e14": "tsx experiments/e14_real_pegin_binding.ts",
+    "e15": "tsx experiments/e15_competing_solvers.ts",
+    "e16": "tsx experiments/e16_cross_node_reorg.ts",
+    "e17": "tsx experiments/e17_offchain_auction.ts",
+    "e17b": "tsx experiments/e17b_enforced_auction.ts",
     "all": "tsx experiments/run_all.ts"
   },
   "dependencies": {
