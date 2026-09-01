@@ -1,0 +1,281 @@
+<!doctype html>
+<!--
+  Native-intent live dashboard. Served by the demo driver (npm run demo), which also proxies both nodes'
+  JSON-RPC same-origin at /rpc/a and /rpc/b (rskj rejects OPTIONS preflights + non-JSON content types, so
+  a browser cannot call it cross-origin directly) and publishes the demo narration at /story.
+  Everything below is chain-derived: mempool intents (typed 0x0249), balances, genesis-auction state,
+  Settled/BidPlaced/Executed/Reclaimed logs, and the consumed set.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Native intents — live</title>
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --border:#2d333b; --text:#e6edf3; --dim:#8b949e;
+    --green:#3fb950; --red:#f85149; --amber:#d29922; --blue:#58a6ff; --purple:#bc8cff;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font:14px/1.45 -apple-system,"Segoe UI",Roboto,sans-serif; padding:16px; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px; }
+  header { display:flex; align-items:baseline; gap:16px; flex-wrap:wrap; margin-bottom:14px; }
+  header h1 { font-size:18px; font-weight:600; }
+  .pill { border:1px solid var(--border); border-radius:999px; padding:2px 10px; font-size:12px; color:var(--dim); }
+  .pill b { color:var(--text); font-weight:600; }
+  #conn.ok { color:var(--green); border-color:var(--green); }
+  #conn.bad { color:var(--red); border-color:var(--red); }
+  #story { background:linear-gradient(90deg,#1c2330,#161b22); border:1px solid var(--border); border-left:4px solid var(--blue);
+           border-radius:8px; padding:10px 14px; margin-bottom:14px; min-height:44px; }
+  #story .act { color:var(--blue); font-weight:600; font-size:12px; letter-spacing:.4px; text-transform:uppercase; }
+  #story .line { margin-top:2px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; margin-top:14px; }
+  @media (max-width:1100px){ .grid,.grid3{grid-template-columns:1fr;} }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:12px; }
+  .panel h2 { font-size:13px; font-weight:600; color:var(--dim); text-transform:uppercase; letter-spacing:.5px; margin-bottom:10px; display:flex; justify-content:space-between; }
+  .panel h2 .cnt { color:var(--blue); }
+  .card { background:var(--panel2); border:1px solid var(--border); border-radius:6px; padding:8px 10px; margin-bottom:8px; }
+  .card.flash { animation:flash 1.2s ease-out; }
+  @keyframes flash { from { border-color:var(--blue); box-shadow:0 0 12px rgba(88,166,255,.35);} }
+  .row { display:flex; justify-content:space-between; gap:8px; }
+  .dim { color:var(--dim); }
+  .badge { display:inline-block; border-radius:4px; padding:1px 7px; font-size:11px; font-weight:600; }
+  .b-green { background:rgba(63,185,80,.15); color:var(--green); }
+  .b-red   { background:rgba(248,81,73,.15);  color:var(--red); }
+  .b-amber { background:rgba(210,153,34,.15); color:var(--amber); }
+  .b-blue  { background:rgba(88,166,255,.15); color:var(--blue); }
+  .b-purple{ background:rgba(188,140,255,.15);color:var(--purple); }
+  .empty { color:var(--dim); font-style:italic; padding:6px 2px; }
+  #feed { max-height:340px; overflow-y:auto; }
+  #feed .card { display:flex; gap:10px; align-items:baseline; }
+  #feed .t { color:var(--dim); font-size:11px; min-width:56px; }
+  .bal { font-variant-numeric:tabular-nums; }
+  .delta-up { color:var(--green); } .delta-down { color:var(--red); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Native intents on Rootstock — live</h1>
+  <span class="pill" id="conn">connecting…</span>
+  <span class="pill">node A head <b id="headA">–</b></span>
+  <span class="pill">node B head <b id="headB">–</b></span>
+  <span class="pill">RSKIPINTENT <b id="act40">height ≥ 40</b></span>
+  <span class="pill">BTC Vault TVL <b id="tvl">–</b></span>
+</header>
+
+<div id="story"><span class="act" id="storyAct">demo</span><div class="line" id="storyLine">waiting for the demo driver…</div></div>
+
+<div class="grid">
+  <div class="panel"><h2>Mempool — node A <span class="cnt" id="cntA"></span></h2><div id="poolA"><div class="empty">no intents</div></div></div>
+  <div class="panel"><h2>Mempool — node B <span class="dim">(gossip: claim 1)</span> <span class="cnt" id="cntB"></span></h2><div id="poolB"><div class="empty">no intents</div></div></div>
+</div>
+
+<div class="grid3">
+  <div class="panel"><h2>Actors</h2><div id="actors"><div class="empty">none discovered yet</div></div></div>
+  <div class="panel"><h2>Auction (genesis 0x…22)</h2><div id="auction"><div class="empty">no bids</div></div></div>
+  <div class="panel"><h2>Events</h2><div id="feed"><div class="empty">nothing yet</div></div></div>
+</div>
+
+<script>
+"use strict";
+const SETTLEMENT = "0x0000000000000000000000000000000001000021";
+const AUCTION    = "0x0000000000000000000000000000000001000022";
+const COW        = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826";
+const TOPIC = {
+  settled:   "0x2b48913bcaac5ca8fccdc740976517c444980bc382c153617621804fc277a184",
+  bidPlaced: "0xaaddb1daa68f2c899bf123296e7c6175854ccf8ca96e733fb37813a1fbe78ec8",
+  executed:  "0x0d5c355dbbc9704bf64ba59d2aa11f1dfe9bd9c4522f48f1e560aff37957d658",
+  reclaimed: "0x15d3ff426f736ded7ea73283575f6dc42d6d4247faaa84108c3526511ddebbb7",
+};
+const SEL = { isConsumed:"0x6346e832", bids:"0x8f98eeda", balanceOf:"0x70a08231", totalSupply:"0x18160ddd" };
+
+let rpcId = 1;
+async function rpc(node, method, params = []) {
+  const res = await fetch(`/rpc/${node}`, { method:"POST", headers:{ "content-type":"application/json" },
+    body: JSON.stringify({ jsonrpc:"2.0", id:rpcId++, method, params }) });
+  const j = await res.json();
+  if (j.error) throw new Error(j.error.message);
+  return j.result;
+}
+const hexInt = (h) => parseInt(h, 16);
+const word = (data, i) => data.slice(2 + 64*i, 2 + 64*(i+1));
+const addrOf = (w) => "0x" + w.slice(24);
+const short = (h) => h.slice(0, 8) + "…" + h.slice(-4);
+const rbtc = (wei) => { const n = Number(BigInt(wei)) / 1e18; return n.toFixed(n && n < 0.001 ? 6 : 4); };
+const el = (id) => document.getElementById(id);
+
+// --- state ---
+const state = {
+  startBlock: null, scanned: null,
+  actors: new Map(),      // addr -> {label, bal, prevBal}
+  intents: new Map(),     // H -> {user, minOut, expiry, consumed, seenA, seenB}
+  auctions: new Map(),    // H -> {bidder, amount, deadline, done}
+  feed: [], seenLogs: new Set(),
+  users: 0, solvers: 0,
+  vault: null, vaultSymbol: "bvBTC",
+};
+const unit = (weiHex, token) =>
+  `${rbtc(weiHex)} ${token && state.vault && token.toLowerCase() === state.vault ? state.vaultSymbol : "RBTC"}`;
+state.actors.set(COW, { label: "solver 1 (cow)", bal: null, prevBal: null });
+
+function track(addr, kind) {
+  addr = addr.toLowerCase();
+  if (state.actors.has(addr)) return;
+  const label = kind === "user" ? `user ${String.fromCharCode(65 + state.users++)}` : `solver ${++state.solvers + 1}`;
+  state.actors.set(addr, { label, bal: null, prevBal: null });
+}
+function feed(badgeClass, badge, text) {
+  state.feed.unshift({ t: new Date().toLocaleTimeString(), badgeClass, badge, text });
+  if (state.feed.length > 60) state.feed.pop();
+}
+
+// --- polling ---
+function parsePool(content, node) {
+  const out = [];
+  for (const byNonce of Object.values(content.pending ?? {}))
+    for (const list of Object.values(byNonce))
+      for (const tx of list ?? []) {
+        const isIntent = tx.type === "0x0249" || (tx.to?.toLowerCase() === SETTLEMENT && (tx.input.length - 2) / 2 === 160);
+        if (!isIntent) continue;
+        const H = "0x" + word(tx.input, 0);
+        out.push(H);
+        if (!state.intents.has(H)) {
+          const out = addrOf(word(tx.input, 4));
+          state.intents.set(H, { user: tx.from, minOut: BigInt("0x" + word(tx.input, 3)), out,
+            expiry: parseInt(word(tx.input, 2), 16), consumed: false, seenA: false, seenB: false });
+          track(tx.from, "user");
+          feed("b-blue", "INTENT", `${short(H)} from ${short(tx.from)} · minOut ${unit("0x" + word(tx.input, 3), out)} (node ${node.toUpperCase()})`);
+        }
+        state.intents.get(H)["seen" + node.toUpperCase()] = true;
+      }
+  return out;
+}
+
+async function pollLogs(head) {
+  if (state.scanned === null) state.scanned = state.startBlock;
+  if (head <= state.scanned) return;
+  const from = "0x" + (state.scanned + 1).toString(16), to = "0x" + head.toString(16);
+  for (const [addr, topics] of [[SETTLEMENT, [TOPIC.settled]], [AUCTION, [TOPIC.bidPlaced, TOPIC.executed, TOPIC.reclaimed]]]) {
+    for (const t of topics) {
+      const logs = await rpc("a", "eth_getLogs", [{ fromBlock: from, toBlock: to, address: addr, topics: [t] }]).catch(() => []);
+      for (const lg of logs) {
+        const key = lg.transactionHash + lg.logIndex;
+        if (state.seenLogs.has(key)) continue;
+        state.seenLogs.add(key);
+        const H = lg.topics[1];
+        if (t === TOPIC.settled) {
+          const user = addrOf(lg.topics[2].slice(2));
+          const outTok = addrOf(word(lg.data, 0));
+          const minOut = "0x" + word(lg.data, 1), input = "0x" + word(lg.data, 2);
+          feed("b-green", "SETTLED", `${short(H)} → ${short(user)} paid ${unit(minOut, outTok)}, input ${rbtc(input)} RBTC claimed`);
+        } else if (t === TOPIC.bidPlaced) {
+          const bidder = addrOf(lg.topics[2].slice(2));
+          track(bidder, "solver");
+          feed("b-purple", "BID", `${short(H)} · ${short(bidder)} bids ${rbtc("0x" + word(lg.data, 0))} RBTC (window → block ${hexInt("0x" + word(lg.data, 1))})`);
+        } else if (t === TOPIC.executed) {
+          feed("b-green", "AUCTION WON", `${short(H)} · winner ${short(addrOf(lg.topics[2].slice(2)))} — user paid ${rbtc("0x" + word(lg.data, 0))} RBTC (best bid)`);
+        } else {
+          feed("b-amber", "RECLAIMED", `${short(H)} · stranded bid ${rbtc("0x" + word(lg.data, 0))} RBTC returned`);
+        }
+      }
+    }
+  }
+  state.scanned = head;
+}
+
+async function pollAuctions() {
+  for (const H of state.intents.keys()) {
+    const raw = await rpc("a", "eth_call", [{ to: AUCTION, data: SEL.bids + H.slice(2) }, "latest"]).catch(() => null);
+    if (!raw || raw.length < 2 + 64 * 5) continue;
+    const bidder = addrOf(word(raw, 0));
+    if (bidder === "0x0000000000000000000000000000000000000000") continue;
+    state.auctions.set(H, { bidder, amount: "0x" + word(raw, 1), deadline: hexInt("0x" + word(raw, 2)), done: word(raw, 4).endsWith("1") });
+  }
+}
+
+async function tick() {
+  try {
+    const headA = hexInt(await rpc("a", "eth_blockNumber"));
+    const headB = await rpc("b", "eth_blockNumber").then(hexInt).catch(() => null);
+    if (state.startBlock === null) { state.startBlock = headA; }
+    el("headA").textContent = headA; el("headB").textContent = headB ?? "–";
+    el("act40").textContent = headA >= 40 ? "ACTIVE" : `inactive (${headA}/40)`;
+    el("conn").textContent = "live"; el("conn").className = "ok";
+
+    const poolA = parsePool(await rpc("a", "txpool_content"), "a");
+    const poolB = await rpc("b", "txpool_content").then((c) => parsePool(c, "b")).catch(() => []);
+
+    for (const [H, it] of state.intents) {
+      if (!it.consumed) {
+        const r = await rpc("a", "eth_call", [{ to: SETTLEMENT, data: SEL.isConsumed + H.slice(2) }, "latest"]).catch(() => null);
+        if (r && BigInt(r) !== 0n) { it.consumed = true; }
+      }
+    }
+    await pollLogs(headA);
+    await pollAuctions();
+    if (!state.vault) {
+      const m = await fetch("/manifest").then((r) => r.json()).catch(() => null);
+      if (m && m.vault) { state.vault = m.vault.toLowerCase(); state.vaultSymbol = m.symbol || "bvBTC"; }
+    }
+    if (state.vault) {
+      const ts = await rpc("a", "eth_call", [{ to: state.vault, data: SEL.totalSupply }, "latest"]).catch(() => null);
+      if (ts) el("tvl").textContent = `${rbtc(ts)} RBTC`;
+    }
+    for (const [addr, a] of state.actors) {
+      a.prevBal = a.bal;
+      a.bal = BigInt(await rpc("a", "eth_getBalance", [addr, "latest"]).catch(() => a.bal ?? "0x0"));
+      if (state.vault) {
+        const s = await rpc("a", "eth_call", [{ to: state.vault, data: SEL.balanceOf + addr.slice(2).padStart(64, "0") }, "latest"]).catch(() => null);
+        a.shares = s ? BigInt(s) : (a.shares ?? 0n);
+      }
+    }
+    render(headA, poolA, poolB);
+    const story = await fetch("/story").then((r) => r.json()).catch(() => null);
+    if (story && story.length) {
+      const last = story[story.length - 1];
+      el("storyAct").textContent = last.act; el("storyLine").textContent = last.text;
+    }
+  } catch (e) {
+    el("conn").textContent = "node unreachable — is the demo driver running?"; el("conn").className = "bad";
+  }
+}
+
+function intentCard(H, it, head) {
+  const st = it.consumed ? `<span class="badge b-green">CONSUMED</span>`
+    : head >= it.expiry ? `<span class="badge b-red">EXPIRED</span>`
+    : `<span class="badge b-blue">OPEN · ${it.expiry - head} blks</span>`;
+  return `<div class="card"><div class="row"><span class="mono">${short(H)}</span>${st}</div>
+    <div class="row dim mono"><span>user ${short(it.user)}</span><span>minOut ${unit("0x" + it.minOut.toString(16), it.out)}</span></div></div>`;
+}
+function render(head, poolA, poolB) {
+  for (const [id_, pool] of [["poolA", poolA], ["poolB", poolB]]) {
+    const seen = new Set(pool);
+    const cards = [...state.intents.entries()].filter(([H]) => seen.has(H)).map(([H, it]) => intentCard(H, it, head));
+    el(id_).innerHTML = cards.join("") || `<div class="empty">no intents in the pool</div>`;
+    el(id_ === "poolA" ? "cntA" : "cntB").textContent = cards.length || "";
+  }
+  el("actors").innerHTML = [...state.actors.entries()].map(([addr, a]) => {
+    const d = a.prevBal !== null && a.bal !== null ? a.bal - a.prevBal : 0n;
+    const delta = d !== 0n ? `<span class="${d > 0n ? "delta-up" : "delta-down"}"> ${d > 0n ? "▲" : "▼"} ${rbtc("0x" + (d < 0n ? -d : d).toString(16))}</span>` : "";
+    const shares = a.shares && a.shares > 0n
+      ? `<div class="row dim mono"><span>vault</span><span class="bal">${rbtc("0x" + a.shares.toString(16))} ${state.vaultSymbol}</span></div>` : "";
+    return `<div class="card ${d !== 0n ? "flash" : ""}"><div class="row"><span>${a.label}</span>
+      <span class="bal mono">${a.bal === null ? "–" : rbtc("0x" + a.bal.toString(16))} RBTC${delta}</span></div>${shares}
+      <div class="dim mono">${short(addr)}</div></div>`;
+  }).join("") || `<div class="empty">none discovered yet</div>`;
+  el("auction").innerHTML = [...state.auctions.entries()].map(([H, a]) => {
+    const st = a.done ? `<span class="badge b-green">CLOSED</span>`
+      : head >= a.deadline ? `<span class="badge b-amber">EXECUTABLE</span>`
+      : `<span class="badge b-purple">BIDDING · ${a.deadline - head} blks</span>`;
+    return `<div class="card"><div class="row"><span class="mono">${short(H)}</span>${st}</div>
+      <div class="row dim mono"><span>best ${short(a.bidder)}</span><span>${rbtc(a.amount)} RBTC</span></div></div>`;
+  }).join("") || `<div class="empty">no bids on the genesis auction</div>`;
+  el("feed").innerHTML = state.feed.map((f) =>
+    `<div class="card"><span class="t mono">${f.t}</span><span class="badge ${f.badgeClass}">${f.badge}</span><span>${f.text}</span></div>`
+  ).join("") || `<div class="empty">nothing yet</div>`;
+}
+
+setInterval(tick, 1000); tick();
+</script>
+</body>
+</html>

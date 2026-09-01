@@ -10,6 +10,7 @@ const sources = {
   "TestToken.sol": { content: fs.readFileSync(path.join(__dirname, "TestToken.sol"), "utf8") },
   "Bond.sol": { content: fs.readFileSync(path.join(__dirname, "Bond.sol"), "utf8") },
   "Auction.sol": { content: fs.readFileSync(path.join(__dirname, "Auction.sol"), "utf8") },
+  "Vault.sol": { content: fs.readFileSync(path.join(__dirname, "Vault.sol"), "utf8") },
 };
 
 const input = {

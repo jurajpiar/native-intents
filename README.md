@@ -49,6 +49,13 @@ run as two rskj regtest nodes and a bitcoind under docker/podman. Each experimen
 attempt against a claim. All of the following pass on a real build (see [`poc/README.md`](poc/README.md)
 to reproduce):
 
+There is also a narrated **live demo**: with the stack up, `cd poc/sdk && npm run demo` serves a real-time
+dashboard at `http://localhost:8666` (mempool intents on both nodes, actor balances, auction state, event
+feed — all chain-derived) and plays the full lifecycle against it: payer-less admission and gossip, a free
+rejection of an expired intent, a two-solver race with the replay blocked, and the auction bid war ending
+with the user paid the best bid. The driver proxies the nodes' JSON-RPC same-origin because rskj rejects
+cross-origin browser calls (no OPTIONS preflight handling, JSON-only content types).
+
 | # | What it tests | Result |
 |---|---|---|
 | E1, E1b | A payer-less account's intent is admitted to the mempool and gossips to a second node (claim 1) | ✓ |
