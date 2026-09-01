@@ -109,13 +109,15 @@ The experiments each try to falsify a claim:
 - E3 — after a solver consumes `H`, the same `H` cannot be re-submitted. (Consumed set.)
 - E7 — a solve delivers ≥ `minOut` to the user and records `H` consumed, atomically. (Settlement.)
 - E6 — an under-delivering solve reverts and leaves `H` intact; consumption requires delivery. (m1 residual closed.)
-- E8 — an intent with no valid Bitcoin ticket is rejected. (Anti-spam.)
+- E8 — an intent with no valid Bitcoin ticket is rejected; an intent referencing a real processed peg-in is admitted. (Anti-spam, both directions.)
 
 # Implementation status
 
 As of 2026-09-01, milestones 1 (mempool-only admission) and 2 (atomic solve) are implemented on PR #3558 and verified on a real build against two patched rskj regtest nodes under docker-compose. Milestone 1: E1, E1b, E2 demonstrate the two irreducible claims. Milestone 2: E7 demonstrates atomic settlement (a solve delivers ≥ `minOut` to the user and records `H` consumed in one transaction), E3 demonstrates replay protection, and E6 demonstrates that the m1 consume-griefing residual is closed (an under-delivering solve reverts and leaves `H` intact).
 
-Not yet implemented: the positive Bitcoin-ticket path (E8 exercises only the negative case; the positive case needs the federation-driven regtest peg-in); reorg behaviour; and a consensus-level bundle object (settlement is realized as a single atomic solve transaction). Fee mechanics (solver repayment and spread) are a planned companion RSKIP. The intent output is currently modelled as RBTC delivered through the registry; supporting arbitrary token outputs is future work.
+The positive Bitcoin-ticket path is implemented and verified end to end on a real build: a driver registers a genuine regtest peg-in through the public `receiveHeader` / `registerBtcTransaction` path (the regtest `receiveHeader` throttle is dropped to zero so the headers coinbase maturity forces can be relayed), and E8-positive admits an intent that references it while still rejecting a bogus ticket. Because the anti-spam ticket is required to be an ordinary peg-in, the no-solver case degrades to a normal peg-in credit — the refund story of pressure point 5.
+
+Not yet implemented: reorg behaviour; a consensus-level bundle object (settlement is realized as a single atomic solve transaction). Fee mechanics (solver repayment and spread) are a planned companion RSKIP. The intent output is currently modelled as RBTC delivered through the registry; supporting arbitrary token outputs is future work.
 
 Two implementation notes surfaced by the PoC. First, relevant to any SDK: rskj serialises a zero `gasPrice` as a raw `0x00` byte (`RLP.encodeCoinNonNullZero`) while a zero `value` and zero `nonce` serialise as `0x80`; a signer that does not match this recomputes a different signing hash and recovers the wrong sender. Second, relevant to the settlement design: in the current executor a precompiled-contract exception is not propagated to the transaction receipt — it sets the internal exception but not the execution error, and the transaction track is committed regardless — so a failing precompile reports success. The PoC works within this by making `solve` write only after all checks pass (a failed solve therefore has no effect: no delivery, `H` unconsumed), and by judging outcomes on state effects rather than receipt status. A production version should either propagate precompile exceptions to the receipt (so an under-delivering `solve` visibly reverts) or return an explicit result code.
 

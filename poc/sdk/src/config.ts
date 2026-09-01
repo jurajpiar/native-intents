@@ -9,6 +9,9 @@ export const RPC_B = process.env.RPC_B ?? "http://localhost:4445";
 /** consumed-set registry precompile (see IntentConstants.java) */
 export const REGISTRY_ADDR = "0x0000000000000000000000000000000001000020";
 
+/** RSK Bridge precompile (peg-in / SPV) */
+export const BRIDGE_ADDR = "0x0000000000000000000000000000000001000006";
+
 /** registry selectors (keccak256(sig)[:4]) */
 export const SEL_IS_CONSUMED = "0x6346e832";
 export const SEL_CONSUMED_HEIGHT = "0xc6c79c8b";

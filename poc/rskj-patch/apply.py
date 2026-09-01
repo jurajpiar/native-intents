@@ -107,6 +107,13 @@ EDITS = [
      "            REMASC_ADDR,\n"
      "            co.rsk.intent.IntentConstants.INTENT_REGISTRY_ADDR));",
      "INTENT_REGISTRY_ADDR));"),
+
+    # E7 (BTC-ticket path): drop the regtest receiveHeader throttle so ~104 headers can be relayed
+    # rapidly by the peg-in driver. Regtest-only constant; not a mainnet/testnet change.
+    (f"{SRC}/co/rsk/peg/constants/BridgeRegTestConstants.java",
+     "        minSecondsBetweenCallsReceiveHeader = 300;  // 5 minutes in seconds",
+     "        minSecondsBetweenCallsReceiveHeader = 0;  // PoC: no throttle on regtest header relay (was 300)",
+     "minSecondsBetweenCallsReceiveHeader = 0;"),
 ]
 
 

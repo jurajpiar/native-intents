@@ -27,15 +27,18 @@ The rest of the suite probes the design's own admitted soft spots (the pressure 
 | E3 | Consumed-set | After an intent is solved, the same H cannot be re-submitted | the replay is admitted, or isConsumed stays false | 1 node, ticket off |
 | E7 | Settlement (m2) | solve delivers ≥ minOut to the user and consumes H atomically | user isn't credited ≥ minOut, or H consumed without payment | 1 node, ticket off |
 | E6 | m1 residual closed (m2) | an under-delivering solve reverts and leaves H intact | a solve consumes H without paying, or a failed solve strands H | 1 node, ticket off |
-| E8 | Anti-spam | Without a confirmed BTC peg-in ticket, an intent is rejected | it is accepted with a bogus btcTxid | 1 node, ticket **on** |
+| E8 | Anti-spam (negative) | Without a confirmed BTC peg-in ticket, an intent is rejected | it is accepted with a bogus btcTxid | 1 node, ticket **on** |
+| E8+ | Anti-spam (positive) | An intent referencing a real processed peg-in is admitted | the valid-ticket intent is rejected | ticket **on** + `npm run pegin` |
 
 ## Status (2026-09-01)
 
 Milestones 1 and 2 both verified against the patched pr3558 node (docker-compose, two rskj regtest
 nodes + bitcoind). E1, E1b, E2 (m1: the two irreducible claims), E3, E7, and E6 (m2: replay,
-atomic settlement, grief closed) all pass. E8 is not yet run — it needs a node launched with
-`-Dintent.requireBtcTicket=true`; its positive case additionally needs the federation-driven regtest
-peg-in in `../stack/scripts/pegin.md` (still stretch).
+atomic settlement, grief closed) all pass. E8 (negative and positive) also passes: the `pegin` driver
+registers a real regtest peg-in via the public receiveHeader/registerBtcTransaction path, and
+E8-positive confirms a valid-ticket intent is admitted while a bogus one is rejected (run with
+`INTENT_REQUIRE_TICKET=true` per `../stack/scripts/pegin.md`). The full v1 story is now demonstrated
+end to end on a patched rskj build.
 
 E6 changed meaning in m2. In milestone 1 it demonstrated the griefing hole (consume was unbound to
 delivery). Milestone 2's atomic solve closes it: E6 now passes when the grief *fails* — an
@@ -43,9 +46,7 @@ under-delivering solve has no effect and H stays intact, so the honest solver ca
 
 The m2 experiments judge success by state effects (was the user paid? is H consumed?), not by receipt
 status: in the current rskj executor a throwing precompile still reports status 0x1 (see the RSKIP
-implementation notes), so `solve` writes only after all checks pass and a failed solve is a clean no-op. It passes when the grief succeeds, quantifying the
-residual the design already flags (milestone 1 has no atomic bundle binding consume to min-out
-delivery). It also shows the grief is bounded: the honest user re-issues under a fresh H.
+implementation notes), so `solve` writes only after all checks pass and a failed solve is a clean no-op.
 
 ## What the PoC does not yet test (honest gaps)
 
@@ -58,9 +59,9 @@ These are real and belong in the write-up, not buried:
   outputs are future work.
 - Consensus-level bundle. Settlement is one atomic solve transaction, not a miner-assembled intent+
   solution bundle; MEV/ordering concerns of a true bundle are untested.
-- The positive BTC path. E8 tests the negative case (no ticket → rejected) which needs no peg-in. The
-  positive case (a real processed peg-in as a valid ticket) needs the federation-driven peg-in flow in
-  `../stack/scripts/pegin.md`, which is fiddly on regtest and is marked stretch.
+- Non-fresh-chain peg-in. The `pegin` driver relays from the Bridge's SPV genesis, so it assumes a
+  fresh chain (`docker-compose down -v` if bitcoind and rskj ever diverge). Re-running against an
+  already-populated Bridge is untested.
 - Reorgs. Claim-2's clean reorg story (an intent on the new branch is still includable or expired; a
   dropped solve reverts with its block) is asserted in the design, not yet exercised. A reorg experiment
   needs two mining nodes and a partition; deferred.
