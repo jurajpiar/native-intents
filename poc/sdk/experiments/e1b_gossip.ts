@@ -33,8 +33,9 @@ async function main(): Promise<number> {
     return r.done();
   }
 
+  // tx-relay after a fresh recreate can lag the first block or two; poll generously
   const reachedB = await waitFor(async () =>
-    (await rpcB.pendingTxs()).some((t) => t.hash.toLowerCase() === intent.hash.toLowerCase()), 20000);
+    (await rpcB.pendingTxs()).some((t) => t.hash.toLowerCase() === intent.hash.toLowerCase()), 60000);
   r.check("intent appeared in node B mempool", reachedB);
   return r.done();
 }

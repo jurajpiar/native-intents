@@ -41,7 +41,7 @@ The input must be identified by the intent and claimable by the solver only thro
 1. The credited amount and its current holder are determinable from chain state at settlement (so `solve` can move exactly `I`).
 2. The user's signature over the intent authorises moving `I` to the solver conditional on delivery of `out ≥ minOut` — and on nothing else.
 
-The simplest binding that satisfies this: the peg-in credits the user's account as today, and the signed intent authorises the registry to transfer `I` from the user to the solver inside `solve`. The registry never custodies the input; it moves it in the same call that delivers the output.
+A finding from implementing this: **native RBTC cannot be pulled from an account** without that account's own transaction, so the input cannot sit in the user's balance waiting to be claimed by `solve`. The workable binding is escrow: the peg-in credits the settlement contract, earmarked for the intent's `btcTxid`, and `solve` releases it to the solver in the same call that delivers the output. The contract custodies the input only between the peg-in and settlement, and only ever pays it to the solver that satisfies the intent. (An ERC-20 input could instead be pulled via a prior `approve` from the user; native RBTC requires the escrow route, which is also the natural shape of a peg-in that names the contract as its RSK recipient.)
 
 ## Settlement accounting
 
@@ -50,7 +50,7 @@ The simplest binding that satisfies this: the peg-in credits the user's account 
 1. Re-check admission at the inclusion height (unexpired, `H` unconsumed, ticket valid) — as in the companion RSKIP.
 2. Verify the input `I` is present and attributable to the user (the peg-in is processed and credited).
 3. Transfer `out ≥ minOut` of the output asset from the solver to the user.
-4. Transfer the input `I` from the user to the solver.
+4. Release the escrowed input `I` (the peg-in credited to the contract) to the solver.
 5. Record `H` consumed.
 
 The spread `value(I) − value(out)` is simply what the solver retains: it is not computed or enforced by the protocol, only permitted. Gas is paid by the solver as the transaction sender, so a failed `solve` costs the solver gas and nothing else — the intent stays unconsumed and solvable.
@@ -103,6 +103,10 @@ This document adds steps 2 and 4 (input verification and claim) to the `solve` s
 - Bond sizing and slashing conditions; whether any part of bonding must be on-consensus.
 - Multi-input / partial-fill intents (one intent satisfied by several solvers), out of scope for v1.
 - Fee to the network beyond gas (none proposed; noted for completeness).
+
+# Implementation status
+
+Implemented in the PoC's settlement contract (milestone 4) and verified end to end (experiment E12). The contract holds an input escrow keyed by `btcTxid`; `depositForPegin` models the peg-in credit (in production the peg-in itself credits the contract). On `settle` the contract records `H`, delivers `out ≥ minOut` of the output asset to the user, then releases the escrowed input to the solver — checks-effects-interactions ordered so the claim cannot be reentered. E12 exercises the cross-asset case: the user pegs in RBTC and receives an ERC-20; the solver delivers the token and claims the RBTC input, keeping the spread. Not implemented: price discovery, the over-`minOut` auction, and bonding (market structure, off-consensus); and the production peg-in→contract crediting (modelled here by `depositForPegin`).
 
 # References
 

@@ -23,7 +23,20 @@ contract Settlement {
     // parse precompile (IntentRegistryContract), returns abi(sender,H,btcTxid,expiry,minOut,outputToken)
     address constant PARSE = 0x0000000000000000000000000000000001000020;
 
-    event Settled(bytes32 indexed h, address indexed user, address outputToken, uint256 minOut);
+    /**
+     * Input escrow, keyed by BTC txid (m4 fee mechanics). In the flagship flow the peg-in credits RBTC
+     * to this contract earmarked for its btcTxid; `settle` releases it to the solver as repayment plus
+     * spread. depositForPegin models that peg-in credit for the PoC (native RBTC cannot be pulled from
+     * the user's account, so the input is escrowed here rather than sitting in the user's balance).
+     */
+    mapping(bytes32 => uint256) public pegin;
+
+    event Settled(bytes32 indexed h, address indexed user, address outputToken, uint256 minOut, uint256 inputClaimed);
+
+    /// Model the peg-in credit: escrow `msg.value` of input RBTC against a BTC txid.
+    function depositForPegin(bytes32 btcTxid) external payable {
+        pegin[btcTxid] += msg.value;
+    }
 
     /// consumed-set view: true once H has been settled
     function isConsumed(bytes32 h) external view returns (bool) {
@@ -41,7 +54,7 @@ contract Settlement {
     function settle(bytes calldata rawIntentTx) external payable {
         (bool ok, bytes memory ret) = PARSE.staticcall(rawIntentTx);
         require(ok && ret.length == 192, "intent parse failed");
-        (address user, bytes32 H, , uint256 expiry, uint256 minOut, address outToken) =
+        (address user, bytes32 H, bytes32 btcTxid, uint256 expiry, uint256 minOut, address outToken) =
             abi.decode(ret, (address, bytes32, bytes32, uint256, uint256, address));
 
         require(user != address(0), "bad intent");
@@ -50,6 +63,10 @@ contract Settlement {
         assembly { consumed := sload(H) }
         require(consumed == 0, "H already consumed");
 
+        // effects before interactions: record H consumed up front (a reentrant settle for the same H reverts)
+        assembly { sstore(H, add(number(), 1)) }
+
+        // deliver >= minOut of the output asset to the user
         if (outToken == address(0)) {
             require(msg.value >= minOut, "under minOut");
             (bool d,) = payable(user).call{value: minOut}("");
@@ -64,7 +81,15 @@ contract Settlement {
             require(IERC20(outToken).transferFrom(msg.sender, user, minOut), "erc20 transfer failed");
         }
 
-        assembly { sstore(H, add(number(), 1)) } // record consumed (height+1, non-zero marker)
-        emit Settled(H, user, outToken, minOut);
+        // release the escrowed input (the peg-in) to the solver — repayment + spread. Read after the
+        // delivery so a reentrant claim of the same btcTxid can't be double-spent; zero before sending.
+        uint256 input = pegin[btcTxid];
+        if (input > 0) {
+            pegin[btcTxid] = 0;
+            (bool c,) = payable(msg.sender).call{value: input}("");
+            require(c, "input claim failed");
+        }
+
+        emit Settled(H, user, outToken, minOut, input);
     }
 }

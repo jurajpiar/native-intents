@@ -16,6 +16,7 @@ const suite = [
   "e6_consume_griefing.ts",
   "e10_token_output.ts",
   "e11_visible_revert.ts",
+  "e12_fee_mechanics.ts",
 ];
 
 const results: { name: string; code: number }[] = [];

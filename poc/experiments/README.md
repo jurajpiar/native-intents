@@ -32,6 +32,7 @@ The rest of the suite probes the design's own admitted soft spots (the pressure 
 | E9 | Reorg | A reorg that drops the solve reverts H + delivery; the intent is re-solvable | H stays consumed, delivery kept, or not re-solvable | 1 node (evm_snapshot/revert) |
 | E10 | Token output (m3) | Settlement delivers an ERC-20 output to the user and consumes H | user isn't credited the token, or H consumed without delivery | 1 node, ticket off |
 | E11 | Visible revert (m3) | A failed solve reverts visibly (status 0x0) and leaves H intact | it reports success, consumes H, or pays the user | 1 node, ticket off |
+| E12 | Fee mechanics (m4) | Solver delivers the output and claims the escrowed input (peg-in), keeping the spread | user isn't paid the output, solver doesn't get the input, or escrow not cleared | 1 node, ticket off |
 
 ## Status (2026-09-01)
 
@@ -51,6 +52,13 @@ Milestone 3 moved settlement into a VM contract (`Settlement.sol`, genesis-deplo
 or ERC-20 output and records H, and — because it runs in the VM — a failed solve now reverts *visibly*
 (status 0x0), fixing the m2 caveat where a throwing raw precompile reported success. E10 exercises an
 ERC-20 output; E11 confirms visible reverts. Experiments assert on receipt status again, plus effects.
+
+Milestone 4 added the fee mechanics: the settlement contract holds an input escrow keyed by btcTxid
+(`depositForPegin` models the peg-in credit), and `settle` releases it to the solver as repayment +
+spread after delivering the output. E12 exercises the cross-asset flagship — user pegs in RBTC, receives
+a token; solver delivers the token and claims the RBTC input. Finding recorded in the fee RSKIP: native
+RBTC can't be pulled from the user, so the input must be escrowed (a peg-in crediting the contract),
+not authorised-for-transfer from the user's balance.
 
 ## What the PoC does not yet test (honest gaps)
 
