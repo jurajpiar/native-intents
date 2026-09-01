@@ -17,6 +17,7 @@
     "e8": "tsx experiments/e8_spam_without_ticket.ts",
     "pegin": "tsx experiments/pegin.ts",
     "e8pos": "tsx experiments/e8_positive_ticket.ts",
+    "e9": "tsx experiments/e9_reorg.ts",
     "all": "tsx experiments/run_all.ts"
   },
   "dependencies": {

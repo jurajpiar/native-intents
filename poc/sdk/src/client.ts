@@ -28,6 +28,9 @@ export class Rpc {
   getTx = (hash: string): Promise<TxRpc | null> => this.call<TxRpc | null>("eth_getTransactionByHash", [hash]);
   getReceipt = (hash: string): Promise<Receipt | null> => this.call<Receipt | null>("eth_getTransactionReceipt", [hash]);
   peerCount = async (): Promise<number> => parseInt(await this.call<string>("net_peerCount"), 16);
+  // evm_snapshot/evm_revert: roll the chain + state back to a prior height — used to model a reorg
+  snapshot = (): Promise<string> => this.call<string>("evm_snapshot");
+  revert = (id: string): Promise<boolean> => this.call<boolean>("evm_revert", [id]);
 
   /** rskj txpool_content -> { pending: {addr: {nonce: [tx,...]}}, queued: {...} } (nonce maps to a LIST) */
   async pendingTxs(): Promise<TxRpc[]> {

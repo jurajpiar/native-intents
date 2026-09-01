@@ -29,6 +29,7 @@ The rest of the suite probes the design's own admitted soft spots (the pressure 
 | E6 | m1 residual closed (m2) | an under-delivering solve reverts and leaves H intact | a solve consumes H without paying, or a failed solve strands H | 1 node, ticket off |
 | E8 | Anti-spam (negative) | Without a confirmed BTC peg-in ticket, an intent is rejected | it is accepted with a bogus btcTxid | 1 node, ticket **on** |
 | E8+ | Anti-spam (positive) | An intent referencing a real processed peg-in is admitted | the valid-ticket intent is rejected | ticket **on** + `npm run pegin` |
+| E9 | Reorg | A reorg that drops the solve reverts H + delivery; the intent is re-solvable | H stays consumed, delivery kept, or not re-solvable | 1 node (evm_snapshot/revert) |
 
 ## Status (2026-09-01)
 
@@ -62,9 +63,10 @@ These are real and belong in the write-up, not buried:
 - Non-fresh-chain peg-in. The `pegin` driver relays from the Bridge's SPV genesis, so it assumes a
   fresh chain (`docker-compose down -v` if bitcoind and rskj ever diverge). Re-running against an
   already-populated Bridge is untested.
-- Reorgs. Claim-2's clean reorg story (an intent on the new branch is still includable or expired; a
-  dropped solve reverts with its block) is asserted in the design, not yet exercised. A reorg experiment
-  needs two mining nodes and a partition; deferred.
+- Reorgs under real p2p. E9 exercises the reorg story deterministically via evm_snapshot/evm_revert
+  (state reversion is the same code path a real reorg takes), but a genuine two-miner partition/merge
+  under p2p is not tested — deferred as higher-cost, lower-marginal-value since the consumed set is
+  ordinary world state.
 - "Instant". The design's own pressure point 3 — admission is gated on the Bridge SPV view, so protocol
   latency is BTC confirmation + header registration, not instant. No experiment yet drives the Bridge
   header cadence to measure it; it needs the peg-in path first.
