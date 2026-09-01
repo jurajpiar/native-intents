@@ -59,12 +59,19 @@ export class Report {
   }
 }
 
-export async function preflight(rpc: Rpc): Promise<void> {
+/** RSKIPINTENT activation height on regtest (must match rskipIntent in regtest.conf). */
+export const ACTIVATION_HEIGHT = 40;
+
+export async function preflight(rpc: Rpc, opts: { waitActivation?: boolean } = {}): Promise<void> {
   try {
     await rpc.blockNumber();
   } catch (e) {
-    console.error(`\nCannot reach node at ${rpc.url}. Is the stack up? (podman-compose up -d)\n${(e as Error).message}`);
+    console.error(`\nCannot reach node at ${rpc.url}. Is the stack up? (docker-compose up -d)\n${(e as Error).message}`);
     process.exit(2);
+  }
+  // Intents are gated behind the RSKIPINTENT activation height on regtest; wait for it unless opted out.
+  if (opts.waitActivation !== false) {
+    await waitFor(async () => (await rpc.blockNumber().catch(() => 0)) >= ACTIVATION_HEIGHT, 120000, 1000);
   }
 }
 

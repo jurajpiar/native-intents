@@ -52,4 +52,28 @@ export class BtcRpc {
   generateToAddress = (n: number, addr: string) => this.rpc<string[]>("generatetoaddress", [n, addr], true);
   sendToAddress = (addr: string, amountBtc: number) => this.rpc<string>("sendtoaddress", [addr, amountBtc], true);
   getBalance = () => this.rpc<number>("getbalance", [], true);
+
+  // raw-tx flow, for building a peg-in with an OP_RETURN destination (RSKIP170 v1)
+  createRawTransaction = (outputs: Record<string, unknown>[]) =>
+    this.rpc<string>("createrawtransaction", [[], outputs], false);
+  fundRawTransaction = (hex: string) =>
+    this.rpc<{ hex: string; fee: number; changepos: number }>("fundrawtransaction", [hex], true);
+  signRawTransactionWithWallet = (hex: string) =>
+    this.rpc<{ hex: string; complete: boolean }>("signrawtransactionwithwallet", [hex], true);
+  sendRawTransactionBtc = (hex: string) => this.rpc<string>("sendrawtransaction", [hex], false);
+
+  /**
+   * Build, fund, sign and broadcast a peg-in that credits an RSK contract via an RSKIP170 v1 OP_RETURN.
+   * Output 1: `amountBtc` to the federation address. Output 2: OP_RETURN "RSKT" || 0x01 || 20-byte RSK addr.
+   * Returns the peg-in txid.
+   */
+  async peginToRskAddress(federationAddr: string, rskAddr20Hex: string, amountBtc: number): Promise<string> {
+    const addr = rskAddr20Hex.replace(/^0x/, "").toLowerCase().padStart(40, "0").slice(-40);
+    const opReturnHex = "52534b54" + "01" + addr; // "RSKT" + version 1 + 20-byte RSK destination = 25 bytes
+    const raw = await this.createRawTransaction([{ [federationAddr]: amountBtc }, { data: opReturnHex }]);
+    const funded = await this.fundRawTransaction(raw);
+    const signed = await this.signRawTransactionWithWallet(funded.hex);
+    if (!signed.complete) throw new Error("peg-in tx not fully signed");
+    return this.sendRawTransactionBtc(signed.hex);
+  }
 }

@@ -11,6 +11,7 @@ const iface = new Interface([
   "function getFederationAddress() view returns (string)",
   "function getBtcBlockchainBestChainHeight() view returns (int256)",
   "function getBtcTxHashProcessedHeight(string hash) view returns (int64)",
+  "function getPeginInfo(bytes32 btcTxid) view returns (bytes)",
   "function receiveHeader(bytes header) returns (int256)",
   "function registerBtcTransaction(bytes txBytes, int256 height, bytes pmt)",
 ]);
@@ -30,6 +31,16 @@ export class Bridge {
 
   getFederationAddress = () => this.callRead<string>("getFederationAddress");
   bestChainHeight = async () => Number(await this.callRead<bigint>("getBtcBlockchainBestChainHeight"));
+
+  /** Real peg-in (destination, amount) recorded by the Bridge for a btc txid, or null if none/unavailable. */
+  async getPeginInfo(btcTxidHex: string): Promise<{ dest: string; amount: bigint } | null> {
+    const raw = await this.rpc.ethCall(BRIDGE_ADDR, iface.encodeFunctionData("getPeginInfo", [btcTxidHex])).catch(() => "0x");
+    if (!raw || raw === "0x") return null; // method not in this build (rebuild to A?), or no record
+    let infoHex: string;
+    try { infoHex = iface.decodeFunctionResult("getPeginInfo", raw)[0] as string; } catch { return null; }
+    if (getBytes(infoHex).length !== 64) return null;
+    return { dest: "0x" + infoHex.slice(2 + 24, 2 + 64), amount: BigInt("0x" + infoHex.slice(2 + 64)) };
+  }
   /** -1 if the btc txid has not been processed as a peg-in */
   processedHeight = async (txidBigEndianHex: string) =>
     Number(await this.callRead<bigint>("getBtcTxHashProcessedHeight", [txidBigEndianHex]));
