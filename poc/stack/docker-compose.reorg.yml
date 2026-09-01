@@ -1,0 +1,61 @@
+# Native-intent PoC — REORG scenario stack (experiment E16).
+#
+# A separate, self-contained stack of TWO rskj miner nodes (no bitcoind — E16 uses an RBTC output with the
+# BTC ticket off). Both mine ON DEMAND (evm_mine); E16 drives a genuine cross-node reorg by partitioning
+# them with `docker stop`/`start`, mining a settle into A's chain, out-mining it on B, then healing so A
+# reorgs onto B's heavier chain and the settle is orphaned.
+#
+# It reuses the image built by the main stack (rskj-intent:poc) and its own network/volumes/host ports, so
+# it does NOT clash with the default stack (podman-compose.yml). Run from poc/:
+#   docker-compose -f stack/podman-compose.yml build         # once, if the image isn't built yet
+#   docker-compose -f stack/docker-compose.reorg.yml up -d
+#   ( cd sdk && npm run e16 )
+#   docker-compose -f stack/docker-compose.reorg.yml down -v
+#
+# Fixed container_names (rskj-a-reorg / rskj-b-reorg) so the experiment can stop/start them by name.
+
+version: "3.8"
+
+networks:
+  intentnet-reorg:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+
+services:
+  rskj-a-reorg:
+    image: rskj-intent:poc          # built by the main stack; reused here
+    container_name: rskj-a-reorg
+    environment:
+      RSK_CONF: /config/node-a-reorg.conf
+      JVM_OPTS: "-Xmx2g"
+      INTENT_OPTS: "-Dintent.requireBtcTicket=false -Dintent.maxExpirySpan=100"
+    ports:
+      - "4454:4444"
+    networks:
+      intentnet-reorg:
+        ipv4_address: 172.29.0.10
+    volumes:
+      - ./config:/config:ro
+      - rskj-a-reorg-db:/var/lib/rsk/db
+
+  rskj-b-reorg:
+    image: rskj-intent:poc
+    container_name: rskj-b-reorg
+    environment:
+      RSK_CONF: /config/node-b-reorg.conf
+      JVM_OPTS: "-Xmx2g"
+      INTENT_OPTS: "-Dintent.requireBtcTicket=false -Dintent.maxExpirySpan=100"
+    ports:
+      - "4455:4444"
+    networks:
+      intentnet-reorg:
+        ipv4_address: 172.29.0.11
+    volumes:
+      - ./config:/config:ro
+      - rskj-b-reorg-db:/var/lib/rsk/db
+
+volumes:
+  rskj-a-reorg-db:
+  rskj-b-reorg-db:
