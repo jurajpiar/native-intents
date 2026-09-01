@@ -1,0 +1,12 @@
+# Build context for poc/stack/Containerfile.rskj is the repo root — keep it lean.
+.git
+rskj/.git
+rskj/**/build
+rskj/.gradle
+**/node_modules
+poc/_tmp
+poc/sdk
+poc/demo
+poc/contracts/build
+*.log
+.DS_Store

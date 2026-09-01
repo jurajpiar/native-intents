@@ -3,5 +3,8 @@
 poc/_tmp/
 *.log
 
+# local rskj checkout (pr3558 base + intent patch applied directly)
+/rskj/
+
 # OS cruft
 .DS_Store

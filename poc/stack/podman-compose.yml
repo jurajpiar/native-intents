@@ -1,6 +1,6 @@
-# Native-intent PoC stack. Run from poc/:
-#   podman build -f stack/Containerfile.rskj -t rskj-intent:poc .
-#   podman-compose -f stack/podman-compose.yml up -d
+# Native-intent PoC stack. The image builds from the LOCAL rskj checkout at the repo root (rskj/),
+# which carries the intent patch applied directly. Run from the repo root:
+#   docker-compose -f poc/stack/podman-compose.yml up -d --build
 #
 # Services:
 #   bitcoind  regtest BTC node (harness builds BTC txs / drives peg-ins here)
@@ -33,8 +33,8 @@ services:
 
   rskj-a:
     build:
-      context: ..                         # poc/ — so rskj-patch/ is in the build context
-      dockerfile: stack/Containerfile.rskj
+      context: ../..                      # repo root — so the local rskj/ checkout is in the context
+      dockerfile: poc/stack/Containerfile.rskj
     image: rskj-intent:poc                 # built here; rskj-b reuses this tag
     depends_on: [bitcoind]
     environment:
