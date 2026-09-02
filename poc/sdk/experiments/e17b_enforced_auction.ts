@@ -17,7 +17,7 @@
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
 import { Solver } from "../src/solver.js";
 import { depositForPegin } from "../src/settlement.js";
-import { auction, placeBid, executeAuction, bidOf } from "../src/auction.js";
+import { auction, placeBid, executeAuction, bidOf, withdrawCredit } from "../src/auction.js";
 import { Report, preflight, requireSettlement, rpcA, fundAccount, waitReceipt, succeeded, reverted } from "./_harness.js";
 import { AUCTION_ADDR, RBTC } from "../src/config.js";
 import { waitFor } from "../src/client.js";
@@ -35,8 +35,19 @@ async function main(): Promise<number> {
   if (!code || code === "0x") {
     console.error(
       `\nGenesis auction not deployed at ${AUCTION_ADDR} — this build predates E17b.\n` +
-      `Rebuild with wiped volumes:\n` +
-      `  docker-compose -f stack/podman-compose.yml down -v && docker-compose -f stack/podman-compose.yml up -d --build\n`
+      `Rebuild with wiped volumes (from the repo root):\n` +
+      `  docker-compose -f poc/stack/podman-compose.yml down -v && docker-compose -f poc/stack/podman-compose.yml up -d --build\n`
+    );
+    process.exit(2);
+  }
+  // generation check: the token-escrow auction's Bid struct has 6 fields; an older genesis (5 fields)
+  // decodes as BAD_DATA. Probe with the zero H so a stale chain fails HERE, with instructions.
+  try { await bidOf(auction(rpcA.url), "0x" + "0".repeat(64)); }
+  catch {
+    console.error(
+      `\nGenesis auction at ${AUCTION_ADDR} is a STALE generation (pre-token-escrow Bid struct).\n` +
+      `The chain predates the current Auction.sol. Rebuild with wiped volumes (from the repo root):\n` +
+      `  docker-compose -f poc/stack/podman-compose.yml down -v && docker-compose -f poc/stack/podman-compose.yml up -d --build\n`
     );
     process.exit(2);
   }
@@ -71,8 +82,10 @@ async function main(): Promise<number> {
   const exec = await waitReceipt(rpcA, await executeAuction(a1, intent.rawHex));
   r.check("execute settles through the auction", succeeded(exec), exec ? exec.status : "no receipt");
   r.check("user received the best bid", BigInt(await rpcA.getBalance(user.address)) === BID, `got=${await rpcA.getBalance(user.address)}`);
+  // pull-payment: execute() credits the winner; the input arrives via withdraw()
+  r.check("winning bidder withdraws its credited input", succeeded(await waitReceipt(rpcA, await withdrawCredit(a1))));
   const cowDelta = BigInt(await rpcA.getBalance(solver1.payer)) - cowBefore;
-  r.check("winning bidder received the claimed input", cowDelta > INPUT - GAS_BOUND, `delta=${cowDelta}`);
+  r.check("winning bidder received the claimed input", cowDelta > INPUT - GAS_BOUND * 2n, `delta=${cowDelta}`);
   r.check("H consumed", await isConsumed((to, d) => rpcA.ethCall(to, d), H));
 
   // --- regression: a bid-free intent settles directly exactly as before ---

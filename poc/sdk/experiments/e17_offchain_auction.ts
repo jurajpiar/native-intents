@@ -18,7 +18,7 @@
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
 import { Solver } from "../src/solver.js";
 import { depositForPegin } from "../src/settlement.js";
-import { deployAuction, auction, placeBid, executeAuction, reclaimBid, bidOf } from "../src/auction.js";
+import { deployAuction, auction, placeBid, executeAuction, reclaimBid, bidOf, withdrawCredit } from "../src/auction.js";
 import { Report, preflight, requireSettlement, rpcA, fundAccount, waitReceipt, succeeded, reverted } from "./_harness.js";
 import { RBTC } from "../src/config.js";
 import { waitFor } from "../src/client.js";
@@ -67,8 +67,10 @@ async function main(): Promise<number> {
   const exec = await waitReceipt(rpcA, await executeAuction(a1, intent1.rawHex));
   r.check("execute after the window succeeded", succeeded(exec), exec ? exec.status : "no receipt");
   r.check("user received the BEST BID (minOut + surplus)", BigInt(await rpcA.getBalance(user1.address)) === BID2, `got=${await rpcA.getBalance(user1.address)}`);
+  // pull-payment: the input is CREDITED to the winner, who withdraws in a separate tx
+  r.check("winner withdraws its credited input", succeeded(await waitReceipt(rpcA, await withdrawCredit(a2))));
   const s2Delta = BigInt(await rpcA.getBalance(solver2.payer)) - s2Before;
-  r.check("winner claimed the input net of its bid", s2Delta > INPUT - BID2 - GAS_BOUND, `delta=${s2Delta}`);
+  r.check("winner claimed the input net of its bid", s2Delta > INPUT - BID2 - GAS_BOUND * 2n, `delta=${s2Delta}`);
   r.check("H consumed via the auction", await isConsumed((to, d) => rpcA.ethCall(to, d), H1));
 
   // --- part 2: the bypass (unenforced instance) ---

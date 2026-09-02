@@ -20,6 +20,7 @@ const suite = [
   "e15_competing_solvers.ts",
   "e17_offchain_auction.ts",
   "e17b_enforced_auction.ts", // needs the E17b genesis (auction at 0x..22); exits with instructions if absent
+  "e18_failure_containment.ts", // needs the hardened genesis auction (pull-payments + GRACE); exits with instructions if stale
 ];
 
 const results: { name: string; code: number }[] = [];
