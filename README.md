@@ -115,6 +115,13 @@ first-valid-inclusion — and an enforced genesis variant where a bid locks the 
 closing the bypass at the cost of making the auction a settlement rule. The trade-off is left explicit
 in `PRODUCTIONIZATION.md` as a governance decision.
 
+The enforced auction's post-win failure modes are hardened and tested (E18): payouts are pull-payments
+(an unpayable winner or outbid bidder loses alone — no more "winner pay failed" bricking an intent to
+expiry), and exclusivity decays `GRACE` blocks after the bidding deadline, so a persistently failing
+execute degrades to open competition at `minOut` instead of holding the intent hostage. The documented
+residual: a contract *user* whose delivery reverts can still force failed settles (bounded by decay,
+then expiry), and the decay path forfeits the auction surplus.
+
 Not built (by design): a consensus-level intent+solution bundle — deferred until MEV/ordering or
 batch-solving is a real requirement, since the single-transaction contract model already delivers every
 property above. Left as specification in `PRODUCTIONIZATION.md`: the off-chain solver reveal/pipeline
