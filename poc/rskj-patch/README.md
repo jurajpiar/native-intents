@@ -1,5 +1,10 @@
 # rskj patch — native intent, milestone 1
 
+> **RETIRED (2026-09-02): provenance only.** The rskj clone at the repo root (`rskj/`) carries all
+> of these patches directly and is authoritative; the stack builds from it. Genesis contract
+> bytecode is injected by `poc/contracts/compile.js` on every compile. Edit the clone directly —
+> do not add new `apply.py` entries.
+
 Adds the native-intent transaction subtype and its consumed-set registry to rskj, scoped to what the
 two irreducible claims need: pre-inclusion admission and a world-state consumed set. Intents are
 **mempool-only, never mined** in this milestone.

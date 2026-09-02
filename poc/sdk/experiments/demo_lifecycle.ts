@@ -24,7 +24,7 @@ import { getBytes, hexlify, randomBytes, Wallet } from "ethers";
 import { buildIntent, freshWallet, randomH } from "../src/intent.js";
 import { Solver } from "../src/solver.js";
 import { depositForPegin } from "../src/settlement.js";
-import { auction, placeBid, executeAuction, bidOf } from "../src/auction.js";
+import { auction, placeBid, executeAuction, bidOf, withdrawCredit } from "../src/auction.js";
 import { deployVault, vault, vaultDeposit, vaultApprove, sharesOf } from "../src/vault.js";
 import { preflight, requireSettlement, rpcA, fundAccount, waitReceipt, succeeded, reverted, errMsg } from "./_harness.js";
 import { RBTC, RPC_A, RPC_B, SETTLEMENT_ADDR } from "../src/config.js";
@@ -155,7 +155,8 @@ async function main(): Promise<void> {
   narrate("act 4 · auction", `waiting for the bidding window to close (block ${bidInfo.deadline})…`);
   await waitFor(async () => BigInt(await rpcA.blockNumber()) >= bidInfo.deadline, 40000, 1000);
   await waitReceipt(rpcA, await executeAuction(a1, intent2.rawHex));
-  narrate("act 4 · auction", `executed. The user asked for 0.001 RBTC and received 0.0014 — the BEST BID, not the minimum. The winning solver claimed the 0.01 input. Competition priced the intent.`);
+  await waitReceipt(rpcA, await withdrawCredit(a2)); // pull-payment: winner withdraws its credited input
+  narrate("act 4 · auction", `executed. The user asked for 0.001 RBTC and received 0.0014 — the BEST BID, not the minimum. The winning solver withdrew the credited 0.01 input. Competition priced the intent.`);
   await beat(3000);
 
   narrate("fin", `that's the lifecycle: free admission, free invalidity, atomic competitive settlement, price discovery. Dashboard stays live — Ctrl-C to stop.`);

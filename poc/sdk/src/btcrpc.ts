@@ -53,9 +53,17 @@ export class BtcRpc {
   sendToAddress = (addr: string, amountBtc: number) => this.rpc<string>("sendtoaddress", [addr, amountBtc], true);
   getBalance = () => this.rpc<number>("getbalance", [], true);
 
+  /** unspent outputs, optionally filtered to specific addresses (0-conf included) */
+  listUnspent = (addresses?: string[]) =>
+    this.rpc<{ txid: string; vout: number; address: string; amount: number; spendable: boolean }[]>(
+      "listunspent", [0, 9999999, addresses ?? []], true);
+  /** UTXO-set scan for an arbitrary (non-wallet) address — e.g. the federation's peg address */
+  scanTxOutSet = (addr: string) =>
+    this.rpc<{ total_amount: number }>("scantxoutset", ["start", [`addr(${addr})`]], false);
+
   // raw-tx flow, for building a peg-in with an OP_RETURN destination (RSKIP170 v1)
-  createRawTransaction = (outputs: Record<string, unknown>[]) =>
-    this.rpc<string>("createrawtransaction", [[], outputs], false);
+  createRawTransaction = (outputs: Record<string, unknown>[], inputs: { txid: string; vout: number }[] = []) =>
+    this.rpc<string>("createrawtransaction", [inputs, outputs], false);
   fundRawTransaction = (hex: string) =>
     this.rpc<{ hex: string; fee: number; changepos: number }>("fundrawtransaction", [hex], true);
   signRawTransactionWithWallet = (hex: string) =>
@@ -73,6 +81,31 @@ export class BtcRpc {
     const raw = await this.createRawTransaction([{ [federationAddr]: amountBtc }, { data: opReturnHex }]);
     const funded = await this.fundRawTransaction(raw);
     const signed = await this.signRawTransactionWithWallet(funded.hex);
+    if (!signed.complete) throw new Error("peg-in tx not fully signed");
+    return this.sendRawTransactionBtc(signed.hex);
+  }
+
+  /**
+   * Like peginToRskAddress, but coin-controlled: spends ONLY UTXOs held by `fromAddress`, with change
+   * returned there — so the send is visibly THAT user's BTC moving (playground uses this so per-user
+   * BTC balances tell the true story). Flat fee; change below dust is folded into the fee.
+   */
+  async peginFromAddress(federationAddr: string, rskAddr20Hex: string, amountBtc: number, fromAddress: string): Promise<string> {
+    const FEE = 0.0002, DUST = 0.00001;
+    const utxos = (await this.listUnspent([fromAddress])).filter((u) => u.spendable);
+    const inputs: { txid: string; vout: number }[] = [];
+    let inSum = 0;
+    for (const u of utxos) { inputs.push({ txid: u.txid, vout: u.vout }); inSum += u.amount; if (inSum >= amountBtc + FEE) break; }
+    if (inSum < amountBtc + FEE) throw new Error(`insufficient BTC at ${fromAddress}: have ${inSum}, need ${amountBtc + FEE}`);
+    const addr = rskAddr20Hex.replace(/^0x/, "").toLowerCase().padStart(40, "0").slice(-40);
+    const outputs: Record<string, unknown>[] = [
+      { [federationAddr]: Number(amountBtc.toFixed(8)) },
+      { data: "52534b54" + "01" + addr },
+    ];
+    const change = inSum - amountBtc - FEE;
+    if (change > DUST) outputs.push({ [fromAddress]: Number(change.toFixed(8)) });
+    const raw = await this.createRawTransaction(outputs, inputs);
+    const signed = await this.signRawTransactionWithWallet(raw);
     if (!signed.complete) throw new Error("peg-in tx not fully signed");
     return this.sendRawTransactionBtc(signed.hex);
   }

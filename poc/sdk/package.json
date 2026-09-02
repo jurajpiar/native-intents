@@ -28,6 +28,7 @@
     "e17": "tsx experiments/e17_offchain_auction.ts",
     "e17b": "tsx experiments/e17b_enforced_auction.ts",
     "demo": "tsx experiments/demo_lifecycle.ts",
+    "playground": "tsx playground/server.ts",
     "all": "tsx experiments/run_all.ts"
   },
   "dependencies": {

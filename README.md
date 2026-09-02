@@ -56,6 +56,14 @@ rejection of an expired intent, a two-solver race with the replay blocked, and t
 with the user paid the best bid. The driver proxies the nodes' JSON-RPC same-origin because rskj rejects
 cross-origin browser calls (no OPTIONS preflight handling, JSON-only content types).
 
+For hands-on exploration there is also an interactive **playground**: `npm run playground` serves
+`http://localhost:8667`, where you spawn payer-less users, compose intents of several types (vault
+shares, native RBTC swap, ERC-20 output — optionally auction-routed via a broker seed bid that engages
+the settlement lock from block one), and spawn solvers with a strategy (fast / picky / auction) and a
+margin floor. Each solver's decision loop — see, simulate, price, decide, act — streams into its own log,
+so races, lost-the-race reverts, auction folds and outbids are all visible as they happen, alongside
+per-solver PnL and a full decode of every intent.
+
 | # | What it tests | Result |
 |---|---|---|
 | E1, E1b | A payer-less account's intent is admitted to the mempool and gossips to a second node (claim 1) | ✓ |

@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-Apply the native-intent PoC (milestone 1) to an rskj checkout.
+RETIRED (2026-09-02) — kept as provenance only.
 
+The rskj clone at the repo root (rskj/) carries all of these patches directly and is
+authoritative; the stack builds from it (see poc/stack/Containerfile.rskj). Genesis contract
+bytecode is now injected by poc/contracts/compile.js as part of every compile. Do not add new
+patch entries here: edit the clone directly.
+
+Original purpose: apply the native-intent PoC (milestone 1) to a pristine rskj checkout.
 Idempotent: safe to run twice. Each edit is skipped if its marker is already present.
 The patch targets the pr3558 branch (RSKIP543/545/546 typed transactions). See README.md.
 
-Usage:
+Usage (bootstrap of a fresh checkout only):
     python3 apply.py /path/to/rskj            # apply
     python3 apply.py /path/to/rskj --check    # dry run, report only
 """

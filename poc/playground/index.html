@@ -1,0 +1,203 @@
+<!doctype html>
+<!-- Native-intent PLAYGROUND. Served by poc/sdk/playground/server.ts (npm run playground, :8667).
+     Spawn users, compose intents of several types, spawn solvers and watch their decision loops. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Native intents — playground</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --border:#2d333b; --text:#e6edf3; --dim:#8b949e;
+          --green:#3fb950; --red:#f85149; --amber:#d29922; --blue:#58a6ff; --purple:#bc8cff; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font:14px/1.45 -apple-system,"Segoe UI",Roboto,sans-serif; padding:16px; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
+  header { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; margin-bottom:14px; }
+  header h1 { font-size:18px; font-weight:600; }
+  .pill { border:1px solid var(--border); border-radius:999px; padding:2px 10px; font-size:12px; color:var(--dim); }
+  .pill b { color:var(--text); }
+  .cols { display:grid; grid-template-columns:290px 1fr 1fr; gap:14px; align-items:start; }
+  @media (max-width:1200px){ .cols{grid-template-columns:1fr;} }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:14px; }
+  .panel h2 { font-size:13px; font-weight:600; color:var(--dim); text-transform:uppercase; letter-spacing:.5px; margin-bottom:10px; }
+  .card { background:var(--panel2); border:1px solid var(--border); border-radius:6px; padding:8px 10px; margin-bottom:8px; }
+  .row { display:flex; justify-content:space-between; gap:8px; align-items:baseline; }
+  .dim { color:var(--dim); } .empty { color:var(--dim); font-style:italic; }
+  .badge { display:inline-block; border-radius:4px; padding:1px 7px; font-size:11px; font-weight:600; }
+  .b-green{background:rgba(63,185,80,.15);color:var(--green);} .b-red{background:rgba(248,81,73,.15);color:var(--red);}
+  .b-amber{background:rgba(210,153,34,.15);color:var(--amber);} .b-blue{background:rgba(88,166,255,.15);color:var(--blue);}
+  .b-purple{background:rgba(188,140,255,.15);color:var(--purple);}
+  button { background:var(--blue); color:#08131f; border:0; border-radius:6px; padding:6px 12px; font-weight:600; cursor:pointer; }
+  button.small { padding:3px 9px; font-size:12px; }
+  button.ghost { background:transparent; border:1px solid var(--border); color:var(--dim); }
+  button:disabled { opacity:.4; cursor:default; }
+  select,input { background:var(--panel2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; width:100%; }
+  label { font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.4px; display:block; margin:8px 0 3px; }
+  .inline { display:flex; gap:8px; } .inline > div { flex:1; }
+  .check { display:flex; gap:6px; align-items:center; margin-top:10px; font-size:13px; }
+  .check input { width:auto; }
+  .log { background:#0a0e14; border:1px solid var(--border); border-radius:6px; padding:6px 8px; max-height:180px; overflow-y:auto;
+         font-family:ui-monospace,Menlo,monospace; font-size:11.5px; line-height:1.5; }
+  .log .t { color:#4a5568; margin-right:6px; }
+  .pnl-up { color:var(--green); } .pnl-down { color:var(--red); }
+  #feed { max-height:220px; overflow-y:auto; }
+  .toast { position:fixed; bottom:16px; right:16px; background:var(--panel2); border:1px solid var(--red); color:var(--red);
+           border-radius:8px; padding:10px 14px; display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Native intents — playground</h1>
+  <span class="pill">head <b id="head">–</b></span>
+  <span class="pill" id="btcPill" style="display:none">BTC height <b id="btcHeight">–</b></span>
+  <span class="pill" id="fedPill" style="display:none">federation holds <b id="fedBtc">–</b> BTC</span>
+  <span class="pill">vault <b id="vaultA" class="mono">–</b></span>
+  <span class="pill">token <b id="tokenA" class="mono">–</b></span>
+  <span class="pill">pool <b id="poolR" class="mono">–</b></span>
+</header>
+
+<div class="cols">
+  <div><!-- left: users + composer -->
+    <div class="panel">
+      <h2>Users</h2>
+      <div id="users"><div class="empty">none yet</div></div>
+      <button onclick="post('/api/user',{})">+ spawn user</button>
+    </div>
+    <div class="panel">
+      <h2>Compose intent</h2>
+      <label>User</label><select id="fUser"></select>
+      <label>Type (output contract)</label>
+      <select id="fType" onchange="aucGate()">
+        <option value="vault">vault — BTC → bvBTC shares</option>
+        <option value="rbtc">swap — BTC → native RBTC</option>
+        <option value="token">token — BTC → TOK (ERC-20)</option>
+        <option value="lpvault">compound — BTC → swap + LP → vaulted LP (vLP)</option>
+      </select>
+      <div class="inline">
+        <div><label>Input (BTC)</label><input id="fIn" type="number" step="0.001" value="0.01"></div>
+        <div><label>minOut</label><input id="fOut" type="number" step="0.0001" value="0.0099"></div>
+      </div>
+      <label>Expiry (blocks from now, ≤95)</label><input id="fExp" type="number" value="80">
+      <div class="check" id="aucRow"><input id="fAuc" type="checkbox"><span id="aucLbl">route via auction — broker seed bid locks it to the auction</span></div>
+      <div style="margin-top:10px"><button onclick="createIntent()">sign &amp; submit intent</button></div>
+    </div>
+    <div class="panel">
+      <h2>Spawn solver</h2>
+      <label>Strategy</label>
+      <select id="sStrat">
+        <option value="fast">fast — settle at minOut the moment margin clears</option>
+        <option value="picky">picky — high margin floor, passes on thin spreads</option>
+        <option value="auction">auction — opens/joins bid wars, executes when closed</option>
+      </select>
+      <label>Margin floor (bps of input)</label><input id="sMargin" type="number" value="50">
+      <div style="margin-top:10px"><button onclick="spawnSolver()">+ spawn solver</button></div>
+    </div>
+  </div>
+
+  <div><!-- middle: intents -->
+    <div class="panel">
+      <h2>Intents</h2>
+      <div id="intents"><div class="empty">compose one on the left</div></div>
+    </div>
+    <div class="panel">
+      <h2>Feed</h2>
+      <div id="feed"><div class="empty">quiet</div></div>
+    </div>
+  </div>
+
+  <div><!-- right: solvers -->
+    <div class="panel">
+      <h2>Solvers</h2>
+      <div id="solvers"><div class="empty">spawn one on the left — then watch it think</div></div>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const el = (id) => document.getElementById(id);
+const short = (h) => h ? h.slice(0, 8) + "…" + h.slice(-4) : "–";
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;" }[c]));
+let lastState = null;
+
+async function post(url, body) {
+  const r = await fetch(url, { method:"POST", headers:{ "content-type":"application/json" }, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || j.error) { toast(j.error || "request failed"); }
+  refresh();
+}
+function toast(msg) { const t = el("toast"); t.textContent = msg; t.style.display = "block"; setTimeout(() => t.style.display = "none", 4000); }
+
+function createIntent() {
+  const userId = Number(el("fUser").value);
+  if (!userId) return toast("spawn a user first");
+  post("/api/intent", { userId, type: el("fType").value, inputRbtc: Number(el("fIn").value),
+    minOut: Number(el("fOut").value), expiryBlocks: Number(el("fExp").value), viaAuction: el("fAuc").checked });
+}
+function spawnSolver() {
+  post("/api/solver", { strategy: el("sStrat").value, marginBps: Number(el("sMargin").value) });
+}
+function aucGate() {
+  // the generalised auction escrows bids in the intent's own output asset — every type is auctionable
+  const t = el("fType").value;
+  el("aucLbl").textContent = t === "rbtc"
+    ? "route via auction — broker seed bid locks it to the auction"
+    : "route via auction — bids are escrowed in the output asset; the broker seed bid runs the real acquisition route";
+}
+aucGate();
+
+const stBadge = (s) => s === "SETTLED" ? "b-green" : s === "EXPIRED" ? "b-red" : s.startsWith("AUCTION") ? "b-purple" : "b-blue";
+const outLabel = (it) => `${it.minOut} ` + (it.type === "vault" ? "bvBTC" : it.type === "token" ? "TOK" : it.type === "lpvault" ? "vLP" : "RBTC");
+
+function render(s) {
+  el("head").textContent = s.head;
+  el("vaultA").textContent = short(s.vault); el("tokenA").textContent = short(s.token);
+  if (s.poolReserves) el("poolR").textContent = `${s.poolReserves.rbtc} RBTC / ${s.poolReserves.tok} TOK`;
+  if (s.btcEnabled) {
+    el("btcPill").style.display = ""; el("fedPill").style.display = "";
+    el("btcHeight").textContent = s.btcHeight; el("fedBtc").textContent = s.federationBtc;
+  }
+
+  el("users").innerHTML = s.users.map((u) =>
+    `<div class="card"><div class="row"><b>${u.label}</b><span class="mono dim">${short(u.addr)}</span></div>
+     ${u.btcAddr ? `<div class="row mono"><span class="dim">₿ ${short(u.btcAddr)}</span><span><b>${u.btc} BTC</b></span></div>` : ""}
+     <div class="row mono dim"><span>${u.rbtc} RBTC</span><span>${u.shares} bvBTC</span><span>${u.tok} TOK</span><span>${u.vlp} vLP</span></div></div>`
+  ).join("") || `<div class="empty">none yet</div>`;
+
+  const sel = el("fUser"); const cur = sel.value;
+  sel.innerHTML = s.users.map((u) => `<option value="${u.id}">${u.label}</option>`).join("");
+  if ([...sel.options].some((o) => o.value === cur)) sel.value = cur;
+
+  el("intents").innerHTML = s.intents.map((it) => `
+    <div class="card">
+      <div class="row"><span class="mono">${short(it.H)}</span><span class="badge ${stBadge(it.status)}">${esc(it.status)}</span></div>
+      <div class="row dim"><span>${it.user} · <b>${it.type}</b>${it.viaAuction ? " · auction-routed" : ""}</span>
+        <span>expiry blk ${it.expiry}${s.head < it.expiry ? ` (${it.expiry - s.head} left)` : ""}</span></div>
+      <div class="row mono dim"><span>in ${it.input} BTC (escrow ${it.escrow})</span><span>minOut ${outLabel(it)}</span></div>
+      <div class="row mono dim"><span>btcTxid ${short(it.btcTxid)}</span><span>out ${short(it.outputToken)}</span></div>
+    </div>`).join("") || `<div class="empty">compose one on the left</div>`;
+
+  el("solvers").innerHTML = s.solvers.map((sv) => `
+    <div class="card">
+      <div class="row"><b>${esc(sv.label)}</b>
+        <span><span class="badge ${sv.running ? "b-green" : "b-red"}">${sv.running ? "RUNNING" : "STOPPED"}</span>
+        ${sv.running ? `<button class="small ghost" onclick="post('/api/stop/${sv.id}',{})">stop</button>` : ""}</span></div>
+      <div class="row mono dim"><span>${short(sv.addr)} · ${sv.strategy} · ${sv.marginBps}bps</span>
+        <span>bal ${sv.rbtc} · PnL <span class="${sv.pnlNeg ? "pnl-down" : "pnl-up"}">${sv.pnlNeg ? "" : "+"}${sv.pnl}</span></span></div>
+      <div class="log">${sv.log.map((l) => `<div><span class="t">${l.t}</span>${esc(l.line)}</div>`).join("")}</div>
+    </div>`).join("") || `<div class="empty">spawn one on the left — then watch it think</div>`;
+
+  el("feed").innerHTML = s.feed.map((f) => `<div class="card"><span class="dim mono">${f.t}</span> ${esc(f.line)}</div>`).join("")
+    || `<div class="empty">quiet</div>`;
+}
+
+async function refresh() {
+  try {
+    const s = await fetch("/state").then((r) => r.json());
+    lastState = s; render(s);
+  } catch { /* server restarting */ }
+}
+setInterval(refresh, 1200); refresh();
+</script>
+</body>
+</html>

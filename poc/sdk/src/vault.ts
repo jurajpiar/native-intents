@@ -35,3 +35,7 @@ export async function vaultApprove(v: Contract, spender: string, amount: bigint)
 export async function sharesOf(v: Contract, who: string): Promise<bigint> {
   return v.balanceOf(who);
 }
+/** Burn shares, recover the underlying RBTC 1:1 (a losing solver recovers its sunk deposit). */
+export async function vaultWithdraw(v: Contract, shares: bigint): Promise<string> {
+  return (await v.withdraw(shares, ov)).hash;
+}

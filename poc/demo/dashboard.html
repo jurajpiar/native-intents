@@ -186,10 +186,10 @@ async function pollLogs(head) {
 async function pollAuctions() {
   for (const H of state.intents.keys()) {
     const raw = await rpc("a", "eth_call", [{ to: AUCTION, data: SEL.bids + H.slice(2) }, "latest"]).catch(() => null);
-    if (!raw || raw.length < 2 + 64 * 5) continue;
+    if (!raw || raw.length < 2 + 64 * 6) continue; // 6-word Bid struct (outToken added by the generalised auction)
     const bidder = addrOf(word(raw, 0));
     if (bidder === "0x0000000000000000000000000000000000000000") continue;
-    state.auctions.set(H, { bidder, amount: "0x" + word(raw, 1), deadline: hexInt("0x" + word(raw, 2)), done: word(raw, 4).endsWith("1") });
+    state.auctions.set(H, { bidder, amount: "0x" + word(raw, 1), deadline: hexInt("0x" + word(raw, 2)), done: word(raw, 5).endsWith("1") });
   }
 }
 
