@@ -29,6 +29,14 @@ contract Settlement {
     // conditional: with no code at this address (older genesis) or no bid for H it is a no-op, so
     // bid-free intents and SDK-deployed auction instances behave exactly as before.
     address constant AUCTION = 0x0000000000000000000000000000000001000022;
+    // sentinel outputToken meaning "the output is BTC, delivered ON BITCOIN" (exit intents / E19).
+    // No code lives here — it is only a marker an intent's outputToken field can carry.
+    address constant BTC_OUT = 0x0000000000000000000000000000000001000023;
+    // confirmations the solver's BTC payout needs in the Bridge's SPV view before it settles. Regtest
+    // PoC value; mainnet policy would set this per reorg-risk appetite (the solver bears that risk).
+    int256 constant MIN_BTC_CONF = 1;
+    // blocks a reservation shields the reserver's BTC payment from exit races (see reserveExit)
+    uint256 public constant RESERVE_WINDOW = 30;
 
     // one real peg-in per btcTxid can be claimed once (the Bridge does not clear its record)
     mapping(bytes32 => bool) public claimedPegin;
@@ -41,7 +49,60 @@ contract Settlement {
      */
     mapping(bytes32 => uint256) public pegin;
 
+    /**
+     * Exit intents (BTC_OUT): each output of a solver's BTC payout transaction can settle at most one
+     * intent, keyed by keccak(payoutTxidDisplay, voutIndex). Per-OUTPUT (not per-tx) on purpose: one
+     * BTC transaction paying N users can settle N exit intents — batched payouts amortise BTC fees.
+     */
+    mapping(bytes32 => bool) public claimedBtcOut;
+
+    /**
+     * Exit reservations — the fix for "exit races burn the loser's BTC". A Bitcoin payment is
+     * irreversible, so if two solvers race the same exit, both have paid and only one is repaid; nobody
+     * competes under that rule. reserveExit moves the race onto RSK: a solver posts a bond and gains
+     * exclusive settlement rights for RESERVE_WINDOW blocks — long enough to pay on Bitcoin, confirm,
+     * and prove. Losing a reservation race costs gas, never bitcoin. Squatting (reserve, never pay) is
+     * priced: a lapsed reservation's bond is forfeited INTO the input escrow, so the stale exit becomes
+     * strictly more profitable for the next solver — the mechanism heals its own delays.
+     */
+    struct ExitReservation { address solver; uint256 until; uint256 bond; }
+    mapping(bytes32 => ExitReservation) public exitReservations;
+
+    /**
+     * Pull-payment ledger (the F1–F4 pattern from Auction.sol): solver-side RBTC payouts — the input
+     * release, exit bond refunds, excess refunds — are pushed best-effort with a gas cap and DOWNGRADE
+     * TO A CREDIT on failure instead of reverting the settlement. An unpayable solver therefore only
+     * ever hurts itself (its money waits here), never the user or the intent. Delivery of minOut to
+     * the USER stays a hard require: paying the user is the settlement's core promise.
+     */
+    mapping(address => uint256) public credit;
+    uint256 constant PUSH_GAS = 30_000;
+
     event Settled(bytes32 indexed h, address indexed user, address outputToken, uint256 minOut, uint256 inputClaimed);
+    event ExitReserved(bytes32 indexed h, address indexed solver, uint256 until, uint256 bond);
+    event ExitReservationForfeited(bytes32 indexed h, address indexed solver, uint256 bond);
+    event Credited(address indexed payee, uint256 amount);
+    event Withdrawn(address indexed payee, uint256 amount);
+
+    /// Best-effort RBTC push; on failure the amount becomes a withdrawable credit for `to`.
+    function _pay(address to, uint256 amount) internal {
+        if (amount == 0) return;
+        (bool ok,) = payable(to).call{value: amount, gas: PUSH_GAS}("");
+        if (!ok) {
+            credit[to] += amount;
+            emit Credited(to, amount);
+        }
+    }
+
+    /// Claim accrued credits. Effects-first: a failed transfer reverts only this call, never the ledger.
+    function withdraw() external {
+        uint256 amt = credit[msg.sender];
+        require(amt > 0, "nothing to withdraw");
+        credit[msg.sender] = 0;
+        (bool r,) = payable(msg.sender).call{value: amt}("");
+        require(r, "withdraw failed");
+        emit Withdrawn(msg.sender, amt);
+    }
 
     /// Model the peg-in credit: escrow `msg.value` of input RBTC against a BTC txid.
     function depositForPegin(bytes32 btcTxid) external payable {
@@ -68,6 +129,7 @@ contract Settlement {
             abi.decode(ret, (address, bytes32, bytes32, uint256, uint256, address));
 
         require(user != address(0), "bad intent");
+        require(outToken != BTC_OUT, "btc output: use settleBtcOut");
         require(block.number < expiry, "expired");
 
         // auction lock (see AUCTION above): while an open auction exists for H, only the auction settles
@@ -91,18 +153,172 @@ contract Settlement {
             (bool d,) = payable(user).call{value: minOut}("");
             require(d, "deliver failed");
             uint256 excess = msg.value - minOut;
-            if (excess > 0) {
-                (bool r,) = payable(msg.sender).call{value: excess}("");
-                require(r, "refund failed");
-            }
+            _pay(msg.sender, excess); // best-effort refund — an unpayable solver cannot revert delivery
         } else {
             require(msg.value == 0, "no rbtc for token intent");
             require(IERC20(outToken).transferFrom(msg.sender, user, minOut), "erc20 transfer failed");
         }
 
-        // release the input to the solver — repayment + spread. Prefer the REAL peg-in credited to this
-        // contract (recorded by the Bridge at peg-in), falling back to the modelled depositForPegin escrow.
-        uint256 input = 0;
+        uint256 input = _releaseInput(btcTxid);
+        emit Settled(H, user, outToken, minOut, input);
+    }
+
+    /**
+     * Exit intent settlement — the path BACK to BTC (the user's whole lifecycle stays on Bitcoin).
+     * The intent's outputToken is the BTC_OUT sentinel and its H commits to the user's BTC destination:
+     * H = keccak256("BTCOUT" || dest20 || salt). The solver pays `dest` on BITCOIN from its own UTXOs,
+     * then proves that payment here: SPV inclusion via the Bridge's header chain (RSKIP122
+     * getBtcTransactionConfirmations) plus a parse of the raw payout tx showing an unclaimed P2PKH
+     * output of >= minOut SATS (minOut is denominated in sats for exit intents) to `dest`. On success
+     * H is consumed and the escrowed RSK-side input is released to the solver — the mirror image of
+     * the peg-in flow, with the SPV proof pointing the other way.
+     *
+     * All bytes32 BTC hashes are DISPLAY order (as bitcoin-cli prints them); the contract reverses its
+     * own sha256d to match. Legacy (non-segwit) payout transactions only.
+     */
+    /// The bond a reservation must post: 10% of the payout (1 sat = 1e10 wei at par).
+    function exitBondFor(uint256 minOutSats) public pure returns (uint256) {
+        return minOutSats * 1_000_000_000; // minOutSats * 1e10 / 10
+    }
+
+    /**
+     * Reserve an exit intent before paying BTC: exclusive settlement rights for RESERVE_WINDOW blocks
+     * against a bond of >= exitBondFor(minOut). Refunded on the reserver's own settle; forfeited into
+     * the input escrow if the reservation lapses unsettled. Reserving over a LAPSED reservation
+     * forfeits the old bond the same way.
+     */
+    function reserveExit(bytes calldata rawIntentTx) external payable {
+        (bool ok, bytes memory ret) = PARSE.staticcall(rawIntentTx);
+        require(ok && ret.length == 192, "intent parse failed");
+        (address user, bytes32 H, bytes32 btcTxid, uint256 expiry, uint256 minOut, address outToken) =
+            abi.decode(ret, (address, bytes32, bytes32, uint256, uint256, address));
+        require(user != address(0), "bad intent");
+        require(outToken == BTC_OUT, "not a btc-out intent");
+        require(block.number < expiry, "expired");
+        uint256 consumed;
+        assembly { consumed := sload(H) }
+        require(consumed == 0, "H already consumed");
+
+        // the window must not outlive the intent (Auction.sol:91 precedent) — otherwise an honest
+        // reserver could be handed exclusivity it cannot possibly use, and forfeit at expiry (below)
+        require(block.number + RESERVE_WINDOW < expiry, "window would outlive intent");
+
+        ExitReservation storage r = exitReservations[H];
+        require(r.solver == address(0) || block.number >= r.until, "exit already reserved");
+        if (r.solver != address(0)) {
+            pegin[btcTxid] += r.bond; // lapsed: the old bond sweetens the pot for whoever fills now
+            emit ExitReservationForfeited(H, r.solver, r.bond);
+        }
+        require(msg.value >= exitBondFor(minOut), "reservation bond too low");
+        exitReservations[H] = ExitReservation(msg.sender, block.number + RESERVE_WINDOW, msg.value);
+        emit ExitReserved(H, msg.sender, block.number + RESERVE_WINDOW, msg.value);
+    }
+
+    /**
+     * A reservation that outlives its INTENT previously stranded the bond forever: reserveExit and
+     * settleBtcOut both require an unexpired intent, and forfeiture only ran inside those two paths.
+     * Now anyone may forfeit an expired-while-reserved exit's bond TO THE USER (push-then-credit) —
+     * the party the dead exit harmed. Squatting an exit to death therefore costs the full bond;
+     * an honest reserver is protected by the window guard above and by settling inside its window.
+     */
+    function forfeitExpiredExitBond(bytes calldata rawIntentTx) external {
+        (bool ok, bytes memory ret) = PARSE.staticcall(rawIntentTx);
+        require(ok && ret.length == 192, "intent parse failed");
+        (address user, bytes32 H,, uint256 expiry,, address outToken) =
+            abi.decode(ret, (address, bytes32, bytes32, uint256, uint256, address));
+        require(outToken == BTC_OUT, "not a btc-out intent");
+        uint256 consumed;
+        assembly { consumed := sload(H) }
+        require(consumed == 0, "settled - reservation already resolved");
+        require(block.number >= expiry, "intent still live");
+        ExitReservation storage r = exitReservations[H];
+        require(r.solver != address(0), "no reservation");
+        address squatter = r.solver;
+        uint256 bondAmt = r.bond;
+        delete exitReservations[H];
+        _pay(user, bondAmt);
+        emit ExitReservationForfeited(H, squatter, bondAmt);
+    }
+
+    function settleBtcOut(
+        bytes calldata rawIntentTx,
+        bytes32 salt,
+        bytes20 btcDest,
+        bytes calldata rawBtcTx,
+        bytes32 btcBlockHash,
+        uint256 merklePath,
+        bytes32[] calldata merkleHashes
+    ) external {
+        (address user, bytes32 H, bytes32 btcTxid, uint256 minOut) = _checkBtcOutIntent(rawIntentTx, salt, btcDest);
+
+        // reservation gate (cheap, before the SPV work): a LIVE reservation is exclusive; a lapsed one
+        // forfeits its bond into the release below unless the late reserver is the settler after all.
+        uint256 bondBack = 0;
+        ExitReservation storage resv = exitReservations[H];
+        if (resv.solver != address(0)) {
+            if (block.number < resv.until) {
+                require(msg.sender == resv.solver, "exit reserved by another solver");
+                bondBack = resv.bond;
+            } else if (msg.sender == resv.solver) {
+                bondBack = resv.bond; // late, but nobody re-reserved — no forfeit
+            } else {
+                pegin[btcTxid] += resv.bond;
+                emit ExitReservationForfeited(H, resv.solver, resv.bond);
+            }
+            delete exitReservations[H];
+        }
+
+        _checkAndClaimBtcPayment(rawBtcTx, btcDest, minOut, btcBlockHash, merklePath, merkleHashes);
+        assembly { sstore(H, add(number(), 1)) }
+        uint256 input = _releaseInput(btcTxid);
+        // best-effort bond refund: a reserver that cannot receive RBTC must not be able to brick its
+        // own settle AFTER having paid real, irreversible BTC (the old "bond refund failed" footgun).
+        _pay(msg.sender, bondBack);
+        emit Settled(H, user, BTC_OUT, minOut, input);
+    }
+
+    /// Parse + validate an exit intent: sentinel output, unexpired, H commits to (btcDest, salt), unconsumed.
+    function _checkBtcOutIntent(bytes calldata rawIntentTx, bytes32 salt, bytes20 btcDest)
+        internal view returns (address user, bytes32 H, bytes32 btcTxid, uint256 minOut)
+    {
+        (bool ok, bytes memory ret) = PARSE.staticcall(rawIntentTx);
+        require(ok && ret.length == 192, "intent parse failed");
+        uint256 expiry;
+        address outToken;
+        (user, H, btcTxid, expiry, minOut, outToken) =
+            abi.decode(ret, (address, bytes32, bytes32, uint256, uint256, address));
+        require(user != address(0), "bad intent");
+        require(outToken == BTC_OUT, "not a btc-out intent");
+        require(block.number < expiry, "expired");
+        require(H == keccak256(abi.encodePacked("BTCOUT", btcDest, salt)), "dest not committed in H");
+        uint256 consumed;
+        assembly { consumed := sload(H) }
+        require(consumed == 0, "H already consumed");
+    }
+
+    /// SPV-verify the solver's BTC payout via the Bridge's header chain, find an unclaimed P2PKH output
+    /// of >= minSats to dest, and mark that (txid, vout) claimed.
+    function _checkAndClaimBtcPayment(
+        bytes calldata rawBtcTx,
+        bytes20 btcDest,
+        uint256 minSats,
+        bytes32 btcBlockHash,
+        uint256 merklePath,
+        bytes32[] calldata merkleHashes
+    ) internal {
+        bytes32 payTxid = _reverse32(sha256(abi.encodePacked(sha256(rawBtcTx))));
+        (bool okC, bytes memory retC) = BRIDGE.staticcall(abi.encodeWithSignature(
+            "getBtcTransactionConfirmations(bytes32,bytes32,uint256,bytes32[])",
+            payTxid, btcBlockHash, merklePath, merkleHashes));
+        require(okC && retC.length == 32, "confirmations call failed");
+        require(abi.decode(retC, (int256)) >= MIN_BTC_CONF, "btc payout not confirmed");
+        (uint256 voutIdx, ) = _findPayment(rawBtcTx, btcDest, minSats, payTxid);
+        claimedBtcOut[keccak256(abi.encodePacked(payTxid, voutIdx))] = true;
+    }
+
+    /// Release the input to the solver — repayment + spread. Prefer the REAL peg-in credited to this
+    /// contract (recorded by the Bridge at peg-in), falling back to the modelled depositForPegin escrow.
+    function _releaseInput(bytes32 btcTxid) internal returns (uint256 input) {
         (bool ok2, bytes memory raw) = BRIDGE.staticcall(abi.encodeWithSignature("getPeginInfo(bytes32)", btcTxid));
         if (ok2 && raw.length >= 128 && !claimedPegin[btcTxid]) {
             bytes memory info = abi.decode(raw, (bytes)); // Bridge returns BYTES wrapping 64 bytes
@@ -118,11 +334,61 @@ contract Settlement {
             input = pegin[btcTxid];
             if (input > 0) pegin[btcTxid] = 0;
         }
-        if (input > 0) {
-            (bool c,) = payable(msg.sender).call{value: input}("");
-            require(c, "input claim failed");
-        }
+        _pay(msg.sender, input); // best-effort — an unpayable claimant's input waits as a credit
+    }
 
-        emit Settled(H, user, outToken, minOut, input);
+    /// First unclaimed P2PKH output in a LEGACY btc tx paying >= minSats to dest20. Reverts if none.
+    function _findPayment(bytes calldata t, bytes20 dest, uint256 minSats, bytes32 payTxid)
+        internal view returns (uint256 voutIdx, uint256 sats)
+    {
+        require(t.length > 5 && t[4] != 0x00, "segwit payout unsupported");
+        uint256 o = 4; // skip version
+        uint256 n;
+        (n, o) = _varint(t, o);                       // inputs
+        for (uint256 i = 0; i < n; i++) {
+            o += 36;                                  // prevout (32 + 4)
+            uint256 sl;
+            (sl, o) = _varint(t, o);
+            o += sl + 4;                              // scriptSig + sequence
+        }
+        (n, o) = _varint(t, o);                       // outputs
+        for (uint256 i = 0; i < n; i++) {
+            uint256 value = 0;
+            for (uint256 j = 0; j < 8; j++) { value |= uint256(uint8(t[o + j])) << (8 * j); } // LE sats
+            o += 8;
+            uint256 sl;
+            (sl, o) = _varint(t, o);
+            if (sl == 25 && t[o] == 0x76 && t[o + 1] == 0xa9 && t[o + 2] == 0x14
+                && t[o + 23] == 0x88 && t[o + 24] == 0xac
+                && bytes20(t[o + 3:o + 23]) == dest
+                && value >= minSats
+                && !claimedBtcOut[keccak256(abi.encodePacked(payTxid, i))]) {
+                return (i, value);
+            }
+            o += sl;
+        }
+        revert("no unclaimed payout to dest");
+    }
+
+    function _varint(bytes calldata t, uint256 o) internal pure returns (uint256 v, uint256 no) {
+        uint8 b = uint8(t[o]);
+        if (b < 0xfd) return (b, o + 1);
+        if (b == 0xfd) return (uint256(uint8(t[o + 1])) | (uint256(uint8(t[o + 2])) << 8), o + 3);
+        revert("varint too large");
+    }
+
+    /// byte-reverse a bytes32 (internal sha256d order <-> bitcoin display order)
+    function _reverse32(bytes32 x) internal pure returns (bytes32) {
+        uint256 v = uint256(x);
+        v = ((v >> 8)  & 0x00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF)
+          | ((v & 0x00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF) << 8);
+        v = ((v >> 16) & 0x0000FFFF0000FFFF0000FFFF0000FFFF0000FFFF0000FFFF0000FFFF0000FFFF)
+          | ((v & 0x0000FFFF0000FFFF0000FFFF0000FFFF0000FFFF0000FFFF0000FFFF0000FFFF) << 16);
+        v = ((v >> 32) & 0x00000000FFFFFFFF00000000FFFFFFFF00000000FFFFFFFF00000000FFFFFFFF)
+          | ((v & 0x00000000FFFFFFFF00000000FFFFFFFF00000000FFFFFFFF00000000FFFFFFFF) << 32);
+        v = ((v >> 64) & 0x0000000000000000FFFFFFFFFFFFFFFF0000000000000000FFFFFFFFFFFFFFFF)
+          | ((v & 0x0000000000000000FFFFFFFFFFFFFFFF0000000000000000FFFFFFFFFFFFFFFF) << 64);
+        v = (v >> 128) | (v << 128);
+        return bytes32(v);
     }
 }

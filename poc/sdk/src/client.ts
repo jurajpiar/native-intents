@@ -56,7 +56,7 @@ export interface TxRpc {
   nonce: string;
   blockNumber: string | null;
 }
-export interface Receipt { status: string; blockNumber: string | null; }
+export interface Receipt { status: string; blockNumber: string | null; gasUsed?: string; }
 interface TxPoolContent {
   pending?: Record<string, Record<string, TxRpc[]>>;
   queued?: Record<string, Record<string, TxRpc[]>>;

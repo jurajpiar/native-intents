@@ -10,7 +10,7 @@
 
 # Abstract
 
-A new Rootstock-native transaction type in the RSK typed-transaction namespace (`0x02 || subtype`, reserved by RSKIP543/545/546) in which the user signs constraints — a hash-committed payload, a minimum output, an expiry height, and an anti-spam reference — instead of exact calldata. Consensus enforces the constraints before inclusion; independent solvers compete to satisfy them and are paid from the spread. This document specifies the type, its mempool admission rules, and a native consumed-set registry, and describes the atomic intent+solution settlement bundle as the target design. A milestone-1 proof of concept (mempool-only) is implemented and its results are reported.
+A new Rootstock-native transaction type in the RSK typed-transaction namespace (`0x02 || subtype`, reserved by RSKIP543/545/546) in which the user signs constraints — a hash-committed payload, a minimum output, an output asset, an expiry height, and an anti-spam reference — instead of exact calldata. Consensus enforces the constraints before inclusion; independent solvers compete to satisfy them and are paid from the spread. This document specifies the type, its mempool admission rules, the consumed set, outcome-based settlement (including the exit path whose output is BTC delivered on Bitcoin), and the activation gate. A proof of concept implements the full lifecycle — Bitcoin in, Bitcoin out, with the user never sending a Rootstock transaction — and every property below is verified by falsification experiments (E1–E19) against patched rskj regtest nodes and a real bitcoind.
 
 # Motivation
 
@@ -42,13 +42,13 @@ The signing hash follows the RSK-namespace scheme for a non-zero chain id: `kecc
 
 ## Intent constraints (the `data` field)
 
-`data` is exactly 128 bytes, four 32-byte words:
+`data` is exactly 160 bytes, five 32-byte words:
 
 ```
-data = H (32) || btcTxid (32) || expiryHeight E (32) || minOut (32)
+data = H (32) || btcTxid (32) || expiryHeight E (32) || minOut (32) || outputToken (32)
 ```
 
-`H` is a commitment to the full pipeline the user wants executed (`H = keccak256(pipeline)`); the pipeline itself is revealed off-chain to a solver at solve time. `btcTxid` references the confirmed Bitcoin transaction that serves as the anti-spam ticket. `E` is the absolute Rootstock height at which the intent expires. `minOut` is the minimum acceptable output, carried for the solver and enforced at settlement.
+`H` is a commitment to the full pipeline the user wants executed (`H = keccak256(pipeline)`); the pipeline itself is revealed off-chain to a solver at solve time. `btcTxid` references the confirmed Bitcoin transaction that serves as the anti-spam ticket (and, in the fee RSKIP, keys the input escrow). `E` is the absolute Rootstock height at which the intent expires. `minOut` is the minimum acceptable output, enforced at settlement. `outputToken` names the output asset: the zero address for native RBTC, an ERC-20 address for tokens (vault shares and LP tokens included — settlement is outcome-based, so any pipeline whose terminal step tokenises is expressible), or the reserved sentinel `0x…01000023` meaning *BTC delivered on Bitcoin* (an exit intent; `minOut` is then denominated in satoshis, and `H` additionally commits to the user's Bitcoin destination: `H = keccak256("BTCOUT" || hash160 || salt)`, verified on-chain at settlement without the format growing a field).
 
 ## Mempool admission (pre-inclusion validity)
 
@@ -61,21 +61,22 @@ An intent is admitted to the mempool — and therefore gossiped — only if all 
 
 The intent's transaction cost is defined to be zero, so the balance and account-existence checks that normally gate a payer-less sender do not apply — this is what delivers the first motivating property. Checks 2–4 are the second: an intent that fails them is rejected here, never enters a block, and costs nothing. Checks 3 and 4 are storage reads against current state (the consumed-set registry and the Bridge's processed-peg-in set respectively).
 
-## Consumed-set registry (precompile)
+## Parse precompile and the consumed set
 
-A native precompiled contract at a fixed address (`0x…01000020` in the PoC) holds the set of consumed intent commitments as ordinary world state, in the same manner as the Bridge's processed-peg-in-txid set. It exposes:
+Two fixed addresses split the work:
 
-- `isConsumed(bytes32 H) → bool`
-- `consumedHeight(bytes32 H) → uint256`
-- `consume(bytes32 H)` — records `H`, callable by a solver's settlement.
+- **Parse precompile** (`0x…01000020`): stateless. Given the raw signed intent bytes it reconstructs the RSK-namespace signing hash, recovers the user, and returns the decoded fields `(user, H, btcTxid, E, minOut, outputToken)` — the one step impractical in Solidity. Any contract may staticcall it, so settlement-layer contracts (the settlement contract, the auction) authenticate intents without duplicating signature logic.
+- **Settlement contract** (`0x…01000021`, deployed at activation): owns the consumed set as ordinary contract storage at slot `== H`, readable by `eth_call`, provable by storage proof, and read directly by mempool admission. `isConsumed(bytes32 H) → bool` is the public view.
 
-`H` is recorded only on successful execution: the write is made on the transaction's execution track, which is committed only if the transaction succeeds. Reorg handling is ordinary state reversion. The mental model is that the consumed set is to intents what the nonce is to accounts: the registry is readable by `eth_call` and provable by storage proof.
+`H` is recorded only on successful settlement: the write commits only if the settling transaction succeeds, so consumption is bound to delivery by construction. Reorg handling is ordinary state reversion — verified both by state-rollback (E9) and by a genuine two-node partition/merge in which a node's own fork choice orphans a settlement, reverts delivery and `H`, and the intent settles again on the new chain (E16). The mental model stands: the consumed set is to intents what the nonce is to accounts.
 
 ## Settlement: atomic solve
 
 An intent is satisfied by a single solver transaction that calls the settlement contract's `settle(rawIntentTx)`. In one transaction the settlement contract authenticates the intent (a stateless parse precompile recovers the user from the signature — the one step impractical in Solidity), re-checks admission at the inclusion height (unexpired, `H` unconsumed), delivers at least `minOut` of the output asset to the user (native RBTC, or an ERC-20 via `transferFrom`), and only then records `H` consumed in its own storage. Transaction atomicity is the all-or-nothing guarantee: if any bound fails — delivery short of `minOut`, expired, already consumed — the whole call reverts, `H` is not consumed, the intent remains solvable until `E`, and the solver forfeits the gas. This is what binds consumption to delivery: the only way to consume an intent's `H` is to satisfy it.
 
-This is realized without a block-construction change, and settlement runs in the VM (a genesis-deployed contract), so failures revert visibly. The solver transaction carries the signed intent bytes, so it is self-contained, and EVM transaction atomicity supplies the bundle semantics. A consensus-level bundle object (miner-assembled intent+solution, for MEV and ordering control) remains a possible future refinement. Solver repayment and spread accounting are deferred to a companion fee-mechanics RSKIP.
+This is realized without a block-construction change, and settlement runs in the VM (a contract deployed at activation), so failures revert visibly. The solver transaction carries the signed intent bytes, so it is self-contained, and EVM transaction atomicity supplies the bundle semantics. A consensus-level bundle object (miner-assembled intent+solution, for MEV and ordering control) remains a possible future refinement. Solver repayment, the input claim, price competition (the above-`minOut` auction), and the exit path are specified in the companion fee-mechanics RSKIP.
+
+Two settlement-adjacent mechanisms live alongside `settle` and are specified in the companion RSKIP: an auction lock (while an open auction exists for `H` in the designated auction contract, `settle` rejects other callers, so bids above `minOut` cannot be undercut by a bypass at the minimum), and `settleBtcOut` for exit intents (the solver proves a real Bitcoin payment to the destination committed in `H` — SPV inclusion against the Bridge's header chain via RSKIP122 `getBtcTransactionConfirmations`, plus an on-chain parse of the payout transaction — then claims the escrowed input).
 
 ## Expiry, replay, and reorg
 
@@ -95,7 +96,7 @@ Two honest qualifications. "Instant" is a property of solver fronting, not of th
 
 # Backwards compatibility
 
-The type is additive and lives behind the RSKIP543/545/546 typed-transaction activation. Existing transaction types are unaffected. The consumed-set registry is a new precompile; adding it to the genesis precompile set changes state roots at its activation and therefore must be introduced behind a proper activation gate on public networks (the PoC keeps it always-on for regtest only).
+The type is additive and lives behind the RSKIP543/545/546 typed-transaction activation, and everything in this proposal is gated by its own consensus rule (`RSKIPINTENT` in the PoC): the zero-cost admission path, the parse precompile's availability, and the settlement/auction contract deployments all activate at the fork height and are inert before it (verified in E13 — pre-activation intents are rejected with a distinct reason; post-activation they are admitted). Existing transaction types are unaffected.
 
 # Reference implementation and test cases
 
@@ -113,6 +114,13 @@ The experiments each try to falsify a claim:
 - E9 — a reorg that drops the solve reverts both `H` and the delivery, and the intent is solvable again. (Reorg / state reversion.)
 - E10 — an intent whose output is an ERC-20 is settled by delivering the token to the user. (Token output.)
 - E11 — a failed solve reverts visibly (status 0x0) and leaves `H` intact. (Visible revert.)
+- E12 — the solver claims the escrowed input and keeps the spread; the user gets the output. (Fee mechanics; companion RSKIP.)
+- E13 — intents are rejected before the activation height and admitted after. (Activation gate.)
+- E14 — a real RSKIP170 peg-in credits the settlement contract; `settle` releases the actual pegged-in input to the solver. (Real input binding.)
+- E15 — two bonded solvers race one intent: exactly one settle lands, the user is paid once, the loser reverts. (First-valid-inclusion; bonding.)
+- E16 — a genuine two-node p2p partition/merge orphans a settlement; delivery and `H` revert and the intent settles again. (Reorg, full p2p form.)
+- E17/E17b — solvers bid above `minOut`; the user receives the best bid; the enforced auction closes the settle-at-minimum bypass while bid-free intents settle exactly as before. (Price competition.)
+- E19 — a solver's real Bitcoin payment to the user's address, SPV-proven, settles the exit intent and releases the input; a reserved exit rejects other solvers even with valid proofs; wrong destinations and replayed payout outputs revert; a lapsed reservation's bond sweetens the next fill. (Exit path.)
 
 # Implementation status
 
@@ -126,23 +134,31 @@ Milestone 3 moved settlement into a VM contract (genesis-deployed) that calls a 
 
 Milestone 4 implemented the fee mechanics (companion RSKIP): the settlement contract escrows the input (the peg-in, keyed by btcTxid) and releases it to the solver as repayment plus spread when it settles, verified cross-asset in E12 (user pegs in RBTC, receives an ERC-20; solver claims the RBTC input). A finding: native RBTC cannot be pulled from the user, so the input is escrowed in the contract rather than authorised for transfer from the user's balance.
 
-Not yet implemented: a consensus-level bundle object (settlement is a single solve transaction, a VM contract call); and solver price discovery, bonding, and the over-minOut auction (market structure, off-consensus). The production peg-in→contract crediting is modelled by `depositForPegin`. The settlement-contract architecture that would add token outputs (and, as a side effect, visible reverts) and the consensus-level bundle are sketched in `poc/BEYOND-V1.md`.
+The productionization items are also implemented and verified. Activation gate: an `RSKIPINTENT` consensus rule gates admission, the precompile, and the deployments (E13). Real input binding: a genuine RSKIP170 v1 peg-in whose OP_RETURN names the settlement contract credits it directly, the Bridge records the (destination, amount) pair per txid, and `settle` releases the actual pegged-in input (E14) — in production this could instead reuse Flyover's Programmable Peg-in Addresses (RSKIP176), an already-audited mechanism for crediting a contract keyed by a derivation hash. Solver market: a bond contract (E15), the above-`minOut` auction in both off-consensus and enforced shapes with token-denominated bids, pull-payment hardening and lock decay (E17/E17b), and the exit path with SPV-verified solver payouts and bonded reservations (E19). A genuine two-node p2p reorg is verified (E16). See `PRODUCTIONIZATION.md` for the full analysis, including the relationship to Flyover.
+
+Not implemented, by design: a consensus-level bundle object (settlement is a single solve transaction, a VM contract call), the off-chain reveal protocol, and endorsement/reputation — the latter two ship as specification with this RSKIP.
 
 Two implementation notes surfaced by the PoC. First, relevant to any SDK: rskj serialises a zero `gasPrice` as a raw `0x00` byte (`RLP.encodeCoinNonNullZero`) while a zero `value` and zero `nonce` serialise as `0x80`; a signer that does not match this recomputes a different signing hash and recovers the wrong sender. Second, relevant to the settlement design: in the current executor a raw precompiled-contract exception is not propagated to the transaction receipt. For a precompile, `go()` takes the `vm == null` branch and commits the transaction track unconditionally, and the receipt status is derived from an execution-error string that the precompile path never sets — so a throwing precompile reports success with its writes committed. Bridge and Remasc are subject to the same behaviour and are written to avoid throwing for expected failures, handling them internally instead. The PoC works within this by making `solve` write only after all checks pass (a failed solve therefore has no effect: no delivery, `H` unconsumed) and by judging outcomes on state effects, not receipt status. Making a failed `solve` revert *visibly* should not be done by changing the shared precompile path — that would alter Bridge and Remasc consensus behaviour. The clean route is to invoke settlement through a thin VM contract that calls the registry: the VM execution path already rolls back state and fails the receipt on a failed call, so a failed `solve` would revert normally. Alternatively the precompile can return an explicit result code the caller checks. This is a settlement-path refinement, not a change to the transaction type or the consumed set.
 
 # Open questions
 
-- Envelope: whether the intent is signed by a user EVM key (SDK-derived) or by a signature recoverable from the Bitcoin input; and the aggressive variant that packs constraints into the Bitcoin `OP_RETURN` so the intent is fully derivable from the Bitcoin transaction, dissolving the submission step.
-- Admission latency is Bridge-bound: either admission tolerates "not yet visible" with a retry window (weakening the spam filter) or the SDK waits for Bridge registration (adding latency).
-- Exactly when `H` enters the consumed set (currently on successful settlement only, which is what permits retry after a failed solve), and the precise griefing bound.
+- Envelope: whether the intent is signed by a user EVM key (SDK-derived) or by a signature recoverable from the Bitcoin input; and the aggressive variant that packs constraints into the Bitcoin `OP_RETURN` so the intent is fully derivable from the Bitcoin transaction, dissolving the submission step. (The PoC already carries `H` in the peg-in's OP_RETURN alongside the RSKIP170 payload, as a step in this direction.)
+- Admission latency is Bridge-bound: either admission tolerates "not yet visible" with a retry window (weakening the spam filter) or the SDK waits for Bridge registration (adding latency). A fast-fill variant — lower-confirmation tickets with the reorg risk collateralised by solver bonds — is the flyover-style answer and needs its own analysis.
+- Exit intents couple three parameters that must be sized together: the intent's expiry must budget for the solver's Bitcoin confirmations plus the on-chain proof work, the reservation window must fit inside the expiry, and `MIN_BTC_CONF` allocates the payout-reorg risk (it protects the *user*; the solver's bond is the backstop). Regtest values (expiry ≤ 95 blocks, window 30, conf 1) do not transfer to mainnet.
+- A native permit: exiting a live position (vault shares, LP tokens) without any user Rootstock transaction requires the intent itself to carry a transfer authorisation the settlement contract can exercise. EIP-2612 covers permit-aware tokens; the protocol-level generalisation is open.
+- Recovery of an expired exit intent's escrowed input (Flyover's `refundUserPegOut` is the model); currently a documented gap.
 - Consumed-set pruning (lazy prune vs Remasc-style sweep vs bounded growth) and RSKIP555 interaction.
-- The slow-path/refund mechanism when no solver bites, if the flagship flow cannot be shaped as an ordinary peg-in.
+- Enforced vs off-consensus auction: a governance decision this proposal surfaces rather than makes (see the companion RSKIP and `PRODUCTIONIZATION.md`).
 
 # References
 
 - RSKIP36 — EXECUTE opcode (2017), sponsorship-only prior work.
 - RSKIP138 — multi-signed enveloping (2019), sponsorship-only prior work.
 - RSKIP543 / RSKIP545 / RSKIP546 — typed transactions and the `0x02` RSK namespace; rskj PR #3558.
+- RSKIP122 — Bitcoin transaction confirmations query (`getBtcTransactionConfirmations`); the SPV primitive the exit path builds on.
+- RSKIP170 — peg-in transaction version 1 (OP_RETURN destination); the input-binding mechanism verified in E14.
+- RSKIP176 — Programmable Peg-in Addresses (Flyover); the production alternative for crediting the settlement contract.
+- Flyover / Liquidity Bridge Contract — the closest production relative (see `PRODUCTIONIZATION.md`, "Relationship to Flyover"): its `refundPegOut` is shape-for-shape this proposal's `settleBtcOut`, and its LP collateral/penalty model is the precedent for solver bonds.
 - RSKIP555 (Draft) — fork-aware consensus.
 - EIP-155 — replay-protected transaction signing.
 - EIP-2718 — typed transaction envelope.

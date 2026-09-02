@@ -19,11 +19,18 @@ contract Griefer {
         require(ok, "inner bid failed");
     }
 
-    /// Attempt to withdraw accrued credit. The auction's transfer back to this contract always
+    /// Attempt to withdraw accrued credit. The target's transfer back to this contract always
     /// reverts (no receive), so this demonstrates withdraw-failure isolation: only THIS call
-    /// fails; the credit survives untouched.
-    function doWithdraw(address auctionAddr) external {
-        (bool ok,) = auctionAddr.call(abi.encodeWithSignature("withdraw()"));
+    /// fails; the credit survives untouched. Works against any contract with withdraw().
+    function doWithdraw(address target) external {
+        (bool ok,) = target.call(abi.encodeWithSignature("withdraw()"));
         require(ok, "inner withdraw failed");
+    }
+
+    /// Generic passthrough (E20): act as an UNPAYABLE caller of any function — e.g. reserveExit /
+    /// settleBtcOut on Settlement — so experiments can prove those paths cannot be self-bricked.
+    function exec(address target, bytes calldata data) external payable {
+        (bool ok,) = target.call{value: msg.value}(data);
+        require(ok, "inner call failed");
     }
 }

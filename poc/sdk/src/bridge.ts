@@ -3,7 +3,7 @@
  * Reads go via eth_call; state changes (receiveHeader, registerBtcTransaction) are sent from a funded
  * account. All three write/read methods used here are public on regtest (all forks active).
  */
-import { Interface, JsonRpcProvider, Network, Wallet, getBytes } from "ethers";
+import { Interface, JsonRpcProvider, Network, NonceManager, Wallet, getBytes } from "ethers";
 import { Rpc } from "./client.js";
 import { BRIDGE_ADDR, CHAIN_ID, COW_KEY } from "./config.js";
 
@@ -18,10 +18,22 @@ const iface = new Interface([
 
 export class Bridge {
   private provider: JsonRpcProvider;
-  private wallet: Wallet;
+  private signer: NonceManager;
   constructor(private rpc: Rpc, payerKey: string = COW_KEY) {
     this.provider = new JsonRpcProvider(rpc.url, new Network("rsk-regtest", CHAIN_ID), { staticNetwork: true });
-    this.wallet = new Wallet(payerKey, this.provider);
+    // NonceManager tracks the nonce LOCALLY across sends: header relays batch-send many txs without
+    // waiting for receipts, and rskj's pending count does not reflect a just-submitted tx quickly
+    // enough — two provider-fetched nonces collide and rskj rejects the second with -32010
+    // ("gas price not enough to bump transaction", i.e. an underpriced same-nonce replacement).
+    this.signer = new NonceManager(new Wallet(payerKey, this.provider));
+  }
+
+  /**
+   * Re-sync the local nonce with the chain. Call at the START of a batch if this key has sent
+   * transactions through OTHER signers since the last batch (the local count would be stale).
+   */
+  resetNonce(): void {
+    this.signer.reset();
   }
 
   private async callRead<T>(fn: string, args: unknown[] = []): Promise<T> {
@@ -46,7 +58,7 @@ export class Bridge {
     Number(await this.callRead<bigint>("getBtcTxHashProcessedHeight", [txidBigEndianHex]));
 
   private async send(fn: string, args: unknown[]): Promise<string> {
-    const tx = await this.wallet.sendTransaction({
+    const tx = await this.signer.sendTransaction({
       to: BRIDGE_ADDR,
       data: iface.encodeFunctionData(fn, args),
       gasLimit: 500_000,

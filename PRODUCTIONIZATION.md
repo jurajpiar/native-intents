@@ -133,6 +133,89 @@ than `minOut` within a short window (an auction above the base first-valid-inclu
 > above `minOut`, so the user always nets more than their ask. The trade-off between the two shapes is a
 > governance decision the RSKIP should surface, not bury.
 
+## D. The path back to BTC (exit intents)
+
+> Status: implemented AND verified in the PoC (experiment E19, all checks green — including the
+> reservation exclusivity, wrong-destination rejection, per-output replay guard, and the squatter-lapse
+> bond forfeit; `btcout` type in the playground). `settleBtcOut` in the
+> settlement contract verifies a solver's REAL Bitcoin payment — SPV inclusion via the Bridge's header
+> chain (RSKIP122 `getBtcTransactionConfirmations`, already public and statically callable) plus an
+> on-chain parse of the raw payout transaction showing an unclaimed P2PKH output of ≥ `minOut` sats to
+> the destination committed in `H` — then consumes `H` and releases the escrowed input to the solver.
+
+The exit is the mirror image of the peg-in flow, and it completes the design's central promise: the user's
+entire lifecycle stays on Bitcoin. They sign an exit intent whose output is BTC delivered on Bitcoin —
+`outputToken` is a sentinel (`0x..01000023`) and `H` commits to their BTC address:
+`H = keccak256("BTCOUT" || hash160 || salt)`, so the destination is user-signed without the intent format
+growing a field, and revealed to solvers off-chain like the rest of the pipeline. A solver pays the
+address from its own UTXOs and proves it; the SPV proof points the opposite way from the peg-in's.
+
+Why solver-direct payment rather than a Bridge peg-out: `releaseBtc` derives the BTC destination from the
+caller's own key (no arbitrary destinations, and not callable meaningfully from a contract), and a peg-out
+takes hours; a solver payout is a single Bitcoin transaction to exactly the address the user asked for,
+priced into the spread. Design consequences worth carrying into the RSKIP:
+
+- **Confirmation policy is the solver's risk, not the user's.** `MIN_BTC_CONF` (1 in the PoC) sets how
+  deep the payout must be before it can settle. A Bitcoin reorg after settlement cannot un-consume `H` —
+  but it CAN unwind the payout while the solver keeps the input, so the number protects the USER and
+  should be meaningfully higher than 1 in production; the solver's bond (section C) is the natural
+  backstop for the residual.
+- **Batched exits.** The claim guard is per payout OUTPUT, not per transaction: one Bitcoin transaction
+  paying N users can settle N exit intents, amortising BTC fees across fills — a real solver efficiency
+  the PoC's contract already supports.
+- **Exit races would burn the loser's BTC — so exits are RESERVED.** If two solvers raced an exit, both
+  would have irreversibly paid the user (who is paid twice) and only one claims the input; nobody
+  competes under that rule. The implemented fix (`reserveExit`, in E19 and the playground): before
+  paying, a solver posts a bond (10% of the payout) for exclusive settlement rights over a
+  `RESERVE_WINDOW` — the race moves to the RSK leg, where losing costs gas, never bitcoin. Squatting is
+  priced: a lapsed reservation's bond is forfeited INTO the input escrow, so a stalled exit becomes
+  strictly more profitable for the next solver — the mechanism heals its own delays, and the user stays
+  BTC-only (no unusable RBTC compensation). Reservation is opt-in (an unreserved exit is still
+  first-valid), but a rational solver always reserves; the RSKIP should carry this as a first-class part
+  of the exit design, with window and bond sized for mainnet confirmation latency.
+- **The input side still needs a native permit.** The PoC escrows the exit's input (`depositForPegin`
+  stand-in); a real user exiting a live position (vault shares, LP) would need to authorise the pull
+  without an RSK transaction of their own. EIP-2612-style permits cover permit-aware tokens; a
+  protocol-level answer — the intent itself carrying a transfer authorisation the settlement contract can
+  exercise — is the clean generalisation and belongs in the RSKIP discussion.
+- PoC parser scope: legacy P2PKH payout outputs only (no segwit); regtest wallets here are legacy, and a
+  production implementation would extend the output matcher, not the mechanism.
+
+## Relationship to Flyover
+
+Flyover (the LBC + LP protocol) is the closest production relative of this design — effectively "intents
+specialised to the peg, with a pre-chosen counterparty" — and it de-risks several of our mechanisms
+because it has already shipped them:
+
+- **The exit mechanism is production-proven.** LBC `refundPegOut(quoteHash, btcTx, btcBlockHeaderHash,
+  partialMerkleTree, merkleBranchHashes)` is shape-for-shape our `settleBtcOut`: the LP pays the user's
+  BTC address, then proves the payment on RSK (raw non-witness tx + SPV branch against the Bridge) to be
+  refunded. Two binding styles differ and are worth comparing in the RSKIP: Flyover embeds the quote hash
+  in an OP_RETURN output of the payout tx at a fixed position; we commit the destination inside `H` and
+  guard per `(txid, vout)` — ours needs no extra payout output and supports batched payouts, theirs makes
+  the payment↔service binding explicit on Bitcoin. LBC's audited Solidity for BTC tx validation is
+  directly reusable.
+- **Peg-in binding could reuse RSKIP176 instead of a new Bridge change.** Milestone A added a custom
+  `getPeginInfo`; production could instead ride Flyover's Programmable Peg-in Addresses (RSKIP176), where
+  the Bridge already refunds a contract keyed by a derivation hash — the settlement contract plus `H`
+  slots naturally into the derivation. Less new consensus surface, existing audits.
+- **Collateral and penalties exist.** LBC LPs register with collateral, quotes carry a `penaltyFee`, and
+  `refundPegOut` applies punishments — production precedent for our solver bond (C) and the exit
+  reservation bond, including sizing experience.
+- **Flyover LPs are the bootstrap solver set.** They already run BTC liquidity, LP servers, and proof
+  infrastructure; "entry is permissionless, profitable participation requires standing" is easiest to
+  make true from day one by onboarding them. Flyover peg-in (LP advances funds after a few confirmations
+  and waits out the 100 itself) is also exactly the fast-fill variant sketched above — with the reorg
+  risk-transfer already priced by a live market.
+
+What intents add over Flyover, precisely: no pre-agreed counterparty (open per-fill competition and
+auctions instead of a bilateral quote), outcome-based settlement (`minOut` of a terminal asset, any
+route) instead of quoted calldata (`callForUser`), no user RSK transaction for exits (Flyover's
+`depositPegout` requires one), and mempool citizenship for the payer-less ask. One Flyover feature we
+lack and should adopt: `refundUserPegOut` — the user's recovery path when the counterparty never
+delivers. Our analogue (recovering an expired exit intent's escrowed input) is currently a documented
+gap.
+
 ## Cross-cutting: the executor revert path
 
 The PoC settles through a VM contract precisely because a raw precompile cannot revert visibly in the

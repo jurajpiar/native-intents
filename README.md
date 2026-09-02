@@ -74,6 +74,12 @@ per-solver PnL and a full decode of every intent.
 | E7, E6 | Settlement delivers ≥ min-out atomically; an under-delivering solve reverts and leaves `H` intact | ✓ |
 | E10, E11 | The output can be an ERC-20; a failed solve reverts visibly | ✓ |
 | E12 | The solver claims the escrowed input (the peg-in) and keeps the spread; the user gets the output | ✓ |
+| E13 | Intents are rejected before the `RSKIPINTENT` activation height and admitted after | ✓ |
+| E14 | A real RSKIP170 peg-in credits the settlement contract; settle releases the actual pegged-in input | ✓ |
+| E15 | Two bonded solvers race one intent: one settle lands, the user is paid once, the loser reverts | ✓ |
+| E16 | A genuine two-node p2p reorg orphans a settlement; delivery + `H` revert; the intent settles again | ✓ |
+| E17/E17b | Solvers bid above `minOut`; the user receives the best bid; the enforced auction closes the bypass | ✓ |
+| E19 | A solver's real BTC payment, SPV-proven, settles the exit intent; reservations make exit races safe | ✓ |
 
 (E1b, the cross-node gossip variant, is timing-sensitive right after a fresh recreate — transaction
 relay can lag the first blocks — so it occasionally needs a re-run; E1 proves the same claim on a single
@@ -108,6 +114,13 @@ always-on genesis; E13), **real peg-in binding** (a genuine RSKIP170 peg-in cred
 contract and the Bridge records its destination + amount, which `settle` releases to the solver; E14),
 and the **solver market** (a `Bond` contract solvers stake into, off the settle path, plus a competing-
 solvers race showing first-valid-inclusion — one settle wins, the user is paid once; E15).
+
+The **path back to BTC** is built and verified (E19): an exit intent commits the user's Bitcoin address
+inside `H`; a solver pays that address on Bitcoin from its own UTXOs, proves the payment to the
+settlement contract by SPV against the Bridge's header chain plus an on-chain parse of the payout
+transaction, and claims the escrowed input — with bonded reservations making exit races safe (losing a
+reservation costs gas; paying BTC unreserved is a choice, and squatting forfeits the bond into the next
+solver's reward). Full circle: BTC in, BTC out, and the user never sends a Rootstock transaction.
 
 The above-`minOut` auction is built in both shapes (E17/E17b): an off-consensus auction contract —
 bids above the ask, best bid delivered to the user, honestly shown to be bypassable under

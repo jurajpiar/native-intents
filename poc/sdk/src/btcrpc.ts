@@ -64,6 +64,18 @@ export class BtcRpc {
   /** UTXO-set scan for an arbitrary (non-wallet) address — e.g. the federation's peg address */
   scanTxOutSet = (addr: string) =>
     this.rpc<{ total_amount: number }>("scantxoutset", ["start", [`addr(${addr})`]], false);
+  /** address info (node-level): scriptPubKey hex etc. — used to extract a legacy address's hash160 */
+  validateAddress = (addr: string) =>
+    this.rpc<{ isvalid: boolean; scriptPubKey: string }>("validateaddress", [addr], false);
+
+  /** hash160 (0x…, 20 bytes) of a LEGACY P2PKH address, via its canonical scriptPubKey 76a914<h160>88ac */
+  async hash160Of(addr: string): Promise<string> {
+    const v = await this.validateAddress(addr);
+    if (!v.isvalid || !v.scriptPubKey?.startsWith("76a914") || !v.scriptPubKey.endsWith("88ac")) {
+      throw new Error(`not a legacy P2PKH address: ${addr}`);
+    }
+    return "0x" + v.scriptPubKey.slice(6, 46);
+  }
 
   // raw-tx flow, for building a peg-in with an OP_RETURN destination (RSKIP170 v1)
   createRawTransaction = (outputs: Record<string, unknown>[], inputs: { txid: string; vout: number }[] = []) =>
@@ -116,5 +128,28 @@ export class BtcRpc {
     const signed = await this.signRawTransactionWithWallet(raw);
     if (!signed.complete) throw new Error("peg-in tx not fully signed");
     return this.sendRawTransactionBtc(signed.hex);
+  }
+
+  /**
+   * Exit-leg payout (E19): a coin-controlled plain send — `amountBtc` from `fromAddress`'s UTXOs to
+   * `toAddress`, change back to `fromAddress`. LEGACY inputs/outputs only (the settlement contract's
+   * payout parser handles non-segwit P2PKH). Returns { txid, rawHex } — the raw bytes are what the
+   * contract parses and double-sha256s.
+   */
+  async payToAddress(fromAddress: string, toAddress: string, amountBtc: number): Promise<{ txid: string; rawHex: string }> {
+    const FEE = 0.0002, DUST = 0.00001;
+    const utxos = (await this.listUnspent([fromAddress])).filter((u) => u.spendable);
+    const inputs: { txid: string; vout: number }[] = [];
+    let inSum = 0;
+    for (const u of utxos) { inputs.push({ txid: u.txid, vout: u.vout }); inSum += u.amount; if (inSum >= amountBtc + FEE) break; }
+    if (inSum < amountBtc + FEE) throw new Error(`insufficient BTC at ${fromAddress}: have ${inSum}, need ${amountBtc + FEE}`);
+    const outputs: Record<string, unknown>[] = [{ [toAddress]: Number(amountBtc.toFixed(8)) }];
+    const change = inSum - amountBtc - FEE;
+    if (change > DUST) outputs.push({ [fromAddress]: Number(change.toFixed(8)) });
+    const raw = await this.createRawTransaction(outputs, inputs);
+    const signed = await this.signRawTransactionWithWallet(raw);
+    if (!signed.complete) throw new Error("payout tx not fully signed");
+    const txid = await this.sendRawTransactionBtc(signed.hex);
+    return { txid, rawHex: signed.hex };
   }
 }

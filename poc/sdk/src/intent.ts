@@ -3,7 +3,7 @@
  * drive the consumed-set registry. The signing scheme mirrors rskj pr3558's Type2RSKTransactionEncoder
  * for chainId != 0, and is verified in poc/sdk/test/encoding.test.ts.
  */
-import { getBytes, hexlify, keccak256, recoverAddress, SigningKey, Wallet, BaseWallet, Interface, zeroPadValue, toBeHex, randomBytes } from "ethers";
+import { concat, getBytes, hexlify, keccak256, recoverAddress, SigningKey, Wallet, BaseWallet, Interface, toUtf8Bytes, zeroPadValue, toBeHex, randomBytes } from "ethers";
 import {
   cat, encByte, encElem, encList, encNonce, encGasPrice, encValue, encGasLimit, encAddress, encData,
   stripLeadingZeros,
@@ -95,4 +95,13 @@ export async function isConsumed(ethCall: (to: string, data: string) => Promise<
 }
 
 export const randomH = (): Uint8Array => getBytes(randomBytes(32));
+
+/**
+ * H for an EXIT intent: commits to the user's BTC destination (hash160) plus a salt, so the settlement
+ * contract can verify the solver paid the RIGHT Bitcoin address without the intent format growing a
+ * field — H = keccak256("BTCOUT" || dest20 || salt32), checked on-chain by settleBtcOut.
+ */
+export function btcOutH(destHash160Hex: string, salt: Uint8Array): Uint8Array {
+  return getBytes(keccak256(concat([toUtf8Bytes("BTCOUT"), destHash160Hex, salt])));
+}
 export const freshWallet = () => Wallet.createRandom();

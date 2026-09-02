@@ -71,6 +71,7 @@
         <option value="rbtc">swap — BTC → native RBTC</option>
         <option value="token">token — BTC → TOK (ERC-20)</option>
         <option value="lpvault">compound — BTC → swap + LP → vaulted LP (vLP)</option>
+        <option value="btcout">exit — RSK-side value → BTC back to the user's own address</option>
       </select>
       <div class="inline">
         <div><label>Input (BTC)</label><input id="fIn" type="number" step="0.001" value="0.01"></div>
@@ -119,6 +120,9 @@ const el = (id) => document.getElementById(id);
 const short = (h) => h ? h.slice(0, 8) + "…" + h.slice(-4) : "–";
 const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;" }[c]));
 let lastState = null;
+// <details> open-state survives the 1.2s re-render (innerHTML replacement resets it otherwise)
+const openRaw = new Set();
+function rawToggle(id, open) { if (open) openRaw.add(id); else openRaw.delete(id); }
 
 async function post(url, body) {
   const r = await fetch(url, { method:"POST", headers:{ "content-type":"application/json" }, body: JSON.stringify(body) });
@@ -138,16 +142,23 @@ function spawnSolver() {
   post("/api/solver", { strategy: el("sStrat").value, marginBps: Number(el("sMargin").value) });
 }
 function aucGate() {
-  // the generalised auction escrows bids in the intent's own output asset — every type is auctionable
+  // the generalised auction escrows bids in the intent's own output asset — every RSK-side output is
+  // auctionable. Exits are not: their output lives on Bitcoin, so bids would escrow nothing on RSK.
   const t = el("fType").value;
-  el("aucLbl").textContent = t === "rbtc"
-    ? "route via auction — broker seed bid locks it to the auction"
-    : "route via auction — bids are escrowed in the output asset; the broker seed bid runs the real acquisition route";
+  const exit = t === "btcout";
+  el("fAuc").disabled = exit;
+  if (exit) el("fAuc").checked = false;
+  el("aucRow").style.opacity = exit ? ".45" : "1";
+  el("aucLbl").textContent = exit
+    ? "route via auction — unavailable for exits: the output lives on Bitcoin, bids would escrow nothing on RSK"
+    : t === "rbtc"
+      ? "route via auction — broker seed bid locks it to the auction"
+      : "route via auction — bids are escrowed in the output asset; the broker seed bid runs the real acquisition route";
 }
 aucGate();
 
 const stBadge = (s) => s === "SETTLED" ? "b-green" : s === "EXPIRED" ? "b-red" : s.includes("decayed") ? "b-amber" : s.startsWith("AUCTION") ? "b-purple" : "b-blue";
-const outLabel = (it) => `${it.minOut} ` + (it.type === "vault" ? "bvBTC" : it.type === "token" ? "TOK" : it.type === "lpvault" ? "vLP" : "RBTC");
+const outLabel = (it) => `${it.minOut} ` + (it.type === "vault" ? "bvBTC" : it.type === "token" ? "TOK" : it.type === "lpvault" ? "vLP" : it.type === "btcout" ? "BTC (on Bitcoin)" : "RBTC");
 
 // the peg-in as bitcoind sees it: mempool/confirmed, and whether its OP_RETURN carries this intent's H
 const btcRow = (it) => {
@@ -160,7 +171,7 @@ const btcRow = (it) => {
 // the settlement contract's record for H: consumed slot + the settle tx that carried the raw intent
 const settleRow = (it) => {
   if (it.slotH === null || it.slotH === undefined) return `<div class="row mono dim"><span>settlement slot[H] = 0 — unconsumed</span>
-    <details style="display:inline"><summary class="dim" style="cursor:pointer">signed intent (raw)</summary><div class="log" style="max-height:80px;word-break:break-all">${esc(it.rawHex || "")}</div></details></div>`;
+    <details style="display:inline"${openRaw.has(it.id) ? " open" : ""} ontoggle="rawToggle(${it.id}, this.open)"><summary class="dim" style="cursor:pointer">signed intent (raw)</summary><div class="log" style="max-height:80px;word-break:break-all">${esc(it.rawHex || "")}</div></details></div>`;
   const sx = it.settled;
   return `<div class="row mono dim"><span>slot[H] = blk ${it.slotH} — CONSUMED</span>
     <span>${sx ? `settle tx ${short(sx.tx)} by ${short(sx.solver)}` : ""}</span></div>`;
@@ -221,7 +232,7 @@ function render(s) {
         <span class="badge ${sv.running ? "b-green" : "b-red"}">${sv.running ? "RUNNING" : "STOPPED"}</span>
         ${sv.running ? `<button class="small ghost" onclick="post('/api/stop/${sv.id}',{})">stop</button>` : ""}</span></div>
       <div class="row mono dim"><span>${short(sv.addr)} · ${sv.strategy} · ${sv.marginBps}bps</span>
-        <span>bal ${sv.rbtc}${sv.creditPos ? ` · credit ${sv.credit}` : ""} · PnL <span class="${sv.pnlNeg ? "pnl-down" : "pnl-up"}">${sv.pnlNeg ? "" : "+"}${sv.pnl}</span></span></div>
+        <span title="liquid ${sv.pnl} · credit ${sv.credit} · bid escrow ${sv.escrowVal} · held output ${sv.heldVal} · gas ${sv.gas}">bal ${sv.rbtc} · gas ${sv.gas} · PnL <span class="${sv.adjNeg ? "pnl-down" : "pnl-up"}">${sv.adjNeg ? "" : "+"}${sv.adjPnl}</span>${sv.parkedPos ? ` <span class="dim">(liquid ${sv.pnlNeg ? "" : "+"}${sv.pnl} · parked ${sv.parked})</span>` : ""}</span></div>
       <div class="log">${sv.log.map((l) => `<div><span class="t">${l.t}</span>${esc(l.line)}</div>`).join("")}</div>
     </div>`).join("") || (grieferCard || `<div class="empty">spawn one on the left — then watch it think</div>`);
 

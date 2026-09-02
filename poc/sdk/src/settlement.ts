@@ -19,3 +19,68 @@ export async function depositForPegin(rpcUrl: string, btcTxidHex: string, valueW
 export async function peginOf(rpcUrl: string, btcTxidHex: string): Promise<bigint> {
   return contract(rpcUrl).pegin(btcTxidHex);
 }
+
+/**
+ * Settle an EXIT intent (E19): prove the solver's BTC payout (raw legacy tx + SPV branch against the
+ * Bridge's header chain) paid >= minOut sats to the destination committed in H, consume H, and claim
+ * the escrowed input. All BTC hashes in DISPLAY order. Returns the tx hash.
+ */
+export async function settleBtcOut(
+  rpcUrl: string,
+  p: { rawIntentTx: string; salt: Uint8Array | string; btcDest: string; rawBtcTx: string; btcBlockHash: string; merklePath: number; merkleHashes: string[] },
+  key: string = COW_KEY,
+): Promise<string> {
+  const s = contract(rpcUrl, key);
+  const tx = await s.settleBtcOut(
+    p.rawIntentTx, p.salt, p.btcDest,
+    p.rawBtcTx.startsWith("0x") ? p.rawBtcTx : "0x" + p.rawBtcTx,
+    p.btcBlockHash.startsWith("0x") ? p.btcBlockHash : "0x" + p.btcBlockHash,
+    p.merklePath, p.merkleHashes,
+    { gasLimit: 1_500_000, gasPrice: 1_000_000, type: 0, chainId: CHAIN_ID },
+  );
+  return tx.hash;
+}
+
+/** The reservation bond for an exit paying `minOutSats`: 10% of the payout, in wei. */
+export const exitBondFor = (minOutSats: bigint): bigint => minOutSats * 1_000_000_000n;
+
+/**
+ * Reserve an exit intent (exclusive settlement rights for RESERVE_WINDOW blocks) by posting the bond.
+ * Losing this race costs gas; losing an UNRESERVED exit race costs real bitcoin — always reserve first.
+ */
+export async function reserveExit(rpcUrl: string, rawIntentTx: string, bondWei: bigint, key: string = COW_KEY): Promise<string> {
+  const s = contract(rpcUrl, key);
+  const tx = await s.reserveExit(rawIntentTx, { value: bondWei, gasLimit: 400_000, gasPrice: 1_000_000, type: 0, chainId: CHAIN_ID });
+  return tx.hash;
+}
+
+/** Current reservation for an exit intent's H (zero solver = none). */
+export async function exitReservationOf(rpcUrl: string, H: Uint8Array | string): Promise<{ solver: string; until: bigint; bond: bigint }> {
+  const r = await contract(rpcUrl).exitReservations(H);
+  return { solver: r.solver, until: r.until, bond: r.bond };
+}
+
+/** Forfeit an EXPIRED-while-reserved exit's bond to the intent's user (callable by anyone). */
+export async function forfeitExpiredExitBond(rpcUrl: string, rawIntentTx: string, key: string = COW_KEY): Promise<string> {
+  const s = contract(rpcUrl, key);
+  const tx = await s.forfeitExpiredExitBond(rawIntentTx, { gasLimit: 300_000, gasPrice: 1_000_000, type: 0, chainId: CHAIN_ID });
+  return tx.hash;
+}
+
+/** Pull-payment ledger: RBTC owed to `payee` after a failed best-effort push (input, bond, refund). */
+export async function settlementCreditOf(rpcUrl: string, payee: string): Promise<bigint> {
+  return contract(rpcUrl).credit(payee);
+}
+
+/** Withdraw the signer's accrued Settlement credits. Returns the tx hash. */
+export async function withdrawSettlementCredit(rpcUrl: string, key: string = COW_KEY): Promise<string> {
+  const s = contract(rpcUrl, key);
+  const tx = await s.withdraw({ gasLimit: 200_000, gasPrice: 1_000_000, type: 0, chainId: CHAIN_ID });
+  return tx.hash;
+}
+
+/** Has this (payout txid, vout) already settled an exit intent? txid in display order. */
+export async function btcOutClaimed(rpcUrl: string, payTxidDisplay: string, vout: number): Promise<boolean> {
+  const { solidityPackedKeccak256 } = await import("ethers");
+  return contract(rpcUrl).claimedBtcOut(solidityPackedKeccak256(["bytes32", "uint256"], [payTxidDisplay, vout]));
+}

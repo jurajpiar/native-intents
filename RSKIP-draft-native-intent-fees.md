@@ -43,6 +43,8 @@ The input must be identified by the intent and claimable by the solver only thro
 
 A finding from implementing this: **native RBTC cannot be pulled from an account** without that account's own transaction, so the input cannot sit in the user's balance waiting to be claimed by `solve`. The workable binding is escrow: the peg-in credits the settlement contract, earmarked for the intent's `btcTxid`, and `solve` releases it to the solver in the same call that delivers the output. The contract custodies the input only between the peg-in and settlement, and only ever pays it to the solver that satisfies the intent. (An ERC-20 input could instead be pulled via a prior `approve` from the user; native RBTC requires the escrow route, which is also the natural shape of a peg-in that names the contract as its RSK recipient.)
 
+This binding is implemented and verified two ways. In the PoC's own mechanism (E14): a genuine RSKIP170 v1 peg-in whose OP_RETURN names the settlement contract credits it directly, the Bridge records the (destination, amount) pair per txid and exposes it via a `getPeginInfo` view, and `settle` verifies the record and releases the actual pegged-in amount. In production, the same shape can ride Flyover's Programmable Peg-in Addresses (RSKIP176) — an audited, shipped mechanism by which the Bridge refunds a contract keyed by a derivation hash — with the settlement contract and `H` in the derivation, avoiding a new Bridge change.
+
 ## Settlement accounting
 
 `solve` performs, atomically and in this order, reverting the whole call if any step fails:
@@ -59,7 +61,7 @@ The spread `value(I) − value(out)` is simply what the solver retains: it is no
 
 `minOut` is set by the user when signing; it is the worst rate they will accept. Any solver able to meet it may settle, and the first valid `solve` included wins — later `solve`s for the same `H` revert on the consumed-set check, so a losing solver loses only gas. This is a first-valid-inclusion race, and its liveness and censorship-resistance mirror PBS/relay markets: any bonded solver chasing a visible, positive spread will include the intent.
 
-An optional refinement (not required for v1) lets the user leave `minOut` deliberately conservative and have solvers compete to deliver *more* than `minOut`, with the best offer winning within a short window. This is a sealed-or-open auction layered above the base first-valid-inclusion rule and can be added without a consensus change, since "deliver more than the minimum" already satisfies the base rule.
+The refinement that hands the user most of the spread back is the **above-`minOut` auction**, implemented and verified in two shapes that disagree on a real trade-off (E17/E17b). Bids are denominated in the intent's own output asset — native RBTC escrowed by value, ERC-20s (vault shares, LP tokens) escrowed via `transferFrom` — so for compound intents solvers compete on route quality: a better route mints more of the terminal asset per input and can bid higher, with the auction knowing nothing about routes. The off-consensus shape is a plain contract anyone deploys; it is bypassable at `minOut` under the base rule (demonstrated honestly, with the stranded bidder reclaiming its escrow). The enforced shape deploys the same contract at a designated address that `settle` consults: while an open auction exists for `H`, only the auction can settle — including after the bidding deadline, so the permissionless `execute()` cannot be front-run. Enforcement engages only once someone bids (bid-free intents settle exactly as before), a lock requires escrowing a bid above `minOut` (the user always nets above their ask), exclusivity decays after a grace period so a wedged auction releases the intent, and payouts are pull-based so an unpayable party cannot brick execution. The choice between shapes is a governance decision this RSKIP surfaces rather than makes: enforcement closes the bypass at the cost of making the auction a settlement rule instead of pure market structure.
 
 ## Bonding and endorsement
 
@@ -68,11 +70,19 @@ The companion RSKIP notes a residual: a solver can submit a `solve` that fails, 
 - Solvers post a bond and may be endorsed; the bond is slashable for provable misbehaviour (e.g., griefing patterns) and signals capital at risk.
 - The solver specification (message formats for the off-chain reveal, pricing, and inclusion) is published with the RSKIP so entry is genuinely permissionless from day one.
 
-Bonding is deliberately kept out of consensus in v1: it is reputation and capital signalling, not validity. Making it a consensus gate would recreate the permissioned-LP problem the intent design exists to avoid.
+Bonding is deliberately kept out of consensus in v1: it is reputation and capital signalling, not validity. Making it a consensus gate would recreate the permissioned-LP problem the intent design exists to avoid. (Implemented and verified: a bond contract solvers stake into, with arbiter slashing, exercised in E15 alongside the first-valid-inclusion race — the bond is never read by `settle`. Flyover's LBC, where LPs post collateral and quotes carry penalty fees, is the production precedent for sizing.)
+
+## The exit path: output delivered on Bitcoin
+
+An exit intent's output is BTC at the user's own address (the `outputToken` sentinel; destination committed in `H`). The value flow mirrors the entry: the solver pays the user's Bitcoin address from its own UTXOs, then proves the payment on Rootstock — SPV inclusion against the Bridge's header chain (RSKIP122 `getBtcTransactionConfirmations`) plus an on-chain parse of the raw payout transaction showing an unclaimed output of ≥ `minOut` satoshis to the committed destination — and claims the escrowed input in the same call (`settleBtcOut`). The claim guard is per payout *output*, not per transaction, so one Bitcoin transaction paying N users settles N exit intents: batched exits amortise Bitcoin fees across fills. Flyover's `refundPegOut` is the production-proven relative of this exact mechanism.
+
+Exits change the race economics fundamentally: a Bitcoin payment is irreversible, so if two solvers raced an exit, both would have paid the user (who is paid twice) and only one is repaid — nobody competes under that rule. The implemented fix is a **bonded reservation** (`reserveExit`): before paying, a solver posts a bond (10% of the payout in the PoC) for exclusive settlement rights over a reservation window sized to pay, confirm, and prove. The race moves to the Rootstock leg, where losing costs gas, never bitcoin. Squatting is priced: a lapsed reservation's bond is forfeited *into the input escrow*, so a stalled exit becomes strictly more profitable for the next solver — the mechanism heals its own delays, and the compensation stays on the Rootstock side where it is useful (the BTC-only user is made whole in BTC by whoever fills). Reservation is opt-in — an unreserved exit remains first-valid — but a rational solver always reserves. All of this is verified in E19, including the exclusivity (a valid proof from a non-reserver reverts), the wrong-destination rejection, the per-output replay guard, and the lapse-forfeit accounting.
+
+Risk allocation: `MIN_BTC_CONF` (the payout depth required before settlement) protects the **user** — a payout reorged away after settlement leaves `H` consumed and the user unpaid — so production sets it materially above the PoC's regtest value and backs the residual with the solver's bond. The intent's expiry must budget for those confirmations plus the proof work, and the reservation window must fit inside the expiry: three coupled parameters, sized together.
 
 ## Failure and refund
 
-If no solver settles the intent by height `E`, the input is untouched: it is simply the peg-in credit sitting in the user's account. Because the ticket is required to be an ordinary peg-in, the no-solver case is already the slow path — the user has their pegged-in funds and lost nothing but time. No explicit refund mechanism is needed. This is the resolution of pressure point 5 in the design sketch.
+If no solver settles an entry intent by height `E`, the pegged-in value is not lost — but with the escrow binding (the peg-in credits the settlement contract, not the user) the contract must expose a recovery path for the user after expiry: release to the user's RSK address derived from the peg-in, per RSKIP170's refund semantics. For exit intents the same applies to the escrowed input, and Flyover's `refundUserPegOut` is the model. Both recovery paths are specification requirements acknowledged as gaps in the PoC (which strands expired escrows); they are bookkeeping, not new trust assumptions — the funds sit in the settlement contract attributable to the intent that escrowed them.
 
 # Rationale
 
@@ -98,19 +108,26 @@ This document adds steps 2 and 4 (input verification and claim) to the `solve` s
 
 # Open questions
 
-- Exact input-binding representation: peg-in-credits-user + intent-authorised transfer (above), versus a peg-in whose beneficiary is the registry (needs a Bridge change), versus a per-intent escrow.
-- Whether the optional over-`minOut` auction is worth specifying in v1 or left to the solver market.
-- Bond sizing and slashing conditions; whether any part of bonding must be on-consensus.
+- Input binding in production: the PoC's OP_RETURN + Bridge record (E14) versus reusing RSKIP176 Programmable Peg-in Addresses — the latter avoids a new Bridge change and is the recommended direction, pending confirmation that the derivation scheme accommodates `H`.
+- Enforced vs off-consensus auction: both are built; which ships is governance.
+- Bond and reservation sizing for mainnet: the reservation window must cover `MIN_BTC_CONF` Bitcoin blocks (hours), which makes the bond's opportunity cost material — size the bond as a function of window length, not just payout.
+- A native permit for exiting live positions (vault shares, LP) without a user Rootstock transaction.
+- Expired-exit escrow recovery (`refundUserPegOut` analogue).
 - Multi-input / partial-fill intents (one intent satisfied by several solvers), out of scope for v1.
 - Fee to the network beyond gas (none proposed; noted for completeness).
 
 # Implementation status
 
-Implemented in the PoC's settlement contract (milestone 4) and verified end to end (experiment E12). The contract holds an input escrow keyed by `btcTxid`; `depositForPegin` models the peg-in credit (in production the peg-in itself credits the contract). On `settle` the contract records `H`, delivers `out ≥ minOut` of the output asset to the user, then releases the escrowed input to the solver — checks-effects-interactions ordered so the claim cannot be reentered. E12 exercises the cross-asset case: the user pegs in RBTC and receives an ERC-20; the solver delivers the token and claims the RBTC input, keeping the spread. Not implemented: price discovery, the over-`minOut` auction, and bonding (market structure, off-consensus); and the production peg-in→contract crediting (modelled here by `depositForPegin`).
+Everything specified above is implemented in the PoC and verified by experiment: the escrowed input claim and spread (E12, cross-asset), the real peg-in→contract crediting via RSKIP170 OP_RETURN + a Bridge record (E14; RSKIP176 noted as the production alternative), first-valid-inclusion with bonded competing solvers (E15), the above-`minOut` auction in both off-consensus and enforced shapes with token-denominated bids, pull-payments and lock decay (E17/E17b), and the exit path — SPV-verified solver payouts, per-output claims enabling batching, and bonded reservations with lapse-forfeit (E19, all checks green, including the negatives). Checks-effects-interactions ordering throughout; outcomes in race experiments are judged by each actor's own transaction receipt.
+
+Not implemented, deliberately: the off-chain reveal protocol and endorsement/reputation (published as specification with the RSKIPs), recovery of an expired exit's escrowed input (Flyover's `refundUserPegOut` is the model — an acknowledged gap), and the consensus-level bundle.
 
 # References
 
 - RSKIP-XXX — native intent transaction type (companion).
-- RSKIP-XXX implementation notes — precompile-exception propagation (required for visible `solve` reverts).
-- Design sketch, pressure points 3 (instant is a solver property) and 5 (refund = ordinary peg-in).
+- RSKIP122 — `getBtcTransactionConfirmations`; the SPV primitive behind `settleBtcOut`.
+- RSKIP170 — peg-in version 1 (OP_RETURN destination); the implemented input binding (E14).
+- RSKIP176 — Programmable Peg-in Addresses (Flyover); the production input-binding alternative.
+- Flyover / Liquidity Bridge Contract — `refundPegOut` (the exit mechanism's production relative), LP collateral and penalties (bond precedent), `refundUserPegOut` (the expired-escrow recovery model). See `PRODUCTIONIZATION.md`, "Relationship to Flyover".
+- Design sketch, pressure points 3 (instant is a solver property) and 5 (refund/slow path).
 - PBS / proposer-builder separation and relay markets — liveness analogue for the solver inclusion race.

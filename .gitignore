@@ -8,3 +8,6 @@ poc/_tmp/
 
 # OS cruft
 .DS_Store
+
+# stray solc downloads
+soljson-*.js

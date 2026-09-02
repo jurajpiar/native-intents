@@ -27,6 +27,7 @@
     "e16": "tsx experiments/e16_cross_node_reorg.ts",
     "e17": "tsx experiments/e17_offchain_auction.ts",
     "e17b": "tsx experiments/e17b_enforced_auction.ts",
+    "e19": "tsx experiments/e19_btc_exit.ts",
     "demo": "tsx experiments/demo_lifecycle.ts",
     "playground": "tsx playground/server.ts",
     "all": "tsx experiments/run_all.ts"

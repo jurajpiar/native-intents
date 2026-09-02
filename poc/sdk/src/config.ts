@@ -21,6 +21,9 @@ export const BRIDGE_ADDR = "0x0000000000000000000000000000000001000006";
 /** zero address == native RBTC output */
 export const RBTC = "0x0000000000000000000000000000000000000000";
 
+/** sentinel outputToken: the output is BTC, delivered ON BITCOIN (exit intents; minOut is in SATS) */
+export const BTC_OUT = "0x0000000000000000000000000000000001000023";
+
 /** pre-funded regtest account, privkey = keccak256("cow"); address 0xcd2a...d826 */
 export const COW_KEY = keccak256(toUtf8Bytes("cow"));
 export const cowWallet = () => new Wallet(COW_KEY);
