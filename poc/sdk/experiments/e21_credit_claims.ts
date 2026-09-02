@@ -111,6 +111,11 @@ async function main(): Promise<number> {
   const p3 = await freshRbtc(80, psnAddr);
   const BID1 = MINOUT + 100_000_000_000_000n, BID2 = MINOUT + 200_000_000_000_000n;
 
+  // pre-arm cow's outbid BEFORE the first bid opens the 10-block window (keeps the race comfortable)
+  const a1 = auction(rpcA.url);
+  await waitReceipt(rpcA, (await poison.mint(cow.address, BID2, ov)).hash);
+  await waitReceipt(rpcA, (await poison.approve(AUCTION_ADDR, BID2, ov)).hash);
+
   // s2 acquires + bids poison tokens, then gets BLOCKED so its refund transfer must fail
   await waitReceipt(rpcA, (await poison.mint(s2, BID1, ov)).hash);
   const poisonS2 = new Contract(psnAddr, poisonArtifact.abi, wal(s2key));
@@ -119,9 +124,6 @@ async function main(): Promise<number> {
   r.check("p3: first token bid escrows", succeeded(await waitReceipt(rpcA, await placeBidToken(a2, p3.intent.rawHex, BID1))));
   await waitReceipt(rpcA, (await poison.setBlocked(s2, true, ov)).hash);
 
-  const a1 = auction(rpcA.url);
-  await waitReceipt(rpcA, (await poison.mint(cow.address, BID2, ov)).hash);
-  await waitReceipt(rpcA, (await poison.approve(AUCTION_ADDR, BID2, ov)).hash);
   const outbid = await waitReceipt(rpcA, await placeBidToken(a1, p3.intent.rawHex, BID2));
   r.check("p3: higher bid lands over the blocked bidder (pre-fix: 'outbid refund failed')", succeeded(outbid), outbid ? outbid.status : "no receipt");
   const tokCred = await (a1 as Contract).creditToken(psnAddr, s2);

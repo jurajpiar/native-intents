@@ -21,6 +21,8 @@ const suite = [
   "e17_offchain_auction.ts",
   "e17b_enforced_auction.ts", // needs the E17b genesis (auction at 0x..22); exits with instructions if absent
   "e18_failure_containment.ts", // needs the hardened genesis auction (pull-payments + GRACE); exits with instructions if stale
+  "e21_credit_claims.ts", // needs the credit-ledger genesis; exits with instructions if stale
+  "e22_exit_bond_expiry.ts", // needs forfeitExpiredExitBond; no bitcoind required (the exit is never paid)
 ];
 
 const results: { name: string; code: number }[] = [];
