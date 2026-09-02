@@ -146,8 +146,35 @@ function aucGate() {
 }
 aucGate();
 
-const stBadge = (s) => s === "SETTLED" ? "b-green" : s === "EXPIRED" ? "b-red" : s.startsWith("AUCTION") ? "b-purple" : "b-blue";
+const stBadge = (s) => s === "SETTLED" ? "b-green" : s === "EXPIRED" ? "b-red" : s.includes("decayed") ? "b-amber" : s.startsWith("AUCTION") ? "b-purple" : "b-blue";
 const outLabel = (it) => `${it.minOut} ` + (it.type === "vault" ? "bvBTC" : it.type === "token" ? "TOK" : it.type === "lpvault" ? "vLP" : "RBTC");
+
+// the peg-in as bitcoind sees it: mempool/confirmed, and whether its OP_RETURN carries this intent's H
+const btcRow = (it) => {
+  if (!it.btcTx) return "";
+  const carriesH = it.btcTx.opReturn && it.btcTx.opReturn.toLowerCase().endsWith(it.H.slice(2).toLowerCase());
+  const where = it.btcTx.mempool ? `<span class="badge b-amber">₿ IN MEMPOOL</span>` : `<span class="dim">₿ ${it.btcTx.confirmations} conf</span>`;
+  return `<div class="row mono dim"><span>${where} OP_RETURN: RSKT‖dest${carriesH ? "‖<b>H</b> ✓" : ""}</span>
+    <span title="${esc(it.btcTx.opReturn || "")}">${it.btcTx.opReturn ? short("0x" + it.btcTx.opReturn) : ""}</span></div>`;
+};
+// the settlement contract's record for H: consumed slot + the settle tx that carried the raw intent
+const settleRow = (it) => {
+  if (it.slotH === null || it.slotH === undefined) return `<div class="row mono dim"><span>settlement slot[H] = 0 — unconsumed</span>
+    <details style="display:inline"><summary class="dim" style="cursor:pointer">signed intent (raw)</summary><div class="log" style="max-height:80px;word-break:break-all">${esc(it.rawHex || "")}</div></details></div>`;
+  const sx = it.settled;
+  return `<div class="row mono dim"><span>slot[H] = blk ${it.slotH} — CONSUMED</span>
+    <span>${sx ? `settle tx ${short(sx.tx)} by ${short(sx.solver)}` : ""}</span></div>`;
+};
+// failure-mode controls (E18 scenarios): griefer bid while bidding is open; stall toggle while auctioned
+const failBtns = (it) => {
+  if (it.status === "SETTLED" || it.status === "EXPIRED") return "";
+  const b = [];
+  if (it.type === "rbtc" && (it.status === "OPEN" || it.status === "AUCTION · bidding"))
+    b.push(`<button class="small ghost" title="an unpayable contract bids — pre-hardening this bricked the intent" onclick="post('/api/griefer/bid',{intentId:${it.id}})">griefer bid</button>`);
+  if (it.status.startsWith("AUCTION"))
+    b.push(`<button class="small ghost" title="withhold execute so exclusivity decays GRACE blocks after the deadline" onclick="post('/api/stall/${it.id}',{})">${it.stalled ? "resume execute" : "stall execute"}</button>`);
+  return b.length ? `<div class="row" style="margin-top:6px;justify-content:flex-end;gap:6px">${b.join("")}</div>` : "";
+};
 
 function render(s) {
   el("head").textContent = s.head;
@@ -175,17 +202,28 @@ function render(s) {
         <span>expiry blk ${it.expiry}${s.head < it.expiry ? ` (${it.expiry - s.head} left)` : ""}</span></div>
       <div class="row mono dim"><span>in ${it.input} BTC (escrow ${it.escrow})</span><span>minOut ${outLabel(it)}</span></div>
       <div class="row mono dim"><span>btcTxid ${short(it.btcTxid)}</span><span>out ${short(it.outputToken)}</span></div>
+      ${btcRow(it)}
+      ${settleRow(it)}
+      ${failBtns(it)}
     </div>`).join("") || `<div class="empty">compose one on the left</div>`;
 
-  el("solvers").innerHTML = s.solvers.map((sv) => `
+  const grieferCard = s.griefer ? `
+    <div class="card" style="border-color:var(--red)">
+      <div class="row"><b>griefer</b><span class="badge b-red">UNPAYABLE</span></div>
+      <div class="row mono dim"><span>${short(s.griefer.addr)} · contract, no receive()</span>
+        <span>stranded credit <b>${s.griefer.credit}</b> RBTC</span></div>
+      <div style="margin-top:6px"><button class="small ghost" onclick="post('/api/griefer/withdraw',{})">attempt withdraw (reverts — its loss alone)</button></div>
+    </div>` : "";
+  el("solvers").innerHTML = grieferCard + s.solvers.map((sv) => `
     <div class="card">
       <div class="row"><b>${esc(sv.label)}</b>
-        <span><span class="badge ${sv.running ? "b-green" : "b-red"}">${sv.running ? "RUNNING" : "STOPPED"}</span>
+        <span>${sv.creditPos ? `<button class="small" title="pull-payment: execute() credits the winner; withdraw to realise PnL" onclick="post('/api/withdraw/${sv.id}',{})">withdraw ${sv.credit}</button>` : ""}
+        <span class="badge ${sv.running ? "b-green" : "b-red"}">${sv.running ? "RUNNING" : "STOPPED"}</span>
         ${sv.running ? `<button class="small ghost" onclick="post('/api/stop/${sv.id}',{})">stop</button>` : ""}</span></div>
       <div class="row mono dim"><span>${short(sv.addr)} · ${sv.strategy} · ${sv.marginBps}bps</span>
-        <span>bal ${sv.rbtc} · PnL <span class="${sv.pnlNeg ? "pnl-down" : "pnl-up"}">${sv.pnlNeg ? "" : "+"}${sv.pnl}</span></span></div>
+        <span>bal ${sv.rbtc}${sv.creditPos ? ` · credit ${sv.credit}` : ""} · PnL <span class="${sv.pnlNeg ? "pnl-down" : "pnl-up"}">${sv.pnlNeg ? "" : "+"}${sv.pnl}</span></span></div>
       <div class="log">${sv.log.map((l) => `<div><span class="t">${l.t}</span>${esc(l.line)}</div>`).join("")}</div>
-    </div>`).join("") || `<div class="empty">spawn one on the left — then watch it think</div>`;
+    </div>`).join("") || (grieferCard || `<div class="empty">spawn one on the left — then watch it think</div>`);
 
   el("feed").innerHTML = s.feed.map((f) => `<div class="card"><span class="dim mono">${f.t}</span> ${esc(f.line)}</div>`).join("")
     || `<div class="empty">quiet</div>`;

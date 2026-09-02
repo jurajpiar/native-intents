@@ -39,6 +39,10 @@ export class BtcRpc {
   /** 80-byte header hex (verbose=false) */
   getBlockHeaderRaw = (hash: string) => this.rpc<string>("getblockheader", [hash, false], false);
   getRawTransaction = (txid: string) => this.rpc<string>("getrawtransaction", [txid, false], false);
+  /** Verbose decode: vout scripts (OP_RETURN asm) + confirmations (absent/0 = still in the mempool). */
+  getRawTransactionVerbose = (txid: string) =>
+    this.rpc<{ confirmations?: number; vout: { scriptPubKey: { asm: string; hex: string } }[] }>(
+      "getrawtransaction", [txid, true], false);
   /** serialized merkleblock (80-byte header + partial merkle tree) */
   getTxOutProof = (txids: string[]) => this.rpc<string>("gettxoutproof", [txids], false);
 
@@ -90,7 +94,7 @@ export class BtcRpc {
    * returned there — so the send is visibly THAT user's BTC moving (playground uses this so per-user
    * BTC balances tell the true story). Flat fee; change below dust is folded into the fee.
    */
-  async peginFromAddress(federationAddr: string, rskAddr20Hex: string, amountBtc: number, fromAddress: string): Promise<string> {
+  async peginFromAddress(federationAddr: string, rskAddr20Hex: string, amountBtc: number, fromAddress: string, extraDataHex = ""): Promise<string> {
     const FEE = 0.0002, DUST = 0.00001;
     const utxos = (await this.listUnspent([fromAddress])).filter((u) => u.spendable);
     const inputs: { txid: string; vout: number }[] = [];
@@ -98,9 +102,13 @@ export class BtcRpc {
     for (const u of utxos) { inputs.push({ txid: u.txid, vout: u.vout }); inSum += u.amount; if (inSum >= amountBtc + FEE) break; }
     if (inSum < amountBtc + FEE) throw new Error(`insufficient BTC at ${fromAddress}: have ${inSum}, need ${amountBtc + FEE}`);
     const addr = rskAddr20Hex.replace(/^0x/, "").toLowerCase().padStart(40, "0").slice(-40);
+    // extraDataHex (e.g. the intent's 32-byte H) rides in the SAME OP_RETURN after the RSKIP170 v1
+    // payload: 25 + 32 = 57 bytes, well under the 80-byte relay default. NOTE: trailing data makes the
+    // payload non-parseable as strict RSKIP170 v1 — fine for the playground, where the RSK-side credit
+    // is modelled via depositForPegin; drop it where real SPV registration must succeed (E14).
     const outputs: Record<string, unknown>[] = [
       { [federationAddr]: Number(amountBtc.toFixed(8)) },
-      { data: "52534b54" + "01" + addr },
+      { data: "52534b54" + "01" + addr + extraDataHex.replace(/^0x/, "").toLowerCase() },
     ];
     const change = inSum - amountBtc - FEE;
     if (change > DUST) outputs.push({ [fromAddress]: Number(change.toFixed(8)) });

@@ -24,11 +24,12 @@ import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { Wallet, getBytes, hexlify, randomBytes } from "ethers";
+import { Contract, ContractFactory, JsonRpcProvider, Network, Wallet, getBytes, hexlify, id, randomBytes } from "ethers";
+import grieferArtifact from "../src/abi/Griefer.json" with { type: "json" };
 import { buildIntent, randomH } from "../src/intent.js";
 import { Solver } from "../src/solver.js";
 import { depositForPegin, peginOf } from "../src/settlement.js";
-import { auction, placeBid, placeBidToken, executeAuction, bidOf, lockedUntil } from "../src/auction.js";
+import { auction, placeBid, placeBidToken, executeAuction, bidOf, lockedUntil, withdrawCredit, creditOf } from "../src/auction.js";
 import { deployVault, vault, vaultDeposit, vaultApprove, sharesOf, vaultWithdraw } from "../src/vault.js";
 import { deployToken, token, mint, approve, balanceOf } from "../src/token.js";
 import { deployPool, deployTokenVault, pool, tokenVault, reserves, addLiquidity, removeLiquidity, lpBalanceOf, lpApprove, tvDeposit, tvApprove, tvSharesOf, tvWithdraw } from "../src/amm.js";
@@ -60,6 +61,38 @@ const solvers: SolverRec[] = [];
 const feed: { t: string; line: string }[] = [];
 let vaultAddr = "", tokenAddr = "", poolAddr = "", tokenVaultAddr = "";
 let seq = 0;
+
+// ---------- failure-mode state (E18 scenarios, interactive) ----------
+let grieferAddr = "";                      // unpayable contract bidder (no receive) — deployed on demand
+const stalledH = new Set<string>();        // intents whose execute() playground solvers withhold, to demo lock decay
+
+// ---------- observability: the BTC-side item and the H-keyed settlement record ----------
+const SETTLED_TOPIC = id("Settled(bytes32,address,address,uint256,uint256)");
+const settleTxCache = new Map<string, { tx: string; solver: string; block: number }>();
+
+/** The peg-in as bitcoind sees it: mempool vs confirmed, and the OP_RETURN payload (which carries H). */
+async function btcTxInfo(btcTxidHex: string): Promise<{ confirmations: number; mempool: boolean; opReturn: string | null } | null> {
+  if (!btcEnabled) return null;
+  const v = await viaBtc(() => btc.getRawTransactionVerbose(btcTxidHex.replace(/^0x/, ""))).catch(() => null);
+  if (!v) return null;
+  const asm = (v.vout || []).map((o) => o.scriptPubKey?.asm || "").find((a) => a.startsWith("OP_RETURN"));
+  return { confirmations: v.confirmations ?? 0, mempool: !((v.confirmations ?? 0) > 0), opReturn: asm ? asm.replace("OP_RETURN ", "") : null };
+}
+
+/** The settlement contract's record for H: the Settled event's tx (whose calldata carried the raw
+ *  signed intent — the commitment's opening) and the solver that sent it. Cached once found. */
+async function settleInfo(H: string): Promise<{ tx: string; solver: string; block: number } | null> {
+  const hit = settleTxCache.get(H);
+  if (hit) return hit;
+  const logs = await rpc.call<{ transactionHash: string; blockNumber: string }[]>("eth_getLogs",
+    [{ fromBlock: "0x1", toBlock: "latest", address: SETTLEMENT_ADDR, topics: [SETTLED_TOPIC, H] }]).catch(() => []);
+  if (!logs || logs.length === 0) return null;
+  const l = logs[0];
+  const tx = await rpc.getTx(l.transactionHash).catch(() => null);
+  const info = { tx: l.transactionHash, solver: (tx as { from?: string } | null)?.from ?? "?", block: parseInt(l.blockNumber, 16) };
+  settleTxCache.set(H, info);
+  return info;
+}
 
 // --- real BTC side (bitcoind regtest). The BTC genuinely moves (user address -> federation, with the
 // RSKIP170 OP_RETURN naming the settlement contract); only the RSK-side credit stays modelled via
@@ -108,13 +141,61 @@ function viaCow<T>(fn: () => Promise<T>): Promise<T> {
   cowChain = p.catch(() => undefined);
   return p;
 }
+function cowW(): Wallet {
+  const provider = new JsonRpcProvider(rpc.url, new Network("rsk-regtest", 33), { staticNetwork: true });
+  return new Wallet(COW_KEY, provider);
+}
 async function fundFromCow(to: string, weis: bigint): Promise<void> {
   await viaCow(async () => {
-    const { JsonRpcProvider, Network } = await import("ethers");
-    const provider = new JsonRpcProvider(rpc.url, new Network("rsk-regtest", 33), { staticNetwork: true });
-    const tx = await new Wallet(COW_KEY, provider).sendTransaction({ to, value: weis, gasLimit: 100_000, gasPrice: 1_000_000, type: 0, chainId: 33 });
+    const tx = await cowW().sendTransaction({ to, value: weis, gasLimit: 100_000, gasPrice: 1_000_000, type: 0, chainId: 33 });
     await tx.wait();
   });
+}
+
+const grieferOv = { gasLimit: 900_000, gasPrice: 1_000_000, type: 0, chainId: 33 } as const;
+
+async function ensureGriefer(): Promise<string> {
+  if (grieferAddr) return grieferAddr;
+  grieferAddr = await viaCow(async () => {
+    const f = new ContractFactory(grieferArtifact.abi, grieferArtifact.bytecode, cowW());
+    const c = await f.deploy({ gasLimit: 1_500_000, gasPrice: 1_000_000, type: 0, chainId: 33 });
+    await c.waitForDeployment();
+    return c.getAddress();
+  });
+  note(`GRIEFER deployed (${grieferAddr.slice(0, 10)}…) — a contract bidder that CANNOT receive RBTC. Pre-hardening, its win bricked the intent ("winner pay failed") and outbidding it was impossible ("outbid refund failed").`);
+  return grieferAddr;
+}
+
+async function grieferBid(intentId: number): Promise<void> {
+  const it = intents.find((x) => x.id === intentId);
+  if (!it) throw new Error("no such intent");
+  if (it.type !== "rbtc") throw new Error("the griefer bids native RBTC only — pick a swap (rbtc) intent");
+  const addr = await ensureGriefer();
+  const a = auction(rpc.url);
+  const b = await bidOf(a, it.H).catch(() => null);
+  const amount = (b && b.amount > it.minOut ? b.amount : it.minOut) + it.input / 50n;
+  await viaCow(async () => {
+    const g = new Contract(addr, grieferArtifact.abi, cowW());
+    const tx = await g.doBid(await a.getAddress(), it.rawHex, { ...grieferOv, value: amount });
+    await tx.wait();
+  });
+  note(`GRIEFER bid ${fmt(amount)} RBTC on ${it.H.slice(0, 10)}… — if it wins, watch execute succeed anyway: its input becomes pull-payment credit it can never claim. Outbid it and the refund becomes credit too.`);
+}
+
+async function grieferWithdrawAttempt(): Promise<void> {
+  if (!grieferAddr) throw new Error("no griefer deployed yet — place a griefer bid first");
+  const a = auction(rpc.url);
+  const owed = await creditOf(a, grieferAddr).catch(() => 0n);
+  try {
+    await viaCow(async () => {
+      const g = new Contract(grieferAddr, grieferArtifact.abi, cowW());
+      const tx = await g.doWithdraw(await a.getAddress(), grieferOv);
+      await tx.wait();
+    });
+    note(`griefer withdraw SUCCEEDED (unexpected — did it grow a receive()?); credit was ${fmt(owed)} RBTC`);
+  } catch {
+    note(`griefer's withdraw REVERTED in its own tx (it cannot receive RBTC) — ${fmt(owed)} RBTC of credit stays stranded, its loss alone. The ledger, the settlement, everyone else: untouched.`);
+  }
 }
 
 // ---------- intent lifecycle ----------
@@ -125,6 +206,10 @@ async function intentStatus(it: IntentRec): Promise<string> {
   if (head >= it.expiry) return "EXPIRED";
   const locked = await lockedUntil(auction(rpc.url), it.H).catch(() => 0n);
   if (locked !== 0n) return Number(locked) > head ? "AUCTION · bidding" : "AUCTION · executable";
+  // lock gone but a bid exists: exclusivity DECAYED (deadline + GRACE passed unexecuted) —
+  // direct settlement is open again at minOut, and execute() still works until H is consumed
+  const b = await bidOf(auction(rpc.url), it.H).catch(() => null);
+  if (b && b.deadline !== 0n) return "AUCTION · decayed";
   return "OPEN";
 }
 
@@ -206,6 +291,16 @@ async function recoverOutput(s: SolverRec, type: IntentType): Promise<void> {
 
 const unitOf = (t: IntentType) => (t === "rbtc" ? "RBTC" : t === "vault" ? "bvBTC" : t === "token" ? "TOK" : "vLP");
 
+/** Pull-payment sweep: execute() CREDITS the winner (and any fallen-back refunds) instead of
+ *  pushing RBTC, so a solver must withdraw to realise its PnL. Cheap no-op when credit is 0. */
+async function sweepCredit(s: SolverRec): Promise<void> {
+  const a = auction(rpc.url, s.key);
+  const owed = await creditOf(a, s.addr).catch(() => 0n);
+  if (owed <= 0n) return;
+  await withdrawCredit(a);
+  slog(s, `withdrew ${fmt(owed)} RBTC of pull-payment credit from the auction (winner input / refunds)`);
+}
+
 async function tryFill(s: SolverRec, it: IntentRec): Promise<void> {
   const status = await intentStatus(it);
   if (status === "SETTLED" || status === "EXPIRED") {
@@ -213,6 +308,7 @@ async function tryFill(s: SolverRec, it: IntentRec): Promise<void> {
     if (s.bidOn.has(it.H)) {
       const b = await bidOf(auction(rpc.url, s.key), it.H).catch(() => null);
       if (b && b.bidder.toLowerCase() !== s.addr.toLowerCase()) await recoverOutput(s, it.type).catch(() => undefined);
+      else await sweepCredit(s).catch(() => undefined); // I won — collect the credited input
       s.bidOn.delete(it.H);
     }
     s.handled.add(it.H);
@@ -227,16 +323,37 @@ async function tryFill(s: SolverRec, it: IntentRec): Promise<void> {
   const a = auction(rpc.url, s.key);
   const unit = unitOf(it.type);
 
-  if (status.startsWith("AUCTION")) {
+  // decayed: exclusivity lapsed (deadline + GRACE passed unexecuted). Direct settlement is open
+  // again at minOut for everyone; execute() also still works — so auction solvers race the field.
+  if (status === "AUCTION · decayed") {
+    if (s.strategy === "auction") {
+      if (stalledH.has(it.H)) {
+        if (!s.handled.has(it.H + ":stall")) { s.handled.add(it.H + ":stall"); slog(s, `execute on ${it.H.slice(0, 10)}… is STALLED by scenario — lock has decayed, the field can settle at minOut`); }
+        return;
+      }
+      slog(s, `lock on ${it.H.slice(0, 10)}… DECAYED — executing anyway (still pays the best bid if I win the race)`);
+      try { await executeAuction(a, it.rawHex); s.handled.add(it.H); slog(s, `execute sent post-decay`); }
+      catch (e) { slog(s, `post-decay execute failed: ${(e as Error).message.slice(0, 60)}`); }
+      await sweepCredit(s).catch(() => undefined);
+      return;
+    }
+    if (!s.handled.has(it.H + ":decay")) { s.handled.add(it.H + ":decay"); slog(s, `lock on ${it.H.slice(0, 10)}… DECAYED (deadline + GRACE passed unexecuted) — direct settle at minOut is open again`); }
+    // fall through to the OPEN path below: fast/picky solvers can now settle directly
+  } else if (status.startsWith("AUCTION")) {
     if (s.strategy !== "auction") {
       if (!s.handled.has(it.H + ":lock")) { s.handled.add(it.H + ":lock"); slog(s, `intent ${it.H.slice(0, 10)}… is auction-locked — direct settle would revert, skipping`); }
       return;
     }
     const b = await bidOf(a, it.H);
     if (status === "AUCTION · executable") {
+      if (stalledH.has(it.H)) {
+        if (!s.handled.has(it.H + ":stall")) { s.handled.add(it.H + ":stall"); slog(s, `execute on ${it.H.slice(0, 10)}… is STALLED by scenario — withholding so exclusivity decays GRACE blocks after the deadline`); }
+        return;
+      }
       slog(s, `auction window closed on ${it.H.slice(0, 10)}… — executing (winner ${b.bidder.toLowerCase() === s.addr.toLowerCase() ? "me!" : b.bidder.slice(0, 10) + "…"})`);
       try { await executeAuction(a, it.rawHex); s.handled.add(it.H); slog(s, `execute sent — settlement delivers the best bid`); }
       catch (e) { slog(s, `execute failed: ${(e as Error).message.slice(0, 60)}`); }
+      await sweepCredit(s).catch(() => undefined);
       return;
     }
     if (b.bidder.toLowerCase() === s.addr.toLowerCase()) return; // already best
@@ -342,21 +459,23 @@ async function createIntent(p: { userId: number; type: IntentType; inputRbtc: nu
   const outputToken = p.type === "vault" ? vaultAddr : p.type === "token" ? tokenAddr : p.type === "lpvault" ? tokenVaultAddr : RBTC;
   // the BTC side is REAL when bitcoind is up: the user's own UTXOs move to the federation with the
   // RSKIP170 OP_RETURN, and the resulting txid is the intent's ticket. The RSK-side credit is modelled.
+  // H is minted BEFORE the peg-in so the BTC transaction itself can carry it: the OP_RETURN is
+  // RSKIP170 payload || H, making the bitcoin mempool item visibly committed to this intent.
+  const H = randomH();
   let btcTxid: Uint8Array;
   if (btcEnabled && u.btcAddr) {
     const txid = await viaBtc(async () => {
-      const t = await btc.peginFromAddress(federationAddr, SETTLEMENT_ADDR, p.inputRbtc, u.btcAddr!);
-      await btc.generateToAddress(1, faucetAddr);
-      return t;
+      const t = await btc.peginFromAddress(federationAddr, SETTLEMENT_ADDR, p.inputRbtc, u.btcAddr!, hexlify(H));
+      return t; // left UNMINED for a beat so the dashboard shows it in the BTC mempool first
     });
     btcTxid = getBytes("0x" + txid);
-    note(`${u.label}'s BTC moved: ${p.inputRbtc} BTC ${u.btcAddr.slice(0, 10)}… → federation (peg-in ${txid.slice(0, 12)}…)`);
+    note(`${u.label}'s BTC moved: ${p.inputRbtc} BTC ${u.btcAddr.slice(0, 10)}… → federation (peg-in ${txid.slice(0, 12)}…, OP_RETURN carries H ${hexlify(H).slice(0, 10)}…)`);
+    void viaBtc(async () => { await sleep(4000); await btc.generateToAddress(1, faucetAddr); });
   } else {
     btcTxid = getBytes(randomBytes(32));
   }
   await viaCow(() => depositForPegin(rpc.url, hexlify(btcTxid), input));
   await sleep(1200);
-  const H = randomH();
   const head = await rpc.blockNumber();
   const it: IntentRec = {
     id: ++seq, H: hexlify(H), rawHex: "", userId: p.userId, type: p.type, input, minOut, outputToken,
@@ -423,17 +542,32 @@ async function stateSnapshot() {
       tok: fmt(await balanceOf(t, u.wallet.address).catch(() => 0n)),
       vlp: fmt(await tvSharesOf(tv, u.wallet.address).catch(() => 0n)),
     }))),
-    intents: await Promise.all(intents.map(async (it) => ({
-      id: it.id, H: it.H, type: it.type, user: users.find((u) => u.id === it.userId)?.label,
-      input: fmt(it.input), minOut: fmt(it.minOut), outputToken: it.outputToken, expiry: it.expiry,
-      btcTxid: it.btcTxid, viaAuction: it.viaAuction, status: await intentStatus(it).catch(() => "?"),
-      escrow: fmt(await peginOf(rpc.url, it.btcTxid).catch(() => 0n)),
-    }))),
+    intents: await Promise.all(intents.map(async (it) => {
+      const status = await intentStatus(it).catch(() => "?");
+      // slot[H] in the settlement contract IS the consumed-set entry: 0 until settled, blk+1 after
+      const slotH = await rpc.call<string>("eth_getStorageAt", [SETTLEMENT_ADDR, it.H, "latest"]).catch(() => "0x0");
+      return {
+        id: it.id, H: it.H, type: it.type, user: users.find((u) => u.id === it.userId)?.label,
+        input: fmt(it.input), minOut: fmt(it.minOut), outputToken: it.outputToken, expiry: it.expiry,
+        btcTxid: it.btcTxid, viaAuction: it.viaAuction, status,
+        escrow: fmt(await peginOf(rpc.url, it.btcTxid).catch(() => 0n)),
+        stalled: stalledH.has(it.H),
+        btcTx: await btcTxInfo(it.btcTxid).catch(() => null),
+        slotH: BigInt(slotH) === 0n ? null : Number(BigInt(slotH) - 1n), // block it was consumed in
+        settled: status === "SETTLED" ? await settleInfo(it.H).catch(() => null) : null,
+        rawHex: it.rawHex,
+      };
+    })),
     solvers: await Promise.all(solvers.map(async (s) => {
       const bal = BigInt(await rpc.getBalance(s.addr).catch(() => "0x0"));
+      const cred = await creditOf(auction(rpc.url), s.addr).catch(() => 0n);
       return { id: s.id, label: s.label, addr: s.addr, strategy: s.strategy, marginBps: s.marginBps,
-        running: s.running, rbtc: fmt(bal), pnl: fmt(bal - s.startBal), pnlNeg: bal < s.startBal, log: s.log.slice(0, 40) };
+        running: s.running, rbtc: fmt(bal), pnl: fmt(bal - s.startBal), pnlNeg: bal < s.startBal,
+        credit: fmt(cred), creditPos: cred > 0n, log: s.log.slice(0, 40) };
     })),
+    griefer: grieferAddr
+      ? { addr: grieferAddr, credit: fmt(await creditOf(auction(rpc.url), grieferAddr).catch(() => 0n)) }
+      : null,
     feed: feed.slice(0, 50),
   };
 }
@@ -484,6 +618,26 @@ async function main(): Promise<void> {
       if (req.method === "POST" && req.url?.startsWith("/api/stop/")) {
         const s = solvers.find((x) => x.id === Number(req.url!.split("/").pop()));
         if (s) s.running = false;
+        return json(200, { ok: true });
+      }
+      if (req.method === "POST" && req.url?.startsWith("/api/withdraw/")) {
+        const s = solvers.find((x) => x.id === Number(req.url!.split("/").pop()));
+        if (!s) return json(404, { error: "no such solver" });
+        await sweepCredit(s);
+        return json(200, { ok: true });
+      }
+      if (req.method === "POST" && req.url === "/api/griefer/bid") return json(200, { ok: await grieferBid(Number((await readBody(req)).intentId)).then(() => true) });
+      if (req.method === "POST" && req.url === "/api/griefer/withdraw") { await grieferWithdrawAttempt(); return json(200, { ok: true }); }
+      if (req.method === "POST" && req.url?.startsWith("/api/stall/")) {
+        const it = intents.find((x) => x.id === Number(req.url!.split("/").pop()));
+        if (!it) return json(404, { error: "no such intent" });
+        if (stalledH.has(it.H)) {
+          stalledH.delete(it.H);
+          note(`execute UN-STALLED for ${it.H.slice(0, 10)}… — auction solvers may execute again`);
+        } else {
+          stalledH.add(it.H);
+          note(`execute STALLED for ${it.H.slice(0, 10)}… — playground solvers withhold execute; exclusivity decays GRACE blocks after the deadline, then direct settles reopen at minOut`);
+        }
         return json(200, { ok: true });
       }
       res.writeHead(200, { "content-type": "text/html" }); res.end(page());
