@@ -1,224 +1,489 @@
+<!--
+  CANONICAL SOURCE: the Notion page "RSKIP-XXX — Native intent transactions (draft)".
+  https://app.notion.com/p/3cfc132873f98169afa0c6f5b3b4e159
+
+  This file is a synced copy so the repository is self-contained for review. Edit the Notion page;
+  regenerate this file from it. The two drifted once — Notion gained a rewritten abstract, two extra
+  admission rules and four security items, while this file gained findings from the attack board —
+  and reconciling them by hand is exactly the work this note exists to prevent.
+-->
+
 |RSKIP|XXX|
 | --- | --- |
 |**Title**|Native intent transactions|
-|**Description**|A mempool-only transaction type in which the user signs constraints instead of calldata; solvers compete to satisfy them and are paid from the spread|
+|**Description**|A mempool-only transaction type in which users sign constraints rather than calldata, and solvers compete to satisfy them for a spread|
 |**Created**|2026-09-01|
 |**Author**|Juraj Piar (@jurajpiar)|
-|**Purpose**|Usa|
+|**Purpose**|Usability, Interoperability|
 |**Layer**|Core|
 |**Complexity**|2|
 |**Status**|Draft|
 
 # Abstract
 
-This proposal introduces a Rootstock-specific transaction type in the RSK typed-transaction namespace (`0x02 || rsk-tx-type`, per RSKIP-543/545/546) in which the user signs *constraints* — a hash-committed payload, a minimum output, an output asset, an expiry height, and an anti-spam reference — instead of exact calldata. The intent is a free, mempool-only object: consensus enforces its validity *before* inclusion, it is gossiped like any transaction, and it is never mined standalone. A solver satisfies it with an ordinary gas-paying transaction that delivers at least the minimum output to the user and, in the same atomic step, claims the intent's escrowed input — the difference is the solver's fee, and the intent is recorded consumed. The proposal specifies the type, its admission rules, the consumed set, the settlement contract's full behaviour (input binding, the above-minimum auction, and the exit path whose output is BTC delivered on Bitcoin), and the activation gate. Together these enable gas-less, near-instant, Bitcoin-anchored flows: a user whose only asset is arriving from Bitcoin can transact on Rootstock — in and back out — without ever holding RBTC or sending a Rootstock transaction.
+This proposal introduces a Rootstock-specific transaction type in the RSK typed-transaction namespace (`0x02 || rsk-tx-type` under RSKIP-543/545/546). Instead of signing exact calldata, the user signs constraints: a unique intent identifier, a minimum output, an output asset, an expiry height, and a Bitcoin-backed anti-spam reference.
+
+The intent is a free, mempool-only object. Nodes validate it before admission and gossip it like a transaction, but block producers never mine it on its own. A solver fulfils the intent through an ordinary gas-paying transaction. In one atomic call, the settlement contract delivers at least the signed minimum to the user, releases the intent-bound input to the solver, and marks the intent as consumed. The difference between input and output is the solver's fee.
+
+The proposal defines the envelope, admission rules, parsing precompile, consumed set, settlement contract, input binding, price competition, Bitcoin exit path, and activation gate.
+
+Together, these pieces support gas-free, Bitcoin-anchored entry and exit flows. A user whose value is arriving from Bitcoin can transact on Rootstock without first holding RBTC or submitting a Rootstock transaction. Two honest caveats attach to that. A funded party — in practice the wallet's own backend — must register the peg-in before the intent becomes admissible, so the flow is gas-free for the *user* rather than for everyone. And any "near-instant" experience still depends on a solver choosing to front value before final settlement.
 
 # Motivation
 
-Most advertised benefits of "intents" are things smart contracts do worse, not things they cannot do. This proposal rests on two properties that are impossible in contract-land, because contracts execute after inclusion and these are pre-inclusion properties.
+Many benefits attributed to intents can already be built with smart contracts, even if contracts sometimes deliver them less elegantly. This proposal depends on two narrower properties that contracts cannot provide because they execute only after inclusion.
 
-First, **mempool citizenship for an account that cannot pay**. Admission and validity are decided before the EVM runs, so a zero-balance, zero-history account's signed message can become a gossiped mempool object. A contract cannot make that happen; ERC-4337 built an off-protocol alternative mempool precisely because it could not do this in contracts.
+First, **mempool access for an account that cannot pay**. Admission happens before the EVM runs. A signed message from a new, zero-balance account can therefore become a gossiped mempool object only if the node recognises it specially. A contract cannot make that happen. ERC-4337 addresses the same limitation through a separate, off-protocol mempool.
 
-Second, **invalidity before inclusion**. A contract-level expiry or replay check runs on-chain: it spends block space, burns gas, and produces a revert that is visible and can be griefed. Protocol validity means an expired or already-consumed intent never enters a block and costs nothing.
+Second, **invalidity before inclusion**. Contract-level expiry and replay checks consume block space and gas, even when they revert. A node can reject an expired or consumed intent before it reaches a block, leaving no on-chain trace and costing the user nothing.
 
-Everything else — constraint checking, honest signing UX, commit/reveal, output bounds — is quality of implementation and does not by itself justify a consensus change. The specification below is shaped so that these two properties are the load-bearing ones. But the properties only matter if someone actually settles intents, so the proposal also specifies the value flow that makes solving worthwhile: the solver must be able to claim the user's input and keep the difference, and that claim must be possible *only* in the same atomic step that pays the user. That one guarantee — input moves to the solver if and only if the output reaches the user — is the second thing a contract alone cannot deliver end-to-end for native RBTC, and it is what turns "entry is permissionless" into "solving is profitable for a competitive set of solvers".
+Constraint checking, signing UX, and output bounds remain important, but they do not independently justify a consensus change. The two pre-inclusion properties above are the load-bearing claims.
 
-The flagship application is near-instant, Bitcoin-anchored execution on Rootstock: value arriving from Bitcoin, with a solver fronting the result on Rootstock against a Bitcoin event, settled trust-minimally once the event is visible to the Bridge.
+Those properties matter only if solvers have a reason to act. The settlement design therefore gives a successful solver the user's intent-bound input and lets it keep the spread. A contract can enforce the atomic exchange once the escrow exists; the native and Bridge-facing work is what makes a payer-less Bitcoin input available to that contract under an authenticated binding.
+
+The main use case is Bitcoin-anchored execution on Rootstock. A solver may front the requested output against a Bitcoin event, then settle trust-minimally once the event is visible to the Bridge.
 
 # Specification
 
+## The full path, end to end
+
+The flow spans two chains and six parties, and the ordering carries most of the design's weight. Two constraints fix it. The deposit address depends on the binding, so the commitment and the signing key are settled before any coins move. And an intent is admissible only once its ticket is a peg-in the Bridge has processed, so **registration precedes broadcast**.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User (key only, no RBTC)
+    participant W as Wallet backend (funded)
+    participant BTC as Bitcoin
+    participant BR as Bridge
+    participant N as rskj mempool
+    participant S as Solver
+    participant SC as Settlement contract
+
+    Note over U,W: commit first — nothing here has touched a chain yet
+    U->>U: H = keccak256(pipeline)
+    U->>U: binding = keccak256(H || signer)
+    W->>W: deposit address = derive(federation, Settlement, binding, refund addr)
+    U->>U: build + sign the BTC tx to that address — btcTxid is now fixed
+    U->>U: sign intent(H, btcTxid, E, minOut, outputToken)
+
+    U->>BTC: broadcast the BTC tx
+    BTC-->>BR: headers relayed, confirmations accumulate
+
+    Note over W,BR: register — the WALLET does this, not the solver. See below
+    W->>SC: registerPegin(btcTx, proof, binding, refund addr)
+    SC->>BR: registerFlyoverBtcTransaction(derivationArgumentsHash = binding)
+    BR-->>SC: escrow credited to Settlement, bound to binding
+
+    Note over U,N: only now is the intent admissible
+    U->>N: raw intent (gasPrice 0, value 0)
+    N->>N: admit — rule active, signature, 160 bytes, height below E, H unconsumed, ticket visible
+    N->>N: gossip — block producers exclude it from candidate blocks
+
+    Note over S: solve — the user is gone, and is not consulted again
+    S->>N: txpool_content — scan for intent-shaped objects
+    N-->>S: pool entries, carrying neither type nor v, r, s
+    S->>N: eth_getTransactionByHash plus eth_chainId
+    N-->>S: the signed view, with v reported as a bare parity bit
+    S->>S: re-encode the envelope, require keccak256 to equal the advertised hash
+    S->>SC: settle(rawIntentTx) — an ordinary gas-paying transaction
+    SC->>SC: STATICCALL parse → (user, H, btcTxid, E, minOut, outputToken)
+    SC->>SC: check unexpired, H unconsumed, escrow bound to keccak256(H || user)
+    SC->>SC: mark H consumed — effects before interactions
+    SC->>U: deliver at least minOut (balance-delta verified for tokens)
+    SC->>S: release the escrowed input
+
+    Note over N: the settle transaction is mined — the intent never is
+    N->>N: a twin of this H is now refused as already consumed
+```
+
+The escrow-binding check inside `settle` is where the binding earns its keep: a rival intent carrying the same `H` under a different key derives a different binding and matches no escrow.
+
+**Discovery is the mempool, and nothing else.** On the entry path the envelope is self-sufficient: `outputToken`, `minOut`, `E` and the escrow reference are everything a solver needs to price and fill, and they travel in the clear. The user's involvement ends at broadcast. This is measured, not assumed — a solver process given only an RPC URL, holding no reference to the user, the intent, or `H`, discovers the intent in the pool, rebuilds its signed bytes and settles it, with the user delivered `minOut` and the escrow released (experiment E24).
+
+Implementers should note what that costs, because the JSON-RPC surface is not shaped for it. `txpool_content` omits both `type` and `v`, `r`, `s`, so a pool listing cannot be re-encoded on its own; discovery is a listing followed by `eth_getTransactionByHash` per candidate. rskj has no `eth_getRawTransactionByHash`, so re-encoding is the only route to the bytes `settle` requires, which makes the encoding rules above load-bearing for solvers and not only for signers. And because `getEncodedV` reports `yParity` for any typed transaction while the RSK-namespace envelope carries an EIP-155 `v` — with `chainId` absent from the view for this namespace — a solver must recombine the parity with `eth_chainId`. A reconstruction is verifiable without trusting any of this: the transaction hash is `keccak256` of the signed bytes, so a solver can require its own re-encoding to hash to the hash the node advertised, and refuse to settle otherwise.
+
+**Who registers the peg-in.** Admission requires the ticket to be visible, so registration precedes gossip. That excludes a solver who learns of intents *from the mempool* — it would have to act on one it cannot yet see. It does not exclude solvers generally: `settle` takes the intent as calldata and never requires it to have been gossiped, so a solver handed the bytes directly can register and settle in one transaction. Registration is permissionless, so any funded party may do it.
+
+This is a real cost, and it should be stated rather than glossed. The user needs no RBTC and signs no Rootstock transaction, but *somebody* funded must send one before the intent becomes discoverable. A wallet without a funded backend cannot complete the flow alone.
+
+Two candidates, and this proposal does not yet choose between them:
+
+- **A funded party acting for the user** — the wallet's own backend, or the dApp being transacted with. Simple, and what the reference implementation does. It costs that party one transaction per intent, and it makes them a liveness dependency: precisely the named counterparty a payer-less design exists to remove. A wallet that is only a key manager, with no funded backend, cannot complete the flow alone.
+- **Folded into settlement.** A solver holding the intent bytes registers and settles in one transaction, paying for registration exactly where it captures the spread. No separate role, and no free-riding — registration is otherwise a public good, since it makes the intent settleable for *every* solver while only one is repaid. The cost is that discovery then happens off-chain, which leaves the public mempool doing less work than the Motivation claims for it.
+
+Note what is *not* a way out. Because rejection is free and leaves no trace, a wallet may poll — offer the intent, and re-offer it once registration lands — which removes any need to synchronise with the registrant. That is a convenience, not an answer: retrying does not cause registration to happen, and a loop that spins until `E` looks like progress while the user's bitcoin sits in a derived address and the escrow is never credited.
+
 ## Transaction envelope
 
-An intent is an RSK-namespace typed transaction:
+An intent uses the RSK typed-transaction namespace:
 
 ```
 0x02 || rsk-tx-type || rlp([nonce, gasPrice, gasLimit, to, value, data, v, r, s])
 ```
 
-`0x02` is the RSK namespace prefix (RSKIP-543) and `rsk-tx-type` selects the intent subtype (`0x49` proposed; final value assigned on acceptance). The payload is the legacy nine-field list; the signed constraints live in `data`. This reuses the RSKIP-543/545/546 typed-transaction machinery unchanged, so no new parser or encoder is required.
+`0x02` is the RSK namespace prefix defined by RSKIP-543. `rsk-tx-type` selects the intent subtype; `0x49` is proposed, with the final value assigned on acceptance.
 
-The signing hash follows the RSK-namespace scheme for a non-zero chain id: `keccak256(0x02 || rsk-tx-type || rlp([nonce, gasPrice, gasLimit, to, value, data, chainId, "", ""]))`, with EIP-155 `v = yParity + chainId*2 + 35`. The chain id MUST be non-zero.
+The body reuses the existing nine-field legacy format, with the signed constraints stored in `data`. No new outer parser or encoder is needed.
 
-`to` is the settlement contract address (below). `gasPrice` and `value` MUST be zero; the intent is a free mempool object (see admission). The sender is recovered from the signature; a wallet SHOULD derive a fresh address per intent so that intent uniqueness is keyed by the payload commitment rather than by an account nonce.
+For a non-zero chain ID, the signing hash is:
 
-**Encoding note (normative).** rskj serialises a zero `gasPrice` as the raw byte `0x00`, whereas a zero `value` and a zero `nonce` serialise as the RLP empty scalar `0x80`. A signer MUST match this canonical encoding; a signer that does not computes a different signing hash and the node recovers a different (wrong) sender.
+```
+keccak256(
+  0x02 || rsk-tx-type ||
+  rlp([nonce, gasPrice, gasLimit, to, value, data, chainId, "", ""])
+)
+```
 
-## Intent constraints (the `data` field)
+The signature uses EIP-155, with `v = yParity + chainId * 2 + 35`. The chain ID MUST be non-zero.
 
-`data` is exactly 160 bytes, five 32-byte words:
+`to` is the settlement-contract address. Both `gasPrice` and `value` MUST be zero because the intent is a free discovery object rather than a mined transaction.
+
+The sender is recovered from the signature. A wallet SHOULD use a fresh address for each intent so that uniqueness follows the payload commitment rather than an account nonce.
+
+**Encoding requirement.** rskj serialises a zero `gasPrice` as the raw byte `0x00`. A zero `value` and zero `nonce` use the RLP empty scalar `0x80`. A signer MUST reproduce this encoding exactly; otherwise it calculates a different signing hash and the node recovers the wrong sender.
+
+## Signed constraints
+
+`data` is exactly 160 bytes: five 32-byte words.
 
 ```
 data = H (32) || btcTxid (32) || expiryHeight E (32) || minOut (32) || outputToken (32)
 ```
 
-- `H` is a commitment to the full pipeline the user wants executed (`H = keccak256(pipeline)`); the pipeline itself is revealed off-chain to a solver at solve time.
-- `btcTxid` references the confirmed Bitcoin transaction that serves as the anti-spam ticket and keys the input escrow.
-- `E` is the absolute Rootstock height at which the intent expires.
-- `minOut` is the minimum acceptable output, enforced at settlement.
-- `outputToken` names the output asset: the zero address for native RBTC; an ERC-20 address for tokens (vault shares and LP tokens included — settlement is outcome-based, so any pipeline whose terminal step tokenises is expressible); or a reserved sentinel address meaning *BTC delivered on Bitcoin* (an exit intent). For exit intents `minOut` is denominated in satoshis and `H` additionally commits to the user's Bitcoin destination, `H = keccak256("BTCOUT" || hash160 || salt)`, verified on-chain at settlement without the format growing a field.
+- `H` is a 32-byte value chosen by the user, unique per intent. It keys the consumed set, and on the entry path that is the only role settlement gives it: `settle` verifies delivery of `minOut` in `outputToken` and the escrow binding, and never opens `H`. Calling it a "pipeline commitment" describes a convention a wallet may adopt — `H = keccak256(pipeline)` lets the user prove afterwards what they asked for — not a value any consensus or contract rule inspects. An opaque `H` is exactly as settleable as a structured one.
+- `btcTxid` identifies the confirmed Bitcoin transaction used as the anti-spam ticket and input-escrow reference.
+- `E` is the absolute Rootstock block height at which the intent expires.
+- `minOut` is the minimum output accepted by the user and enforced during settlement.
+- `outputToken` selects the output asset. The zero address means native RBTC. An ERC-20 address selects a token, including vault shares or LP tokens. A reserved sentinel denotes BTC delivered on Bitcoin.
 
-## Mempool admission (pre-inclusion validity)
+For a Bitcoin exit, `minOut` is denominated in satoshis. `H` also commits to the user's Bitcoin destination:
 
-An intent is admitted to the mempool — and therefore gossiped — only if all of the following hold:
+```
+H = keccak256("BTCOUT" || hash160 || salt)
+```
 
-1. The signature is valid and the chain id matches.
-2. The intent is not expired: current best height `<` `E`. A node also rejects intents whose `E` is more than a bounded number of blocks ahead, to bound the consumed-set window.
-3. `H` is not already in the consumed set.
-4. The anti-spam ticket is valid: `btcTxid` is visible in the Bridge SPV view (v1: it is a processed peg-in).
+The settlement contract verifies that commitment without adding another field to the envelope.
 
-The intent's transaction cost is defined to be zero, so the balance and account-existence checks that normally gate a payer-less sender do not apply — this delivers the first motivating property. Checks 2–4 deliver the second: an intent that fails them is rejected at admission, never enters a block, and costs nothing. Checks 3 and 4 are storage reads against current state (the settlement contract's consumed set and the Bridge's processed-peg-in set respectively).
+**The exit is where a reveal is genuinely required, and it is the only place.** `settleBtcOut` re-derives the hash above from a `hash160` and `salt` the settling solver passes as arguments, so it does open the preimage. Neither value is in the 160 bytes. An exit intent is therefore discoverable from the mempool but not fillable from it: the solver needs a channel carrying the destination and salt, and this proposal does not specify one. Entry intents have no such dependency — everything a solver needs is in the envelope, in the clear. The salt buys destination privacy and pays for it in liveness, and the proposal should say which it is choosing rather than acquiring both by omission.
 
-Block producers exclude intents from candidate blocks; an intent transaction never appears in a block, so block validity rules, proof of work, and merged mining are untouched by this proposal.
+## Mempool admission
 
-## Parse precompile and the consumed set
+A node admits and gossips an intent only when all of the following are true:
 
-Two fixed, protocol-designated addresses split the work (concrete values assigned at activation):
+1. the intent rule is active;
+2. the signature is valid and the chain ID matches;
+3. the payload uses the exact 160-byte layout;
+4. the current best height is below `E`, and `E` is no further ahead than the configured maximum;
+5. `H` is not already in the consumed set; and
+6. `btcTxid` is visible as a processed peg-in in the Bridge's SPV-backed state.
 
-- **Parse precompile**: stateless. Given the raw signed intent bytes it reconstructs the RSK-namespace signing hash, recovers the user, and returns the decoded fields `(user, H, btcTxid, E, minOut, outputToken)` — the one step impractical in Solidity. Any contract may staticcall it, so settlement-layer contracts authenticate intents without duplicating signature logic.
-- **Settlement contract** (deployed at activation): owns the consumed set as ordinary contract storage at slot `== H`, readable by `eth_call`, provable by storage proof, and read directly by mempool admission. `isConsumed(bytes32 H) → bool` is the public view. Because admission reads this contract's storage and every node must agree on its bytecode at the fork, the settlement contract's behaviour — specified in the rest of this section — is part of this proposal's consensus content even though it is expressed in ordinary contract code.
+An active intent has zero transaction cost. The usual balance and account-existence checks therefore do not reject a payer-less sender. Expired, consumed, malformed, or ticketless intents are rejected before entering the mempool and never consume block space or gas.
 
-`H` is recorded only on successful settlement: the write commits only if the settling transaction succeeds, so consumption is bound to delivery by construction. Reorg handling is ordinary state reversion: a settlement orphaned by a reorg reverts both the delivery and the consumed-set entry, and the intent becomes solvable again on the new chain. The mental model: the consumed set is to intents what the nonce is to accounts.
+Block producers remove intent objects from their candidate transaction list. The intent itself never appears in a block; settlement arrives as an ordinary solver transaction. This leaves the existing proof-of-work and merged-mining mechanisms unchanged, although activating the parser and system contracts still requires a coordinated network upgrade.
 
-## The value flow
+## Parser and consumed set
 
-An intent names an input `I` (the pegged-in value) and an output requirement `minOut`. On a successful settlement the user loses `I` and gains `out ≥ minOut`; the solver gains `I`, loses `out`, and pays gas `g`. A solver participates only when `value(I) − value(minOut) − g > 0`. That inequality is the **spread**: the user prices `minOut` below the market value of their input by at least the solver's cost and margin, and in exchange receives the output atomically, in the asset they want, without holding gas. The spread is the user's fee, paid in kind. It is not a protocol parameter; it emerges from what `minOut` the user is willing to sign and which solver is willing to meet it. Value is conserved — the protocol neither mints nor burns — and gas is the only external cost, paid by the solver to the network.
+Two fixed, protocol-designated addresses divide the work.
 
-## Input binding
+- **Parsing precompile:** a stateless precompile accepts the raw signed intent, reconstructs the RSK-namespace signing hash, recovers the user, and returns `(user, H, btcTxid, E, minOut, outputToken)`. This is the one part that is impractical to reproduce safely in Solidity. Any contract may call it with `STATICCALL`.
+- **Settlement contract:** a contract deployed at activation owns the consumed set in ordinary storage, using `H` as the slot key. Admission reads that slot directly. `isConsumed(bytes32 H)` exposes the same state to callers, and ordinary storage proofs can prove it.
 
-The input must be identified by the intent and claimable by the solver only through settlement. Native RBTC cannot be pulled from an account without that account's own transaction, so the input cannot sit in the user's balance waiting to be claimed. The workable binding is escrow: the peg-in credits the settlement contract, and settlement releases it to the solver in the same call that delivers the output. The contract custodies the input only between the peg-in and settlement, and only ever pays it to the solver that satisfies the intent.
+Every node must agree on the deployed settlement bytecode because mempool admission reads its state at a designated address. Its specified behaviour is therefore part of this proposal even though the implementation runs as ordinary VM code.
 
-The escrow must additionally be bound to the *specific intent*, not merely to the txid — otherwise the escrow belongs to whichever intent names the txid first, and an attacker who observes a settlement-destined peg-in can capture its input with a rival intent carrying a dust `minOut`. The specified mechanism is **RSKIP-176 Programmable Peg-in Addresses**: the user signs the intent first (fixing `H`), then pegs in to a deposit address derived from (federation, settlement contract, `H`, user refund address). The Bridge's flyover registration credits the settlement contract keyed by that derivation — the settlement contract registers the peg-in itself, acting as its own liquidity-bridge-contract, with `H` in the `derivationArgumentsHash` slot. The binding is carried by *where the coins went*: unforgeable and unstrippable by construction, with nothing intent-shaped on Bitcoin's wire, and requiring no Bridge change — the registration path is shipped, audited, and in production use by Flyover.
+The consumed marker commits only when the entire settlement succeeds. If settlement reverts, the marker and every transfer revert together. A chain reorganisation behaves in the same way: removing the settlement block removes both delivery and consumption, allowing the intent to be solved again if it has not expired.
 
-A rejected alternative, for the record: routing an ordinary RSKIP-170 OP_RETURN peg-in to the settlement contract and adding a per-txid Bridge record. That route requires a new Bridge change yet still cannot reach intent-level binding — the OP_RETURN has no room for `H` without breaking v1 payload parsing or Bitcoin's data-carrier standardness, so the strongest binding it could deliver is owner-level (recording the peg-in's lock-sender and requiring the intent's signer to match). Weaker binding at higher consensus cost.
+The useful mental model is that the consumed set plays the same role for intents that account nonces play for ordinary transactions.
 
-## Settlement
+## Value flow
 
-An intent is satisfied by a single solver transaction that calls the settlement contract's `settle(rawIntentTx)`. Atomically, and in this order — reverting the whole call if any step fails:
+Let `I` be the pegged-in input, `out` the output delivered, and `g` the solver's gas cost. After successful settlement:
 
-1. Authenticate the intent via the parse precompile and re-check admission at the inclusion height (unexpired, `H` unconsumed).
-2. Verify the input `I` is present and bound to this intent (the peg-in is registered and its escrow answers to this `H`).
-3. Deliver `out ≥ minOut` of the output asset from the solver to the user (native RBTC, or an ERC-20 via `transferFrom`). For token outputs the delivery MUST be verified by the user's **balance delta** across the transfer, not by the transfer's return value: a fee-on-transfer token moves less than it reports and a non-conforming token may report success having moved nothing, and in either case a return-value check would let the settlement consume `H` and release the input while the user received less than the minimum they signed. Implementations SHOULD additionally accept an empty return from the transfer, since tokens predating the finalised ERC-20 return no data and would otherwise be unusable as outputs; the delta check is what makes accepting that safe, because an address that is not a token returns empty and moves nothing, and so fails on the delta. The same rule applies wherever the settlement layer escrows an output asset — an auction pulling a token bid must verify the amount that arrived, or it will record a bid larger than it holds.
-4. Release the escrowed input `I` to the solver.
-5. Record `H` consumed.
+- the user gives up `I` and receives `out ≥ minOut`;
+- the solver receives `I`, supplies `out`, and pays `g`; and
+- the solver earns `value(I) − value(out) − g`.
 
-Transaction atomicity is the all-or-nothing guarantee: if any bound fails — delivery short of `minOut`, expired, already consumed, escrow bound elsewhere — the whole call reverts, `H` is not consumed, the intent remains solvable until `E`, and the solver forfeits the gas. This binds consumption to delivery: the only way to consume an intent's `H` is to satisfy it. The spread is simply what the solver retains — never computed or enforced by the protocol, only permitted.
+A solver participates only when it expects the result to be positive. The user sets the maximum implicit fee through `minOut`: they accept an output below the input's market value by enough to cover execution cost, risk, and margin. The difference is the spread.
 
-Settlement runs in the VM (a contract deployed at activation), so failures revert visibly with a failed receipt; this is deliberate — routing settlement through a raw precompile would not, because a precompiled contract's exception is not propagated to the receipt in the current executor (the Bridge and Remasc are written around the same behaviour). No block-construction change is required: the solver transaction carries the signed intent bytes, so it is self-contained, and EVM transaction atomicity supplies the bundle semantics. A consensus-level bundle object (block-producer-assembled intent+solution, for MEV and ordering control) remains a possible future refinement.
+The spread is paid in kind rather than through a separate fee balance. The protocol does not mint or burn value, and it does not calculate the spread.
 
-Solver-side payouts (the input release, refunds of excess, auction and reservation payouts below) MUST NOT be reverting pushes: a payee that cannot receive native currency must not be able to revert a settlement whose delivery succeeded, block an auction, or strand an intent. Such payouts are push-with-credit-fallback — a failed transfer becomes a balance withdrawable by its owner. Delivery of `minOut` to the user remains a hard requirement: paying the user is the settlement's core promise.
+## Binding the Bitcoin input
 
-## Price discovery: the above-`minOut` auction
+The input must be identifiable from the intent and claimable only through successful settlement.
 
-`minOut` is the worst rate the user will accept. Any solver able to meet it may settle, and the first valid settlement included wins — later attempts for the same `H` revert on the consumed-set check, so a losing solver loses only gas. This first-valid-inclusion race is the base rule; its liveness and censorship-resistance mirror proposer-builder separation and relay markets.
+Native RBTC cannot be pulled from a user's balance without a transaction from that account. The peg-in must therefore credit the settlement contract as escrow. Settlement releases that escrow to the solver only in the same transaction that delivers the signed output to the user.
 
-The refinement that hands the user most of the spread back is the auction, specified in two shapes that disagree on a real trade-off. Bids are denominated in the intent's own output asset — native RBTC escrowed by value, ERC-20s escrowed via `transferFrom` — so for compound intents solvers compete on route quality: a better route mints more of the terminal asset per input and can bid higher, with the auction knowing nothing about routes. The *off-consensus* shape is a plain contract anyone deploys; it is bypassable at `minOut` under the base rule (the stranded bidder reclaims its escrow). The *enforced* shape deploys the same contract at a designated address that `settle` consults: while an open auction exists for `H`, only the auction can settle — including after the bidding deadline, so the permissionless `execute()` cannot be front-run. Enforcement engages only once someone bids (bid-free intents settle exactly as before), a lock requires escrowing a bid above `minOut` (the user always nets above their ask), exclusivity decays after a grace period so a wedged auction releases the intent back to open competition, and payouts follow the credit-fallback rule above so an unpayable party cannot brick execution. The choice between shapes is a governance decision this proposal surfaces rather than makes: enforcement closes the bypass at the cost of making the auction a settlement rule instead of pure market structure.
+The escrow must be bound to the specific intent, not just to `btcTxid`. A transaction-ID-only mapping would let an attacker observe the peg-in, create a rival intent with a dust `minOut`, and try to claim the funds first.
 
-## The exit path: output delivered on Bitcoin
+Binding to `H` alone is not sufficient either, and the distinction is easy to miss. `H` is a commitment to the *pipeline*, not an authenticator: it travels in the clear in every intent in the public mempool, and settlement never needs its preimage, because settlement is outcome-based. An attacker can therefore copy a victim's `H` and `btcTxid` into an intent of their own, signed with their own key, asking for a dust `minOut`. Every admission rule passes. Settlement recovers the user from the *signature* — so the attacker is the user — and an escrow keyed on `H` matches. The dust goes to the attacker, the entire input goes to the solver, and `H` is consumed, leaving the victim's own intent permanently unsettleable. The dust twin is also the more profitable of the two to any solver, and the solver may simply be the attacker, so this needs neither a race nor an accomplice.
 
-An exit intent's output is BTC at the user's own address (the `outputToken` sentinel; destination committed in `H`). The value flow mirrors the entry: the solver pays the user's Bitcoin address from its own UTXOs, then proves the payment on Rootstock — SPV inclusion against the Bridge's header chain (RSKIP-122 `getBtcTransactionConfirmations`) plus an on-chain parse of the raw payout transaction showing an unclaimed output of ≥ `minOut` satoshis to the committed destination — and claims the escrowed input in the same call (`settleBtcOut`). The claim guard is per payout *output*, not per transaction, so one Bitcoin transaction paying N users settles N exit intents: batched exits amortise Bitcoin fees across fills, up to a bounded maximum output count (an unbounded parse would let a wide payout exceed any gas limit, making it unsettleable). Flyover's `refundPegOut` is the production-proven relative of this exact mechanism.
+The binding MUST therefore commit to the signer as well as the commitment:
 
-The payout MUST also carry a **settler commitment**: an `OP_RETURN` output holding a fixed tag and the RSK address entitled to settle with it, which `settleBtcOut` requires the caller to match. Without it the SPV proof is a bearer object — public bytes naming the user's address — and anyone could present another solver's payout against their own dust-`minOut` intent on the same destination; the per-output claim would then consume the payment and the paying solver's bitcoin would be lost irreversibly. The reservation cannot close this, because it keys on `H` and the hijacker brings a different `H`. Committing the *settler* rather than the intent keeps batching intact: one output protects every payment in the transaction. This payload binding is legitimate here for the reason it is not on entry — the solver builds this transaction and wants to be repaid, so omitting the commitment costs only the omitter — and the commitment is mandatory, since an optional one would simply be harvested whenever it was omitted.
+```
+binding = keccak256(H || signer)
+```
 
-Exits change the race economics fundamentally: a Bitcoin payment is irreversible, so if two solvers raced an exit, both would have paid the user (who is paid twice) and only one is repaid — nobody competes under that rule. The fix is a **bonded reservation** (`reserveExit`): before paying, a solver posts a bond (a fixed fraction of the payout) for exclusive settlement rights over a reservation window sized to pay, confirm, and prove; the window must fit inside the intent's remaining lifetime or the reservation is rejected. The race moves to the Rootstock leg, where losing costs gas, never bitcoin. Squatting is priced: a lapsed reservation's bond is forfeited *into the input escrow*, so a stalled exit becomes strictly more profitable for the next solver — the mechanism heals its own delays, and the compensation stays on the Rootstock side where it is useful (the BTC-only user is made whole in BTC by whoever fills). A reservation that outlives its intent forfeits the bond to the user, so an exit cannot be squatted to death for free. Reservation is opt-in — an unreserved exit remains first-valid — but a rational solver always reserves.
+A rival with a different key derives a different binding and commands no funds.
 
-Risk allocation: the payout confirmation depth required before settlement protects the **user** — a payout reorged away after settlement leaves `H` consumed and the user unpaid — so production sets it materially above test-network values and backs the residual with the solver's bond. The intent's expiry must budget for those confirmations plus the proof work, and the reservation window must fit inside the expiry: three coupled parameters, sized together.
+This proposal uses **RSKIP-176 Programmable Peg-in Addresses** to carry that binding. Note the ordering: the deposit address depends on the binding, so `H` and the signing key must both be fixed *before* any coins move, and `btcTxid` is known from the signed Bitcoin transaction before it is broadcast.
 
-## Failure and refund
+1. the wallet fixes `H` and the signing key, and computes `binding = keccak256(H || signer)`;
+2. it derives a deposit address from the federation, settlement contract, `binding`, and the user's refund address;
+3. it builds and signs the Bitcoin transaction paying that address, which fixes `btcTxid`;
+4. the user signs the intent over `(H, btcTxid, E, minOut, outputToken)` and broadcasts the Bitcoin transaction; and
+5. the settlement contract registers the peg-in as its own liquidity-bridge contract, with `binding` in `derivationArgumentsHash`.
 
-If no solver settles an entry intent by height `E`, the pegged-in value is not lost — but with the escrow binding (the peg-in credits the settlement contract, not the user) the contract must expose a recovery path for the user after expiry: release to the user's refund address, per RSKIP-170's refund semantics. For exit intents the same applies to the escrowed input, and Flyover's `refundUserPegOut` is the model. Both recovery paths are specification requirements; they are bookkeeping, not new trust assumptions — the funds sit in the settlement contract attributable to the intent that escrowed them.
+RSKIP-176's other derivation inputs — the refund address, the liquidity-bridge contract, the liquidity provider — do not include the Rootstock signer, so passing `H` as the derivation argument would reproduce exactly the weakness above at the Bitcoin layer. The derivation argument must be the pair.
 
-The Bridge machinery these paths lean on already ships: since RSKIP-379 (Arrowhead 6.0.0 — mainnet block 6,223,700, testnet 4,927,100), peg-in processing runs a formalised evaluation pipeline (REGISTER / REFUND / NO_REFUND) in which a rejected peg-in with a recoverable sender is *automatically* refunded to the RSKIP-170 refund address — and the RSKIP-176 route bakes the user refund address into the deposit-address derivation itself. So the *rejected-peg-in* half of the refund story is existing consensus behaviour; only the *expired-intent* half (escrow already credited, no solver settled by `E`) needs new specification.
+The Bitcoin destination itself carries the binding, so it cannot be omitted or stripped by a sender. The design uses the Flyover registration path already deployed in production and is intended to require no Bridge change; that assumption still needs implementation-level confirmation for this exact use.
 
-## Expiry, replay, and reorg
+An ordinary RSKIP-170 `OP_RETURN` peg-in routed to the settlement contract was considered and rejected. It would need a new per-transaction Bridge record but still could not carry `H` without changing the v1 payload format or exceeding Bitcoin's standard data-carrier assumptions. At best, it could provide owner-level rather than intent-level binding.
 
-Expiry is height-absolute with a bounded maximum span from the current height. On a reorg, an intent on the new branch is either still includable or expired, and a dropped settlement reverts with its block; the consumed set follows ordinary state reversion. Interaction with fork-aware consensus (RSKIP-555, Draft) must be settled before the validity rules are finalized.
+## Atomic settlement
 
-## Anti-spam ticket (v1: Bitcoin-event-backed)
+A solver fulfils an intent by calling `settle(rawIntentTx)`. The contract must ensure that all of the following happen together or not at all:
 
-v1 intents require a confirmed Bitcoin transaction, referenced by `btcTxid` and checked against the Bridge SPV view at admission. Requiring this to be an ordinary peg-in has a useful consequence: when no solver ever satisfies the intent and it expires, the Bitcoin funds are recoverable by the refund path above, so the no-solver case degrades to the slow path. General-purpose ticketless intents are out of scope for v1.
+1. authenticate and parse the intent;
+2. confirm that it is unexpired and that `H` is unconsumed;
+3. verify that the escrow exists and is bound to `keccak256(H || user)`, where `user` is the address recovered from the signature;
+4. protect against re-entrant settlement by marking `H` on the current reversible execution track;
+5. deliver at least `minOut` of native RBTC or an ERC-20 from the solver to the user; and
+6. release the complete escrowed input to the solver.
 
-## Bonding and endorsement (non-consensus)
+For a token output, delivery MUST be verified by the user's **balance delta** across the transfer rather than by the transfer's return value. A fee-on-transfer token moves less than it reports, and a non-conforming token may report success having moved nothing; a return-value check would then let settlement consume `H` and release the input while the user received less than the minimum they signed. An implementation SHOULD also accept an empty return from the transfer, since tokens predating the finalised ERC-20 return no data and would otherwise be unusable as outputs — the delta check is what makes accepting silence safe, because an address that is not a token also returns nothing and moves nothing, and so fails on the delta. The same rule applies wherever the settlement layer escrows an output asset: an auction pulling a token bid must verify the amount that arrived, or it records a bid larger than it holds.
 
-A competitive solver set must exist from genesis or the protocol properties do not cash out. This is addressed off-consensus, deliberately: solvers post a slashable bond and may be endorsed — capital at risk and reputation, not validity. Making bonding a consensus gate would recreate the permissioned-LP problem the intent design exists to avoid. The solver specification (message formats for the off-chain reveal, pricing, and settlement) is published alongside this RSKIP so entry is genuinely permissionless from day one. Flyover's liquidity bridge contract, where LPs post collateral and quotes carry penalty fees, is the production precedent for sizing. Nothing in this subsection is enforced by consensus; it is included so the market-structure assumptions the design leans on are stated rather than implied.
+Any failure—including under-delivery, expiry, previous consumption, or a mismatched escrow—reverts the whole call. The user either receives the requested output and the solver receives the input, or neither happens. A failed solver loses gas, while the intent remains available until `E`.
+
+Settlement runs in the VM so normal failure receipts and rollback semantics apply. A raw stateful precompile is deliberately avoided because, in the current executor, a precompile exception does not propagate to the receipt. Bridge and Remasc are written around the same behaviour.
+
+No block-construction change is required. The solver transaction carries the signed intent bytes and EVM atomicity provides the bundle semantics. A block-producer-assembled intent-and-solution bundle remains possible future work for ordering, MEV control, or batching.
+
+Payments to solvers, bidders, and reservers MUST NOT rely solely on reverting pushes. If a recipient cannot accept native currency, the amount becomes a credit that its owner can withdraw later. A broken payee must not be able to undo a valid user delivery, block an auction, or strand an intent.
+
+Such a push SHOULD carry a bounded gas stipend rather than forwarding the remaining gas. This bounds what a hostile payee can spend of the settler's gas, and — because a useful stipend is far below the cost of a single storage write — it also means a contract payee cannot execute any logic while a settlement is still on the stack, removing the settlement-path re-entrancy surface entirely. The withdrawal path cannot be capped, since it must deliver in full; there the ordering rule (record consumption before any external call) is what makes a re-entrant settlement meet an already-consumed commitment.
+
+Payment to the user remains a hard requirement. If the user cannot receive the signed output, settlement must fail.
+
+## Price discovery and the above-`minOut` auction
+
+Under the base rule, `minOut` is the worst rate the user will accept. Any solver able to meet it may settle, and the first valid transaction included wins. Later attempts for the same `H` revert, so a losing solver risks only gas.
+
+An auction can return more of the available spread to the user. Bids are denominated in the intent's output asset: native RBTC is escrowed by value, while ERC-20 outputs are escrowed through `transferFrom`. For a compound intent, a better route produces more of the terminal asset and supports a higher bid; the auction does not need to understand the route itself.
+
+Two designs expose a genuine governance trade-off.
+
+- **Off-consensus auction:** anyone can deploy and use the auction, but a solver may bypass it by settling directly at `minOut`. A bidder left behind by that bypass must be able to reclaim its escrow.
+- **Enforced auction:** `settle` checks a designated auction contract. Once a valid bid opens an auction for `H`, only the auction may settle until exclusivity expires. The lock starts only after a bid above `minOut` has been escrowed, so the user always receives more than the signed floor. Permissionless `execute()` remains protected after bidding closes. Exclusivity must also be releasable, so that a settlement which reverts forever inside the auction cannot hold an intent hostage — but that release MUST key on an execution that was **observed to fail**, not on elapsed time. Releasing purely because a grace period has passed hands the intent to whoever withholds the auction's execution: wait out the period, then settle at the floor around a higher standing bid. Worse, for a native-currency output the elapsed-time form has no legitimate trigger at all, since an auction holding the winning bid cannot fail to fund the settlement it wraps. The execution attempt therefore catches the failure, records it, and returns rather than reverting — a revert would roll back the very record the release reads — and it MUST require a gas floor comfortably above a settlement's cost before making the call, or EIP-150's 63/64 forwarding rule would let anyone under-gas the attempt so the inner settlement dies while the recording still runs, releasing a healthy auction on demand. All payouts follow the credit-fallback rule.
+
+This proposal surfaces the choice rather than deciding it. Enforcement prevents bypass, but it also makes the auction part of the settlement rules rather than optional market infrastructure.
+
+## Bitcoin exit path
+
+A Bitcoin exit uses the `outputToken` sentinel and commits the destination in `H`. The solver pays the user's Bitcoin address from its own UTXOs, proves that payment on Rootstock, and claims the intent's escrow through `settleBtcOut`.
+
+The exit inverts the entry's trust shape. On entry the irreversible leg happens first, on Bitcoin, and Rootstock settles against a fact already true. On exit the solver spends irreversibly *after* taking exclusivity and *before* being repaid, so every gate below exists to make that ordering survivable.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User (BTC address, no RBTC)
+    participant W as Wallet backend (funded)
+    participant N as rskj mempool
+    participant S as Solver
+    participant BTC as Bitcoin
+    participant BR as Bridge
+    participant SC as Settlement contract
+
+    Note over U,W: commit the destination — it never appears in the envelope
+    U->>U: pick the BTC destination hash160 and a random salt
+    U->>U: H = keccak256("BTCOUT" || hash160 || salt)
+    U->>U: sign intent(H, btcTxid, E, minOut in satoshis, outputToken = BTC_OUT)
+    W->>SC: fund the input escrow, bound to keccak256(H || signer)
+    Note over W,SC: how an EXIT escrow is funded is an open question — permit-pulled tokens, or a peg-in
+
+    U->>N: raw intent (gasPrice 0, value 0)
+    N->>N: admit and gossip — minOut, E and the sentinel are now public
+    U-->>S: the destination and salt, off-chain
+    Note over U,S: the one step no entry intent needs, and no channel is specified for it. The user may be long offline
+
+    S->>SC: reserveExit(rawIntentTx) with a bond
+    SC->>SC: check BTC_OUT, unexpired, H unconsumed, window fits inside E
+    SC->>SC: exclusive to S until RESERVE_WINDOW elapses
+    Note over S,SC: reserveExit reads only the envelope, so a solver can bond here WITHOUT the reveal
+
+    S->>BTC: pay the hash160 at least minOut sats, plus an OP_RETURN naming S as settler
+    BTC-->>BR: headers relayed, confirmations accumulate
+
+    S->>SC: settleBtcOut(rawIntentTx, salt, btcDest, rawBtcTx, blockHash, merkle branch)
+    SC->>SC: parse — BTC_OUT, unexpired, H equals the commitment over the pair, H unconsumed
+    SC->>SC: reservation gate, before the SPV work — a live reservation admits only its own solver
+    SC->>BR: getBtcTransactionConfirmations(payTxid, blockHash, branch)
+    BR-->>SC: depth, which must reach MIN_BTC_CONF
+    SC->>SC: the OP_RETURN settler MUST equal msg.sender — an SPV proof is otherwise a bearer object
+    SC->>SC: find an unclaimed output paying the committed destination, and claim it per output
+    SC->>SC: mark H consumed
+    SC->>S: release the input escrow, and refund the bond best-effort
+```
+
+Two asymmetries are worth reading off the diagram. The reveal arrow is the only step an entry intent does not have, and `reserveExit` parses nothing but the envelope — so a solver can post a bond on an exit it has not yet been given the means to settle, which is what makes withholding the reveal a griefing lever rather than merely an inconvenience. And the bond refund is deliberately best-effort: a reserver that cannot receive RBTC must not be able to brick its own settlement *after* having spent irreversible bitcoin.
+
+The proof contains:
+
+- SPV inclusion against the Bridge's header chain, using RSKIP-122 `getBtcTransactionConfirmations`; and
+- an on-chain parse of the raw Bitcoin transaction showing an unclaimed output of at least `minOut` satoshis to the committed destination.
+
+Claims are tracked per output, not per transaction. One Bitcoin transaction may therefore pay several users and settle several intents, sharing its Bitcoin fee across the batch, up to a bounded maximum output count — the parse is paid for by the settler, so an unbounded scan would let a wide payout exceed any gas limit and become unsettleable.
+
+The payout MUST also carry a **settler commitment**: an `OP_RETURN` output holding a fixed tag and the RSK address entitled to settle with it, which `settleBtcOut` requires the caller to match. Without it the SPV proof is a bearer object — public bytes naming the user's address — and anyone could present another solver's payout against their own dust-`minOut` intent on the same destination. The per-output claim would then consume the payment, and the paying solver's bitcoin would be lost irreversibly. A reservation cannot close this: it keys on `H`, and the hijacker brings a different `H`. Committing the *settler* rather than the intent keeps batching intact, since one output then protects every payment in the transaction. This payload binding is legitimate here for precisely the reason it is not on the entry side — the solver builds this transaction and wants to be repaid, so omitting the commitment costs only the omitter — and it is mandatory, because an optional commitment would simply be harvested whenever it was omitted.
+
+### Bonded exit reservations
+
+The entry-style first-valid race does not work for exits. A Bitcoin payment is irreversible: if two solvers pay the same user, both payments succeed, but only one solver can claim the Rootstock escrow. Rational solvers will not compete on those terms.
+
+`reserveExit` moves the race to Rootstock. Before paying Bitcoin, a solver posts a bond and receives exclusive settlement rights for a window long enough to pay, confirm, and prove the transaction. The reservation is rejected unless that window fits inside the remaining intent lifetime.
+
+Squatting is costly. If a reservation lapses, its bond is added to the input escrow, making the intent more profitable for the next solver. If it survives beyond intent expiry, the bond goes to the user. An unreserved exit may still follow the first-valid rule, although a rational solver is expected to reserve.
+
+The required Bitcoin confirmation depth protects the user. If a payment is reorganised away after settlement, `H` remains consumed and the user loses the payout. Production must use a materially stronger confirmation requirement than the test environment and back the remaining risk with the reservation bond.
+
+Expiry, confirmation depth, and reservation duration must be sized together. The intent needs enough lifetime for payment, confirmations, and proof submission.
+
+## Failure and recovery
+
+If no solver settles an entry before `E`, the funds are not automatically available in the user's account: the peg-in credited the settlement contract. After expiry, the contract must provide an authenticated recovery path to the user's refund address. The same requirement applies to an exit intent's escrow. Flyover's `refundUserPegOut` is the relevant model.
+
+Some of the refund machinery already exists. Since RSKIP-379, introduced with Arrowhead 6.0.0 at mainnet block 6,223,700 and testnet block 4,927,100, peg-in processing follows REGISTER, REFUND, and NO_REFUND outcomes. A rejected peg-in with a recoverable sender is automatically returned to its RSKIP-170 refund address.
+
+The RSKIP-176 derivation includes the user's refund address, so the rejected-peg-in case inherits that existing behaviour. The remaining gap is different: escrow that was credited successfully but remains unused after the intent expires. That expired-intent recovery path needs a new, explicit specification.
+
+## Expiry, replay, and reorganisation
+
+`E` is an absolute Rootstock height and must fall within a bounded horizon from the current block. After a reorg, the intent is evaluated against the replacement branch and is either still valid or expired. A removed settlement also removes its delivery and consumed marker.
+
+The interaction with fork-aware consensus under RSKIP-555 remains open and must be resolved before the validity rules are finalised.
+
+## Bitcoin-backed anti-spam ticket
+
+v1 requires `btcTxid` to identify a processed Bitcoin peg-in visible in the Bridge's SPV-backed state, which puts a Bitcoin transaction's cost behind free mempool admission and keeps the first version focused on Bitcoin entry and exit.
+
+**As specified, that cost binds entry rather than volume, and the difference is not small.** The rule as written asks only whether the referenced txid *is* a processed peg-in. Nothing binds it to the signer, counts how many intents name it, or dedups. One peg-in therefore admits unlimited intents: fresh `H` each time, since nothing checks its provenance, and a fresh key each time, which sidesteps any per-account pool limit. Measured on a node with the rule enabled, forty-one intents were admitted against a single planted ticket. The ticket is an entry fee per attacker, not a cost per message.
+
+The fix is to check the **escrow**, not the ticket: admit an intent only when an escrow bound to `keccak256(H ‖ signer)` exists for its `btcTxid`. Every field needed is already to hand at admission — `H` and `btcTxid` from the payload, the signer from the signature — so it stays one storage read plus one hash. Each intent then requires its own derived deposit, making the flood cost one Bitcoin transaction *per intent*, which is the design's own premise. It also settles the admission-latency question below, because what is checked becomes escrow existence rather than confirmation depth.
+
+One implementation hazard belongs with that change rather than after it. The consumed set already occupies `slot == H` in the settlement contract, and `H` is attacker-chosen; an escrow marker placed at `slot == keccak256(H ‖ signer)` would share that space, so an attacker could choose an `H` colliding with another intent's escrow slot. The escrow marker must therefore be domain-separated from the consumed set rather than sharing its namespace.
+
+If no solver acts, the recovery mechanism above provides the slow path. General-purpose ticketless intents are outside v1.
+
+## Bonding and endorsement
+
+A competitive solver set cannot be assumed merely because entry is open. Solvers may therefore post slashable bonds and receive endorsements, providing capital-at-risk and reputation signals.
+
+Bonding stays outside consensus in v1. Turning it into a validity gate would recreate a permissioned liquidity-provider set. The solver protocol should instead be published alongside the RSKIP so a new participant has an open path to discovery, pricing, settlement, and — for exits only — the destination reveal.
+
+Flyover's liquidity bridge contract, where LPs post collateral and quotes carry penalty fees, provides a production precedent for sizing. This section states the market assumptions on which liveness depends; it does not make them consensus rules.
 
 ## Activation
 
-Everything in this proposal is gated by its own consensus rule: the zero-cost admission path, the parse precompile's availability, and the settlement/auction contract deployments all activate at the fork height and are inert before it. Block height at which activated is TBD.
+The proposal uses a dedicated consensus rule. Before the activation height, the zero-cost path, admission checks, parsing precompile, and designated contracts are inert. At activation, the parser becomes available and the settlement and auction contracts are installed through the fork transition.
+
+The activation height remains TBD. RSKIP-543/545/546 must already be active.
 
 # Implementation
 
-A reference implementation exists as a set of patches on top of the rskj typed-transactions branch (PR #3558 — which implements RSKIP-545/546 and does not itself contain any of this proposal): the subtype recognizer, the zero-cost admission path, the four admission checks, block-producer exclusion, the parse precompile, the settlement and auction contracts (including the escrowed intent-bound input claim, both auction shapes with credit-fallback payouts and lock decay, and the exit path with SPV-verified payouts, per-output claims, and bonded reservations), together with a TypeScript SDK and a falsification-style test suite run against patched regtest nodes and a real bitcoind — covering payer-less admission and gossip, free expiry rejection, replay protection, settlement atomicity, reorg reversion on one node and under a genuine two-node partition/merge, ERC-20 outputs, visible reverts, activation gating, real peg-in input binding, escrow-capture rejection, competing-solver races, and the exit-path negatives.
+A reference implementation exists as a set of patches on top of the rskj typed-transaction branch (PR #3558, which implements RSKIP-545/546 and contains none of this proposal). It includes:
+
+- intent subtype recognition and canonical signing;
+- activation-gated, zero-cost admission and block-producer exclusion;
+- the stateless parsing precompile and contract-owned consumed set;
+- intent-bound input escrow using a real peg-in path;
+- atomic RBTC and ERC-20 settlement with visible reverts;
+- both forms of the above-`minOut` auction, including credit fallbacks and failure-triggered release of exclusivity;
+- solver bonding;
+- Bitcoin exits with SPV-verified payments, per-output claims, and bonded reservations; and
+- a TypeScript SDK and falsification-oriented test suite.
+
+The suite has been run against patched regtest nodes and a real bitcoind. It covers payer-less admission and gossip, free expiry rejection, replay protection, atomic settlement, single-node and two-node reorganisation, token output, visible failure, activation, peg-in binding, rival-intent escrow capture, competing solvers, exit-path negative cases, and mempool-sourced settlement by a solver holding only an RPC URL.
+
+Passing these tests shows that the implementation behaves as expected in that environment. It does not by itself establish production safety or choose sound mainnet economic parameters.
 
 # Rationale
 
-**Separation of submission, signing, and paying.** The user signs constraints; a solver pays at settle time; anyone holding the bytes may broadcast. The submitter cannot modify (the intent is self-authenticating), cannot forge, and can only delay, since anyone can re-broadcast. This contrasts with the router-contract path, where a specific liquidity provider is the transaction sender and their withdrawal halts the flow.
+**Separate signing, broadcasting, and paying.** The user signs the constraints, anyone may broadcast the self-authenticating bytes, and the solver pays only when settling. A broadcaster cannot alter or forge the intent and can do little beyond delaying it; someone else can rebroadcast.
 
-**Why the solver claims the input rather than being paid a fee.** A separate fee would need a funding source; the user has none on Rootstock yet (that is the whole point — value is arriving from Bitcoin). Letting the solver take the input and deliver the output is self-funding: the user pays in the asset they are giving up anyway, and the fee is the spread. Fixing a fee as a protocol parameter would misprice risk that varies by asset, size, volatility, and confirmation depth; letting `minOut` and solver competition set it lets the market price each intent.
+**Let the solver claim the input.** A separate fee needs separate funding, but the user may have no Rootstock balance. Paying through the spread makes the exchange self-funding. A fixed protocol fee would also misprice risks that vary by asset, amount, volatility, capital cost, and confirmation depth.
 
-**Why the solver pays gas.** It aligns cost with the party that profits and keeps the user gas-free (a required property — the user may have no RBTC). A failed settlement is the solver's cost, which is the correct incentive: solvers simulate and price before submitting.
+**Charge gas to the solver.** The solver is the party seeking profit and is best placed to simulate execution and price failure. This keeps the user gas-free.
 
-**Why settlement is trustless only post-confirmation.** Settlement can move the input to the solver only once the input exists on chain — after the peg-in is registered. A truly instant experience requires the solver to deliver *before* that, taking on Bitcoin double-spend risk. That fronting is off-protocol risk-taking the protocol cannot make trustless; it is priced into the spread. The honest framing: the protocol delivers trust-minimised settlement of fronted flows, and "instant" is a solver service, not a protocol guarantee.
+**Describe "instant" honestly.** Trust-minimised settlement can release the input only after the peg-in is registered. A solver may deliver earlier, but then it accepts Bitcoin double-spend, reorganisation, and capital-time risk. The spread can price that risk; the protocol cannot remove it.
 
-**Liveness.** Inclusion via a solver-paid transaction means censorship resistance is "any bonded solver chasing visible profit", not "block producers include it". Commit/reveal is front-running protection, not privacy: the counterparty solver must see the payload off-chain to price it, so `H` hides it from third parties only.
+**State the liveness dependency.** The public mempool provides common discovery and admission, not guaranteed execution. On the entry path a solver needs nothing but the pool and a visible positive spread. On the exit path it additionally needs the destination and salt committed in `H`, which the envelope does not carry — and there the reveal policy can quietly turn one dApp into the only liveness provider.
 
-**An honest qualification.** Protocol properties only cash out with a competitive solver set; the bonding subsection makes the market-structure assumption explicit, and the claim is "entry is permissionless from genesis", not a promise of competition.
+**Do not promise competition.** Open entry does not guarantee a competitive market. The defensible claim is that entry is permissionless from activation, while profitable participation may require capital and reputation — and, on the exit path, access to a reveal.
 
-# Backward compatibility
+# Backwards compatibility
 
-This change is a hard fork and all full nodes must be updated. The type is additive: it lives behind the RSKIP-543/545/546 typed-transaction activation and its own consensus rule, and existing transaction types are unaffected. Because intents never appear in blocks, SPV light clients do not need to be updated.
+This proposal requires a hard fork and every full node must update. The subtype is additive and depends on the RSKIP-543/545/546 namespace plus its own activation rule. Existing transaction types remain unchanged.
+
+Because intent objects never appear in blocks, SPV clients do not need to understand their envelope. They will continue to observe ordinary settlement transactions and resulting state changes.
 
 # Test cases
 
-Provided with the reference implementation as falsification experiments, one per claim: each states the claim, the procedure, and the observation that would prove the claim false.
+The reference suite treats each experiment as an attempt to disprove one claim. Every case defines the claim, procedure, and observation that would make it false.
+
+The suite should continue to distinguish protocol properties from implementation and market properties. A passing auction or solver test does not make competition a consensus guarantee.
 
 # Security considerations
 
-- **User double-spend of the peg-in.** Handled by requiring the peg-in to be registered (confirmed) before settlement can claim the input; the confirmation depth is the Bridge's, not a new parameter.
-- **Escrow capture by a rival intent.** Closed by the derivation binding: a rival intent naming the same txid derives a different deposit address holding no coins, so it commands no input, and an attempted settlement reverts.
-- **Griefing a specific `H`.** Closed by atomic settlement: an attacker cannot consume `H` without delivering `minOut`; a failed attempt costs the attacker gas and leaves the intent solvable.
-- **Hostile output tokens.** The output asset is named in the user's own signed intent, so no third party can choose it; the balance-delta rule above bounds what a misbehaving token can do *during* settlement. It cannot bound what the token's issuer does afterwards — a token whose issuer can freeze or claw back balances defeats any on-chain check — so wallets composing intents on a user's behalf SHOULD restrict output assets to a vetted set rather than accepting an arbitrary address.
-- **Unpayable participants.** Push payments to solvers, bidders, or reservers cannot revert settlements, block auctions, or strand intents; credit-fallback payouts confine a broken payee's failure to itself. Such a push SHOULD carry a bounded gas stipend rather than forwarding the remaining gas, for two reasons: it bounds what a hostile payee can spend of the settler's gas, and — because a useful stipend is far below the cost of a single storage write — it also means a contract payee cannot execute logic while a settlement is still on the stack, removing the settlement-path reentrancy surface entirely. The withdrawal path cannot be capped, since it must deliver in full; there the ordering rule (record consumption before any external call) is what makes a reentrant settlement meet an already-consumed commitment.
-- **Exit races.** A Bitcoin payment is irreversible; bonded reservations move the race onto Rootstock where losing costs gas. Squatting forfeits the bond into the escrow (lapse) or to the user (intent expiry).
-- **Payout hijack.** An SPV proof is a bearer object, so entitlement must travel with the payment rather than with the proof: the settler commitment binds each payout to the party that made it, and an uncommitted payout is unclaimable by anyone. Reservations alone do not suffice — they protect the intent, not the payment.
-- **Unbounded payout parsing.** The output scan is paid for by the settler, so the output count is capped; an over-wide payout is refused by name rather than exhausting the caller's gas, and the safe batch size is a stated constant instead of an implicit gas ceiling.
-- **Solver default between fronting and claim.** Only relevant in the off-protocol instant variant; the on-protocol path settles atomically, so there is no window.
-- **Price manipulation / MEV.** The first-valid-inclusion race is MEV-exposed like any inclusion market; a consensus-level intent+solution bundle (future work) would give ordering control. Exposure is bounded by the user's `minOut` — the user cannot receive less than they signed for. A user signing an unrealistic `minOut` simply goes unsolved.
-- **Block-producer front-running.** A settle transaction carries the whole authenticated intent in its calldata, so any observer — a block producer most cheaply of all — can settle the same intent first. The user is unaffected (`minOut` still binds), but the honest solver forfeits its gas and any output it pre-acquired, which is a tax on exactly the participants the design needs. The mitigation the design already contains is the auction lock: once an intent is bid upon, a front-run must be expressed as a higher bid, which pays the surplus to the user. Bid-free intents have no such protection, so wallets or brokers SHOULD open an auction on submission if front-running pressure is material.
-- **Block-producer censorship.** Transaction selection cannot be compelled, so a mining solver can include only its own settlements. Liveness rests on "some producer will include a profitable settle", not on any particular one; this is the same assumption relay markets make, and it is stated rather than assumed away.
-- **Block-denominated deadlines are not clocks for a block producer.** Both auction limits — the bidding window and the decay of exclusivity — are block counts, which behave as elapsed time for ordinary participants and as a controllable counter for whoever produces blocks. A producer can therefore close a bidding window in no wall-clock time (bid the floor, mine the window out, and rivals never enter the auction at all), or decline to include `execute()` until exclusivity decays and then settle directly at `minOut` around a higher standing bid. `minOut` still binds, the consumed set still admits one settlement, and an outbid participant still reclaims its escrow, so this costs price discovery rather than principal — but price discovery is the auction's entire product. The decay is a deliberate trade: it is what stops a wedged auction stranding an intent, and it is simultaneously a permissionless route to the floor price. Denominating the window in timestamps instead does not fix this and should not be presented as if it did: a block's timestamp must exceed its parent's but may run up to the network's future-time allowance ahead of real time (540 seconds on Rootstock), so a producer can still close any practical window instantly, simply not repeatedly — it is a rate limit, not a defence. The structural answer is that price discovery denominated in on-chain time is capturable by whoever orders blocks: discovery belongs off-chain, with the chain enforcing the floor and settling the result. This proposal specifies block heights, and records the consequence rather than implying a parameter choice resolves it.
-
-Exclusivity decay is specified with the same reasoning. A settlement contract that releases an auctioned intent purely because a grace period has elapsed hands that intent to whoever withholds the auction's execution: wait out the period, then settle at the floor around a higher standing bid. Worse, for a native-currency output the elapsed-time form has no legitimate trigger at all, since an auction holding the winning bid cannot fail to fund the settlement it wraps. Decay MUST therefore key on an execution that was OBSERVED to fail, not on elapsed time — the execution attempt catches the failure, records it, and returns rather than reverting, since a revert would roll back the very record the decay reads. The attempt MUST also require a gas floor comfortably above a settlement's cost before making the call, or EIP-150's 63/64 forwarding rule would let anyone under-gas the attempt so the inner settlement dies while the recording still runs, decaying a healthy auction on demand.
+- **Bitcoin input double-spend:** settlement may claim the input only after the Bridge accepts the peg-in under its confirmation rules.
+- **Rival-intent escrow capture:** escrow is bound to `keccak256(H || signer)` through the derived deposit address. An intent that merely copies `btcTxid` controls no funds, and neither does one that copies `H` as well — the signer cannot be forged, because settlement recovers it from the signature. Binding to `H` alone would be insufficient precisely because `H` is public and identifies the intent rather than the party entitled to the input.
+- **Consumption griefing:** an attacker cannot consume `H` without completing every required transfer. A failed attempt costs gas and leaves the intent available.
+- **Unpayable participants:** solver, bidder, and reserver payouts use credit fallbacks so a recipient cannot block unrelated progress, and each push carries a bounded gas stipend rather than forwarding the remaining gas.
+- **Hostile output tokens:** the output asset is named in the user's own signed intent, so no third party can choose it, and the balance-delta rule bounds what a misbehaving token can do *during* settlement. It cannot bound what the token's issuer does afterwards — an issuer able to freeze or claw back balances defeats any on-chain check — so wallets composing intents on a user's behalf SHOULD restrict output assets to a vetted set rather than accepting an arbitrary address.
+- **Auction liveness:** enforced exclusivity must release a wedged intent back to open settlement — but on a *demonstrated* execution failure rather than on elapsed time, or the release becomes a lever for whoever withholds the execution.
+- **Exit races:** a bonded reservation moves the irreversible race away from Bitcoin and onto Rootstock. Lapse and expiry must forfeit the bond as specified.
+- **Payout hijack:** an SPV proof is a bearer object, so entitlement must travel with the payment rather than with the proof. The settler commitment binds each payout to the party that made it, and an uncommitted payout is unclaimable by anyone. Reservations alone are insufficient — they protect the intent, not the payment.
+- **Unbounded payout parsing:** the output scan is paid for by the settler, so the output count is capped. An over-wide payout is refused by name rather than exhausting the caller's gas, and the safe batch size is a stated constant rather than an implicit gas ceiling.
+- **Bitcoin payout reorganisation:** confirmation depth and bond size must cover the user's residual risk if a proved payment later disappears.
+- **Fronting risk:** before Bridge registration, the solver bears Bitcoin and capital-time risk. The post-registration path settles atomically.
+- **Block-producer front-running:** a settle transaction carries the whole authenticated intent in its calldata, so any observer — a block producer most cheaply of all — can settle the same intent first. The user is unaffected (`minOut` still binds), but the honest solver forfeits its gas and any output it pre-acquired, which taxes exactly the participants the design needs. The mitigation already in the design is the auction lock: once an intent is bid upon, a front-run must be expressed as a higher bid, which pays the surplus to the user. Bid-free intents have no such protection, so wallets or brokers SHOULD open an auction on submission where front-running pressure is material.
+- **Block-producer censorship:** transaction selection cannot be compelled, so a mining solver can include only its own settlements. Liveness rests on "some producer will include a profitable settle", not on any particular one — the same assumption relay markets make, stated rather than assumed away.
+- **MEV and duplicate submission:** the first-valid race exposes solvers to ordering and losing-transaction gas. `minOut` protects the user from under-delivery but does not guarantee the best available rate.
+- **Block-denominated deadlines are not clocks for a block producer:** an auction's bidding window and the release of its exclusivity are block counts, which behave as elapsed time for ordinary participants and as a controllable counter for whoever produces blocks. A producer can close a bidding window in no wall-clock time — bid the floor, mine the window out, and rivals never enter the auction at all. `minOut` still binds, the consumed set still admits one settlement, and an outbid participant still reclaims its escrow, so this costs price discovery rather than principal; but price discovery is the auction's entire product. Denominating the window in timestamps does not fix this and should not be presented as if it did: a block's timestamp must exceed its parent's but may run up to the network's future-time allowance ahead of real time (540 seconds on Rootstock), so a producer can still close any practical window instantly, simply not repeatedly. That is a rate limit, not a defence. The structural answer is that price discovery denominated in on-chain time is capturable by whoever orders blocks — discovery belongs off-chain, with the chain enforcing the floor and settling the result. This proposal specifies block heights and records the consequence rather than implying a parameter choice resolves it.
+- **Unrealistic output floor:** an intent whose `minOut` leaves no positive expected spread may remain unsolved.
+- **Reveal censorship on the exit path:** a BTC-out intent commits its destination inside `H` and the settling solver must supply `hash160` and `salt`, neither of which is in the envelope. Whoever controls that channel decides which solvers can settle, and a bonded reservation makes the exposure concrete: a solver can be induced to lock a bond against an intent whose preimage is then withheld until the reservation lapses. Entry-path intents carry this risk not at all — they are fillable from the pool alone (E24) — so the exit path should either specify an access rule or a retrievable channel, or drop the salt and accept that the destination is public. The salt buys destination privacy and pays for it in liveness; the proposal should say which it is choosing.
 
 # Open questions
 
-- Envelope: whether the intent is signed by a user EVM key (wallet-derived) or by a signature recoverable from the Bitcoin input, dissolving the submission step further. Packing constraints into the peg-in's OP_RETURN is ruled out (it conflicts with RSKIP-170 v1 parsing and Bitcoin data-carrier standardness); the derivation route already carries the commitment without wire data.
-- Admission latency is Bridge-bound: either admission tolerates "not yet visible" with a retry window (weakening the spam filter) or the wallet waits for Bridge registration (adding latency).
-- Fronting as a first-class cost: with derivation-bound escrows a solver can deliver before Bridge registration against a reliable receivable, pricing capital time-value and reorg risk into its bid — confirmation depth becomes a market variable. Requires settlement with deferred input release and an admission stance on unripe tickets.
-- Exit intents couple three parameters that must be sized together: expiry must budget for the solver's Bitcoin confirmations plus proof work, the reservation window must fit inside the expiry, and the payout confirmation depth allocates the payout-reorg risk. Test-network values do not transfer to mainnet; the reservation window covering hours of Bitcoin confirmations also makes the bond's opportunity cost material — size the bond as a function of window length, not just payout.
-- A native permit: exiting a live position (vault shares, LP tokens) without any user Rootstock transaction requires the intent itself to carry a transfer authorisation the settlement contract can exercise. EIP-2612 covers permit-aware tokens; the protocol-level generalisation is open.
-- Recovery of an expired intent's escrowed input (Flyover's `refundUserPegOut` is the model) — the one refund half not already covered by shipped Bridge behaviour.
-- Consumed-set pruning (lazy prune vs periodic sweep vs bounded growth) and RSKIP-555 interaction.
-- Enforced vs off-consensus auction: a governance decision this proposal surfaces rather than makes.
-- Multi-input / partial-fill intents (one intent satisfied by several solvers), out of scope for v1.
-- Fee to the network beyond gas (none proposed; noted for completeness).
+- **Signing key:** should the intent use a wallet-derived EVM key or a signature recoverable from the Bitcoin input?
+- **Admission latency and who registers:** requiring a registered ticket means registration must precede broadcast, which excludes the solver from doing it — it cannot act on an intent it cannot yet see — and leaves the wallet's funded backend as the natural registrant. Should a node instead tolerate a ticket not yet visible to the Bridge, weakening the spam filter but letting the user broadcast first and a solver register as part of filling?
+- **Fronting as a first-class mode:** derivation-bound escrow may support early delivery against a credible receivable. Doing so needs deferred input release and an explicit rule for unripe tickets.
+- **Exit parameters:** expiry, reservation duration, confirmation depth, and bond size are coupled. Test values cannot simply be copied to mainnet.
+- **Native permit:** exiting vault shares or LP tokens without another user transaction requires a transfer authorisation the settlement contract can exercise. EIP-2612 covers compatible tokens; a general mechanism remains open.
+- **Expired escrow:** the `refundUserPegOut` analogue still needs an exact specification.
+- **Consumed-set pruning:** lazy deletion, periodic sweeping, and bounded growth need to be evaluated alongside RSKIP-555.
+- **Auction governance:** should the auction be bypassable market infrastructure or enforced by the designated settlement contract?
+- **Partial fills:** multi-input and multi-solver intents remain outside v1.
+- **Network fee:** no charge beyond ordinary solver-paid gas is currently proposed.
+
+Packing `H` into an ordinary RSKIP-170 `OP_RETURN` peg-in is not retained as an open option: it conflicts with v1 parsing and the assumed Bitcoin data-carrier limit. The derivation route carries the commitment without adding Bitcoin wire data.
 
 # References
 
-- [RSKIP-36](https://github.com/rsksmart/RSKIPs/blob/master/IPs/RSKIP36.md) — EXECUTE opcode (2017), sponsorship-only prior work.
-- [RSKIP-138](https://github.com/rsksmart/RSKIPs/blob/master/IPs/RSKIP138.md) — multi-signed enveloping (2019), sponsorship-only prior work.
-- RSKIP-543 / RSKIP-545 / RSKIP-546 — typed transactions and the `0x02` RSK namespace. rskj [PR #3558](https://github.com/rsksmart/rskj/pull/3558) implements RSKIP-545/546 and is the base branch for this proposal's reference implementation.
-- RSKIP-122 — Bitcoin transaction confirmations query (`getBtcTransactionConfirmations`); the SPV primitive the exit path builds on.
-- RSKIP-170 — peg-in transaction version 1 (OP_RETURN destination and refund semantics).
-- RSKIP-176 — Programmable Peg-in Addresses (Flyover); the specified input-binding mechanism.
-- RSKIP-379 — peg-in processing pipeline (Arrowhead 6.0.0): REGISTER/REFUND/NO_REFUND evaluation with automatic rejection refunds; the shipped Bridge half of the refund path.
-- [Flyover / Liquidity Bridge Contract](https://github.com/rsksmart/liquidity-bridge-contract) — the closest production relative: `refundPegOut` is shape-for-shape this proposal's `settleBtcOut`, `refundUserPegOut` the expired-escrow recovery model, and its LP collateral/penalty model the precedent for solver bonds.
+- [RSKIP-36](https://github.com/rsksmart/RSKIPs/blob/master/IPs/RSKIP36.md) — EXECUTE opcode and earlier sponsorship-only work.
+- [RSKIP-138](https://github.com/rsksmart/RSKIPs/blob/master/IPs/RSKIP138.md) — multi-signed enveloping and earlier sponsorship-only work.
+- RSKIP-543, RSKIP-545, and RSKIP-546 — typed transactions and the `0x02` RSK namespace. rskj [PR #3558](https://github.com/rsksmart/rskj/pull/3558) implements RSKIP-545/546 and is the base branch for this proposal's reference implementation.
+- RSKIP-122 — `getBtcTransactionConfirmations`, used for Bitcoin payout proofs.
+- RSKIP-170 — peg-in transaction version 1, including destination and refund semantics.
+- RSKIP-176 — Programmable Peg-in Addresses, used for input binding.
+- RSKIP-379 — the REGISTER, REFUND, and NO_REFUND peg-in pipeline introduced with Arrowhead 6.0.0.
+- [Flyover / Liquidity Bridge Contract](https://github.com/rsksmart/liquidity-bridge-contract) — production precedent for payout proofs, refund handling, collateral, and penalties.
 - RSKIP-555 (Draft) — fork-aware consensus.
-- [EIP-155](https://eips.ethereum.org/EIPS/eip-155) — replay-protected transaction signing.
-- [EIP-2718](https://eips.ethereum.org/EIPS/eip-2718) — typed transaction envelope.
-- [ERC-4337](https://eips.ethereum.org/EIPS/eip-4337) — off-protocol account abstraction and its alternative mempool.
-- [RIP-7560](https://github.com/ethereum/RIPs/blob/master/RIPS/rip-7560.md) — native account abstraction direction on Ethereum (divergence to track).
-- PBS / proposer-builder separation and relay markets — liveness analogue for the solver inclusion race.
+- [EIP-155](https://eips.ethereum.org/EIPS/eip-155) — replay-protected signing.
+- [EIP-2718](https://eips.ethereum.org/EIPS/eip-2718) — typed transaction envelopes.
+- [ERC-4337](https://eips.ethereum.org/EIPS/eip-4337) — account abstraction and an alternative mempool.
+- [RIP-7560](https://github.com/ethereum/RIPs/blob/master/RIPS/rip-7560.md) — Ethereum's native account-abstraction direction.
+- Proposer-builder separation and relay markets — a useful, but limited, liveness analogy for solver inclusion.
 
 # Copyright
 
-Copyright and related rights waived via [CC0](https://creativecommons.org/publicdomain/zero/1.0/).
+Copyright and related rights waived under [CC0](https://creativecommons.org/publicdomain/zero/1.0/).
