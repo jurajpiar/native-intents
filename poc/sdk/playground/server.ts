@@ -28,7 +28,7 @@ import { Contract, ContractFactory, JsonRpcProvider, Network, Wallet, getBytes, 
 import grieferArtifact from "../src/abi/Griefer.json" with { type: "json" };
 import { buildIntent, btcOutH, randomH } from "../src/intent.js";
 import { Solver } from "../src/solver.js";
-import { depositForPegin, peginOf, settleBtcOut, reserveExit, exitBondFor } from "../src/settlement.js";
+import { depositForPegin, peginOf, settleBtcOut, reserveExit, exitBondFor, bindingOf } from "../src/settlement.js";
 import { branchFromTxOutProof } from "../src/merkle.js";
 import { auction, placeBid, placeBidToken, executeAuction, bidOf, lockedUntil, withdrawCredit, creditOf } from "../src/auction.js";
 import { deployVault, vault, vaultDeposit, vaultApprove, sharesOf, vaultWithdraw } from "../src/vault.js";
@@ -593,7 +593,7 @@ async function createIntent(p: { userId: number; type: IntentType; inputRbtc: nu
     const btcDest = await btc.hash160Of(u.btcAddr);
     const H = btcOutH(btcDest, salt);
     const btcTxid = getBytes(randomBytes(32));
-    await viaCow(() => depositForPegin(rpc.url, hexlify(btcTxid), input, hexlify(H)));
+    await viaCow(() => depositForPegin(rpc.url, hexlify(btcTxid), input, bindingOf(H, u.wallet.address)));
     await sleep(1200);
     const head = await rpc.blockNumber();
     const it: IntentRec = {
@@ -625,7 +625,7 @@ async function createIntent(p: { userId: number; type: IntentType; inputRbtc: nu
   } else {
     btcTxid = getBytes(randomBytes(32));
   }
-  await viaCow(() => depositForPegin(rpc.url, hexlify(btcTxid), input, hexlify(H)));
+  await viaCow(() => depositForPegin(rpc.url, hexlify(btcTxid), input, bindingOf(H, u.wallet.address)));
   await sleep(1200);
   const head = await rpc.blockNumber();
   const it: IntentRec = {

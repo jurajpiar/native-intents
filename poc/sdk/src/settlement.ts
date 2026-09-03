@@ -1,5 +1,5 @@
 /** Settlement contract helpers for the fee mechanics (m4): model the peg-in credit and read the escrow. */
-import { Contract, JsonRpcProvider, Network, Wallet } from "ethers";
+import { Contract, JsonRpcProvider, Network, Wallet, keccak256, solidityPacked, hexlify } from "ethers";
 import settlementAbi from "./abi/Settlement.json" with { type: "json" };
 import { CHAIN_ID, COW_KEY, SETTLEMENT_ADDR } from "./config.js";
 
@@ -13,12 +13,29 @@ function contract(rpcUrl: string, key: string = COW_KEY): Contract {
  * `intentH` (the PoC model of RSKIP176 entry binding — sign first, then deposit). Passing the default
  * zero H models a legacy/unbound peg-in, which stays exposed to txid squatting (atlas B1).
  */
+/**
+ * The escrow binding the contract keys on: keccak256(H || signer). Mirrors Settlement.bindingOf.
+ *
+ * NOT H alone. H is public the moment an intent is in the mempool, and anyone can sign an intent
+ * carrying it; the signer is what a rival cannot forge. Binding to the pair is what stops a same-H
+ * twin with a dust minOut collecting the victim's escrow (attack B5). In production this is the value
+ * that goes into RSKIP-176's derivationArgumentsHash.
+ */
+export function bindingOf(H: string | Uint8Array, signer: string): string {
+  return keccak256(solidityPacked(["bytes32", "address"], [hexlify(H), signer]));
+}
+
+/**
+ * Model the peg-in credit. `binding` is bindingOf(H, signer) for a bound escrow, or all-zero for the
+ * legacy unbound path. It is deliberately NOT computed here from an H: every caller has to say who the
+ * signer is, because getting that wrong silently produces an escrow nobody can claim.
+ */
 export async function depositForPegin(
   rpcUrl: string, btcTxidHex: string, valueWei: bigint,
-  intentH: string | Uint8Array = "0x" + "0".repeat(64), key: string = COW_KEY,
+  binding: string | Uint8Array = "0x" + "0".repeat(64), key: string = COW_KEY,
 ): Promise<string> {
   const s = contract(rpcUrl, key);
-  const tx = await s.depositForPegin(btcTxidHex, intentH, { value: valueWei, gasLimit: 200_000, gasPrice: 1_000_000, type: 0, chainId: CHAIN_ID });
+  const tx = await s.depositForPegin(btcTxidHex, binding, { value: valueWei, gasLimit: 200_000, gasPrice: 1_000_000, type: 0, chainId: CHAIN_ID });
   return tx.hash;
 }
 

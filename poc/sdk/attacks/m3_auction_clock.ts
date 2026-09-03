@@ -39,15 +39,15 @@
  */
 import { Contract, JsonRpcProvider, Network, NonceManager, Wallet, getBytes, hexlify, randomBytes } from "ethers";
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
-import { depositForPegin, peginOf } from "../src/settlement.js";
+import { depositForPegin, peginOf, bindingOf } from "../src/settlement.js";
 import { auction, placeBid, bidOf, executeAuction, lockedUntil, failedAtOf } from "../src/auction.js";
 import { Solver } from "../src/solver.js";
-import { AUCTION_ADDR, CHAIN_ID, COW_KEY, SETTLEMENT_ADDR } from "../src/config.js";
+import { AUCTION_ADDR, CHAIN_ID, COW_KEY } from "../src/config.js";
 import auctionArtifact from "../src/abi/Auction.json" with { type: "json" };
 import { fundAccount, waitReceipt } from "../experiments/_harness.js";
 import { Attack } from "./_forensics.js";
 import { AttackSpec, Outcome } from "./registry.js";
-import { StackCtx, requireContracts } from "./_stacks.js";
+import { StackCtx } from "./_stacks.js";
 
 const INPUT = 10_000_000_000_000_000n;      // 0.01 rbtc of escrowed peg-in input
 const MINOUT = 1_000_000_000_000_000n;      // the floor the user signed for
@@ -62,17 +62,9 @@ export async function run(spec: AttackSpec, ctx: StackCtx): Promise<number> {
   a.note("both auction limits — WINDOW and GRACE — are block counts, and a miner decides when a block");
   a.note("happens. So this attack does not race anyone: it just moves the clock.");
 
-  // The reorg stack exists for E16, which never touches the auction — so it can be running a chain
-  // whose genesis predates the Auction account entirely. Probe before doing anything, or the first
-  // contract read fails as an undecodable "0x" and the run looks like a broken attack.
-  const probeAuction = auction(ctx.rpc.url, COW_KEY);
-  await requireContracts(ctx, [
-    { addr: SETTLEMENT_ADDR, label: "Settlement" },
-    {
-      addr: AUCTION_ADDR, label: "Auction",
-      probe: { data: probeAuction.interface.encodeFunctionData("WINDOW"), fn: "WINDOW()" },
-    },
-  ]);
+  // No genesis probe here any more: ensureStack compares BOTH contracts' deployed bytecode against
+  // the compiled runtime before an attack starts, which subsumes the WINDOW() probe this used to do —
+  // and catches what that probe missed, since WINDOW() survived the rewrite of the decay rule.
 
   // A rival solver with its own money, so "who was outbid" is a balance fact and not a bookkeeping one.
   const rivalKey = Wallet.createRandom().privateKey;
@@ -123,7 +115,7 @@ export async function run(spec: AttackSpec, ctx: StackCtx): Promise<number> {
     const btcTxid = getBytes(randomBytes(32));
     const H = randomH();
     const user = freshWallet();
-    await waitReceipt(rpc, await depositForPegin(rpc.url, hexlify(btcTxid), INPUT, hexlify(H)));
+    await waitReceipt(rpc, await depositForPegin(rpc.url, hexlify(btcTxid), INPUT, bindingOf(H, user.address)));
     const intent = buildIntent(user, {
       H, btcTxid, expiry: (await rpc.blockNumber()) + 4 * (WINDOW + GRACE), minOut: MINOUT,
     });

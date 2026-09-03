@@ -152,23 +152,42 @@ contract Settlement {
     }
 
     /**
-     * Which intent an escrowed input answers to: btcTxid -> H (0 = unbound). This is the PoC model of
-     * RSKIP176 entry binding: in production the peg-in's DERIVED DEPOSIT ADDRESS carries H, so the
-     * Bridge credits an escrow only the matching intent can claim; here the deposit call carries it.
-     * Without it, the escrow belongs to whoever names the txid first (atlas B1 — txid squatting).
+     * Which intent an escrowed input answers to: btcTxid -> BINDING (0 = unbound), where
+     *
+     *     binding = keccak256(H || signer)
+     *
+     * and NOT H alone. H is the pipeline commitment: thirty-two bytes that sit in the clear in every
+     * intent in the public mempool, and that anyone may copy into an intent of their own. The signer is
+     * recovered from the signature at settlement, so a binding that omits it lets a rival sign a twin
+     * of the victim's intent — same H, same btcTxid, dust minOut — and have a solver release the
+     * victim's escrow against it (attack B5). Including the signer means a rival with a different key
+     * computes a different binding and commands no funds.
+     *
+     * This is the PoC model of RSKIP176 entry binding: in production the peg-in's DERIVED DEPOSIT
+     * ADDRESS carries the binding as its derivationArgumentsHash, so the Bridge credits an escrow only
+     * the matching (intent, signer) pair can claim; here the deposit call carries it instead. The same
+     * lesson applies there — the derivation argument MUST be keccak256(H || signer), not H — because
+     * RSKIP176's other derivation inputs (refund address, LBC, LP) do not include the Rootstock signer.
      */
     mapping(bytes32 => bytes32) public peginIntent;
 
+    /// The binding an escrow is keyed on. One place, so the SDK, the attacks and the contract cannot
+    /// disagree about it — a mismatched hash here would look exactly like an unbound escrow.
+    function bindingOf(bytes32 h, address signer) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(h, signer));
+    }
+
     /**
-     * Model the peg-in credit: escrow `msg.value` of input RBTC against a BTC txid, BOUND to the
-     * intent commitment `h` (sign-first ordering, as RSKIP176 requires — H determines the address).
-     * h == 0 models a legacy/unbound peg-in: still claimable by any intent naming the txid, kept only
-     * to mirror the real-pegin path's current exposure (see _releaseInput).
+     * Model the peg-in credit: escrow `msg.value` of input RBTC against a BTC txid, BOUND to
+     * `binding = bindingOf(H, signer)`. Commit-first ordering, as RSKIP176 requires: H and the signer
+     * are known before any coins move, so the binding can determine the deposit address.
+     * binding == 0 models a legacy/unbound peg-in: still claimable by any intent naming the txid, kept
+     * only to mirror the real-pegin path's current exposure (see _releaseInput).
      */
-    function depositForPegin(bytes32 btcTxid, bytes32 h) external payable {
-        if (h != bytes32(0)) {
-            require(peginIntent[btcTxid] == bytes32(0) || peginIntent[btcTxid] == h, "escrow bound to another intent");
-            peginIntent[btcTxid] = h;
+    function depositForPegin(bytes32 btcTxid, bytes32 binding) external payable {
+        if (binding != bytes32(0)) {
+            require(peginIntent[btcTxid] == bytes32(0) || peginIntent[btcTxid] == binding, "escrow bound to another intent");
+            peginIntent[btcTxid] = binding;
         }
         pegin[btcTxid] += msg.value;
     }
@@ -223,7 +242,7 @@ contract Settlement {
             _deliverToken(outToken, user, minOut);
         }
 
-        uint256 input = _releaseInput(btcTxid, H);
+        uint256 input = _releaseInput(btcTxid, H, user);
         emit Settled(H, user, outToken, minOut, input);
     }
 
@@ -334,7 +353,7 @@ contract Settlement {
 
         _checkAndClaimBtcPayment(rawBtcTx, btcDest, minOut, btcBlockHash, merklePath, merkleHashes);
         assembly { sstore(H, add(number(), 1)) }
-        uint256 input = _releaseInput(btcTxid, H);
+        uint256 input = _releaseInput(btcTxid, H, user);
         // best-effort bond refund: a reserver that cannot receive RBTC must not be able to brick its
         // own settle AFTER having paid real, irreversible BTC (the old "bond refund failed" footgun).
         _pay(msg.sender, bondBack);
@@ -383,11 +402,13 @@ contract Settlement {
 
     /// Release the input to the solver — repayment + spread. Prefer the REAL peg-in credited to this
     /// contract (recorded by the Bridge at peg-in), falling back to the modelled depositForPegin escrow.
-    /// ENTRY BINDING (atlas B2): a bound modelled escrow answers only to the intent it was deposited
-    /// for — a rival intent naming the same txid reverts here, unwinding its delivery atomically.
-    /// The REAL-pegin branch cannot carry H today (the OP_RETURN has no room for it) — that path keeps
-    /// the B1 exposure by construction and is exactly what RSKIP176 derivation replaces in production.
-    function _releaseInput(bytes32 btcTxid, bytes32 h) internal returns (uint256 input) {
+    /// ENTRY BINDING: a bound modelled escrow answers only to the (intent, signer) pair it was
+    /// deposited for. A rival naming the same txid with its own H reverts here (B1), and so does a
+    /// rival carrying the victim's H under a different key (B5) — the binding includes the signer,
+    /// which the rival cannot forge because settlement recovers it from the signature.
+    /// The REAL-pegin branch cannot carry a binding today (the OP_RETURN has no room for it) — that
+    /// path keeps the B1 exposure by construction and is exactly what RSKIP176 derivation replaces.
+    function _releaseInput(bytes32 btcTxid, bytes32 h, address signer) internal returns (uint256 input) {
         (bool ok2, bytes memory raw) = BRIDGE.staticcall(abi.encodeWithSignature("getPeginInfo(bytes32)", btcTxid));
         if (ok2 && raw.length >= 128 && !claimedPegin[btcTxid]) {
             bytes memory info = abi.decode(raw, (bytes)); // Bridge returns BYTES wrapping 64 bytes
@@ -403,7 +424,7 @@ contract Settlement {
             uint256 esc = pegin[btcTxid];
             if (esc > 0) {
                 bytes32 bound = peginIntent[btcTxid];
-                require(bound == bytes32(0) || bound == h, "input escrow bound to another intent");
+                require(bound == bytes32(0) || bound == bindingOf(h, signer), "input escrow bound to another intent");
                 input = esc;
                 pegin[btcTxid] = 0;
             }

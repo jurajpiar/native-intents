@@ -21,7 +21,7 @@
  */
 import { getBytes, hexlify, randomBytes } from "ethers";
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
-import { depositForPegin, peginIntentOf, peginOf } from "../src/settlement.js";
+import { depositForPegin, peginIntentOf, peginOf, bindingOf } from "../src/settlement.js";
 import { Solver } from "../src/solver.js";
 import { COW_KEY } from "../src/config.js";
 import { fundAccount, preflight, requireSettlement, rpcA, waitReceipt } from "../experiments/_harness.js";
@@ -61,7 +61,7 @@ export async function run(spec: AttackSpec): Promise<number> {
 
   // --- step 2: the attacker binds the victim's txid to its own H, for one wei ----------------
   a.step("attacker binds the victim's btcTxid to an H it controls, for 1 wei");
-  const bind = await a.tx(depositForPegin(rpcA.url, hexlify(victimTxid), DUST, hexlify(attackerH), attacker.privateKey));
+  const bind = await a.tx(depositForPegin(rpcA.url, hexlify(victimTxid), DUST, bindingOf(attackerH, attacker.address), attacker.privateKey));
   const bound = await peginIntentOf(rpcA.url, hexlify(victimTxid));
   a.check("bind landed", bind.ok);
   a.check("escrow now bound to the ATTACKER's H", bound.toLowerCase() === hexlify(attackerH).toLowerCase(), `${bound.slice(0, 12)}…`);
@@ -70,7 +70,7 @@ export async function run(spec: AttackSpec): Promise<number> {
 
   // --- step 3: the victim's own deposit is now impossible ------------------------------------
   a.step("victim escrows their real pegged-in input against their own H");
-  const vdep = await a.tx(depositForPegin(rpcA.url, hexlify(victimTxid), INPUT, hexlify(victimH)));
+  const vdep = await a.tx(depositForPegin(rpcA.url, hexlify(victimTxid), INPUT, bindingOf(victimH, victim.address)));
   a.check("victim's deposit REVERTED", !vdep.ok, vdep.reason ?? "no reason");
   a.check("revert names the binding", (vdep.reason ?? "").includes("bound to another intent"));
   a.check("escrow still holds only the attacker's dust", (await peginOf(rpcA.url, hexlify(victimTxid))) === DUST);
@@ -108,7 +108,7 @@ export async function run(spec: AttackSpec): Promise<number> {
   const stillBound = await peginIntentOf(rpcA.url, hexlify(victimTxid));
   a.check("binding survives the drain (only the balance is cleared)",
     stillBound.toLowerCase() === hexlify(attackerH).toLowerCase(), `${stillBound.slice(0, 12)}…`);
-  const redep = await a.tx(depositForPegin(rpcA.url, hexlify(victimTxid), INPUT, hexlify(victimH)));
+  const redep = await a.tx(depositForPegin(rpcA.url, hexlify(victimTxid), INPUT, bindingOf(victimH, victim.address)));
   a.check("victim STILL cannot escrow — the txid is poisoned permanently", !redep.ok, redep.reason ?? "no reason");
   a.check("but a settle with an empty escrow no longer reverts on the binding",
     true, "esc == 0 skips the check, so the intent could settle with zero input released");

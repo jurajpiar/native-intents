@@ -14,7 +14,7 @@
  * (native permit — see PRODUCTIONIZATION).
  */
 import { buildIntent, freshWallet, isConsumed, btcOutH } from "../src/intent.js";
-import { depositForPegin, settleBtcOut, btcOutClaimed, reserveExit, exitBondFor, exitReservationOf } from "../src/settlement.js";
+import { depositForPegin, settleBtcOut, btcOutClaimed, reserveExit, exitBondFor, exitReservationOf, bindingOf } from "../src/settlement.js";
 import { branchFromTxOutProof } from "../src/merkle.js";
 import { Bridge, syncHeadersTo } from "../src/bridge.js";
 import { BtcRpc } from "../src/btcrpc.js";
@@ -69,7 +69,7 @@ async function main(): Promise<number> {
   const salt = getBytes(randomBytes(32));
   const H = btcOutH(userDest, salt);
   const btcTxid = getBytes(randomBytes(32));            // the exit input's escrow key
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, hexlify(H)));
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, bindingOf(H, user.address)));
   const height = await rpcA.blockNumber();
   const intent = buildIntent(user, { H, btcTxid, expiry: height + 90, minOut: MIN_SATS, outputToken: BTC_OUT });
   await rpcA.sendRaw(intent.rawHex);
@@ -108,7 +108,7 @@ async function main(): Promise<number> {
   const wrongDest = await btc.hash160Of(await btc.getNewAddress("e19-wrong", "legacy"));
   const salt2 = getBytes(randomBytes(32));
   const btcTxid2 = getBytes(randomBytes(32));
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid2), INPUT, hexlify(btcOutH(wrongDest, salt2))));
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid2), INPUT, bindingOf(btcOutH(wrongDest, salt2), mallory.address)));
   const wrongIntent = buildIntent(mallory, { H: btcOutH(wrongDest, salt2), btcTxid: btcTxid2, expiry: (await rpcA.blockNumber()) + 90, minOut: MIN_SATS, outputToken: BTC_OUT });
   const wrong = await waitReceipt(rpcA, await settleBtcOut(rpcA.url, {
     rawIntentTx: wrongIntent.rawHex, salt: salt2, btcDest: wrongDest,
@@ -133,8 +133,9 @@ async function main(): Promise<number> {
   // replay: a SECOND exit intent to the same destination cannot reuse the same payout output
   const salt3 = getBytes(randomBytes(32));
   const btcTxid3 = getBytes(randomBytes(32));
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid3), INPUT, hexlify(btcOutH(userDest, salt3))));
-  const replayIntent = buildIntent(freshWallet(), { H: btcOutH(userDest, salt3), btcTxid: btcTxid3, expiry: (await rpcA.blockNumber()) + 90, minOut: MIN_SATS, outputToken: BTC_OUT });
+  const replayUser = freshWallet(); // before the deposit — the escrow binding commits to the signer
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid3), INPUT, bindingOf(btcOutH(userDest, salt3), replayUser.address)));
+  const replayIntent = buildIntent(replayUser, { H: btcOutH(userDest, salt3), btcTxid: btcTxid3, expiry: (await rpcA.blockNumber()) + 90, minOut: MIN_SATS, outputToken: BTC_OUT });
   const replay = await waitReceipt(rpcA, await settleBtcOut(rpcA.url, {
     rawIntentTx: replayIntent.rawHex, salt: salt3, btcDest: userDest,
     rawBtcTx: payRaw, btcBlockHash: "0x" + payBlockHash, merklePath: branch.path, merkleHashes: branch.hashes,
@@ -144,8 +145,9 @@ async function main(): Promise<number> {
   // --- squatting is priced: a reservation that lapses unsettled forfeits its bond into the escrow ---
   const salt4 = getBytes(randomBytes(32));
   const btcTxid4 = getBytes(randomBytes(32));
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid4), INPUT, hexlify(btcOutH(userDest, salt4))));
-  const lapseIntent = buildIntent(freshWallet(), { H: btcOutH(userDest, salt4), btcTxid: btcTxid4, expiry: (await rpcA.blockNumber()) + 90, minOut: MIN_SATS, outputToken: BTC_OUT });
+  const lapseUser = freshWallet();
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid4), INPUT, bindingOf(btcOutH(userDest, salt4), lapseUser.address)));
+  const lapseIntent = buildIntent(lapseUser, { H: btcOutH(userDest, salt4), btcTxid: btcTxid4, expiry: (await rpcA.blockNumber()) + 90, minOut: MIN_SATS, outputToken: BTC_OUT });
   await rpcA.sendRaw(lapseIntent.rawHex);
   r.check("squatter reserves (and will never pay)", succeeded(await waitReceipt(rpcA, await reserveExit(rpcA.url, lapseIntent.rawHex, bond, s2key))));
   const squat = await exitReservationOf(rpcA.url, btcOutH(userDest, salt4));

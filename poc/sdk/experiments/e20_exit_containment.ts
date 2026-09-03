@@ -23,8 +23,7 @@
 import { buildIntent, freshWallet, isConsumed, btcOutH } from "../src/intent.js";
 import {
   depositForPegin, peginIntentOf, peginOf, settleBtcOut, reserveExit, exitBondFor, exitReservationOf,
-  settlementCreditOf,
-} from "../src/settlement.js";
+  settlementCreditOf, bindingOf } from "../src/settlement.js";
 import { branchFromTxOutProof } from "../src/merkle.js";
 import { Bridge, syncHeadersTo } from "../src/bridge.js";
 import { BtcRpc } from "../src/btcrpc.js";
@@ -86,9 +85,10 @@ async function main(): Promise<number> {
     const salt = getBytes(randomBytes(32));
     const H = btcOutH(userDest, salt);
     const btcTxid = getBytes(randomBytes(32));
+    const user = freshWallet(); // before the deposit: the escrow binding commits to the signer
     // Assert the escrow landed: a silently failed deposit surfaces much later as an unexplained
     // "solver claimed nothing" delta, which reads as a falsified claim rather than a setup failure.
-    if (!succeeded(await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, hexlify(H))))) {
+    if (!succeeded(await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, bindingOf(H, user.address))))) {
       throw new Error(`escrow deposit failed for ${hexlify(btcTxid).slice(0, 12)}…`);
     }
     // +90, not +150: admission caps the expiry span at intent.maxExpirySpan (100, pinned in
@@ -96,7 +96,7 @@ async function main(): Promise<number> {
     // check. The widest part needs ~67 blocks — part 2 reserves TWICE in sequence, and each
     // reserveExit demands block.number + RESERVE_WINDOW(30) < expiry — so 90 leaves ~23 spare and
     // matches the sibling exit experiments (E19 uses +90).
-    const intent = buildIntent(freshWallet(), { H, btcTxid, expiry: (await rpcA.blockNumber()) + 90, minOut: MIN_SATS, outputToken: BTC_OUT });
+    const intent = buildIntent(user, { H, btcTxid, expiry: (await rpcA.blockNumber()) + 90, minOut: MIN_SATS, outputToken: BTC_OUT });
     await rpcA.sendRaw(intent.rawHex);
     return { salt, H, btcTxid, intent };
   }

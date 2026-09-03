@@ -13,7 +13,7 @@ import { Bridge } from "../src/bridge.js";
 import { settlerCommitmentScript, BtcRpc } from "../src/btcrpc.js";
 import { branchFromTxOutProof, MerkleBranch } from "../src/merkle.js";
 import { buildIntent, btcOutH, freshWallet, BuiltIntent } from "../src/intent.js";
-import { depositForPegin } from "../src/settlement.js";
+import { depositForPegin, bindingOf } from "../src/settlement.js";
 import { BTC_OUT } from "../src/config.js";
 import { waitReceipt, rpcA } from "../experiments/_harness.js";
 import { Attack } from "./_forensics.js";
@@ -187,7 +187,7 @@ export async function freshExitIntent(
   const salt = getBytes(randomBytes(32));
   const H = btcOutH(p.destHash160, salt);
   const btcTxid = getBytes(randomBytes(32));
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), p.inputWei ?? 10_000_000_000_000_000n, hexlify(H)));
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), p.inputWei ?? 10_000_000_000_000_000n, bindingOf(H, user.address)));
   const intent = buildIntent(user, {
     H, btcTxid, expiry: (await rpcA.blockNumber()) + (p.expiryBlocks ?? 90), minOut: p.minSats, outputToken: BTC_OUT,
   });

@@ -23,7 +23,7 @@
  * 1 node, no bitcoind. Needs the entry-binding genesis (peginIntent): down -v + rebuild if the probe fails.
  */
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
-import { depositForPegin, peginOf, peginIntentOf } from "../src/settlement.js";
+import { depositForPegin, peginOf, peginIntentOf, bindingOf } from "../src/settlement.js";
 import { Solver } from "../src/solver.js";
 import { Report, preflight, requireSettlement, rpcA, waitReceipt, succeeded, reverted } from "./_harness.js";
 import { COW_KEY, RBTC } from "../src/config.js";
@@ -54,8 +54,8 @@ async function main(): Promise<number> {
     const btcTxid = getBytes(randomBytes(32));
     const victim = freshWallet();
     const H = randomH();
-    if (bound) await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, hexlify(H)));
-    else await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT)); // legacy, H = 0
+    if (bound) await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, bindingOf(H, victim.address)));
+    else await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT)); // legacy, unbound
     const expiry = (await rpcA.blockNumber()) + 80;
     const intent = buildIntent(victim, { H, btcTxid, expiry, minOut: MINOUT, outputToken: RBTC });
     await rpcA.sendRaw(intent.rawHex);
@@ -67,7 +67,7 @@ async function main(): Promise<number> {
 
   // ---- part 1: bound escrow — the squat reverts, the victim settles ----
   const p1 = await stage(true);
-  r.check("p1: escrow bound to the victim's H", (await peginIntentOf(rpcA.url, hexlify(p1.btcTxid))).toLowerCase() === hexlify(p1.H).toLowerCase());
+  r.check("p1: escrow bound to the victim's (H, signer) pair", (await peginIntentOf(rpcA.url, hexlify(p1.btcTxid))).toLowerCase() === bindingOf(p1.H, p1.victim.address).toLowerCase());
   r.check("p1: the rival intent is ADMITTED (the squat is free to attempt — admission is not the defence)", true);
   const squat = await waitReceipt(rpcA, await solver.solve(p1.rival.rawHex, DUST));
   r.check("p1: settling the rival intent REVERTS ('input escrow bound to another intent')", reverted(squat), squat ? squat.status : "no receipt");
@@ -91,10 +91,11 @@ async function main(): Promise<number> {
   // ---- part 3: a binding cannot be reassigned ----
   const p3btc = getBytes(randomBytes(32));
   const p3H = randomH();
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(p3btc), INPUT, hexlify(p3H)));
-  const rebind = await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(p3btc), INPUT, hexlify(randomH())).catch(() => "0x" + "0".repeat(64)));
+  const p3user = freshWallet();
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(p3btc), INPUT, bindingOf(p3H, p3user.address)));
+  const rebind = await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(p3btc), INPUT, bindingOf(randomH(), p3user.address)).catch(() => "0x" + "0".repeat(64)));
   r.check("p3: re-binding to a different intent rejected ('escrow bound to another intent')", rebind === null || reverted(rebind), rebind ? rebind.status : "not mined");
-  r.check("p3: top-up with the SAME H accumulates", succeeded(await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(p3btc), INPUT, hexlify(p3H)))) && (await peginOf(rpcA.url, hexlify(p3btc))) === INPUT * 2n);
+  r.check("p3: top-up with the SAME H accumulates", succeeded(await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(p3btc), INPUT, bindingOf(p3H, p3user.address)))) && (await peginOf(rpcA.url, hexlify(p3btc))) === INPUT * 2n);
 
   console.log("\nthe input now answers to its intent, not to whoever names its txid first — the modelled");
   console.log("half of RSKIP176. The real-pegin path keeps the B1 exposure until derivation lands (E24).");

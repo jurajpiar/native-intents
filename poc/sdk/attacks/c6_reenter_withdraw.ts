@@ -22,7 +22,7 @@
  */
 import { Contract, ContractFactory, Interface, JsonRpcProvider, Network, Wallet, getBytes, hexlify, randomBytes } from "ethers";
 import { buildIntent, freshWallet, randomH } from "../src/intent.js";
-import { depositForPegin, settlementCreditOf } from "../src/settlement.js";
+import { depositForPegin, settlementCreditOf, bindingOf } from "../src/settlement.js";
 import { auction, creditOf, executeAuction, bidOf } from "../src/auction.js";
 import { AUCTION_ADDR, CHAIN_ID, COW_KEY, SETTLEMENT_ADDR } from "../src/config.js";
 import { fundAccount, preflight, requireSettlement, rpcA, waitReceipt } from "../experiments/_harness.js";
@@ -64,7 +64,7 @@ export async function run(spec: AttackSpec): Promise<number> {
   const btcTxid = getBytes(randomBytes(32));
   const H = randomH();
   const user = freshWallet();
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, hexlify(H)));
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, bindingOf(H, user.address)));
   const intent = buildIntent(user, { H, btcTxid, expiry: (await rpcA.blockNumber()) + 90, minOut: MINOUT });
   await rpcA.sendRaw(intent.rawHex);
 
@@ -98,7 +98,7 @@ export async function run(spec: AttackSpec): Promise<number> {
   const btcTxid2 = getBytes(randomBytes(32));
   const H2 = randomH();
   const user2 = freshWallet();
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid2), INPUT, hexlify(H2)));
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid2), INPUT, bindingOf(H2, user2.address)));
   const intent2 = buildIntent(user2, { H: H2, btcTxid: btcTxid2, expiry: (await rpcA.blockNumber()) + 90, minOut: MINOUT });
   await rpcA.sendRaw(intent2.rawHex);
 

@@ -23,7 +23,7 @@ import { dirname, join } from "node:path";
 import { getBytes, hexlify, randomBytes, Wallet } from "ethers";
 import { buildIntent, freshWallet, randomH } from "../src/intent.js";
 import { Solver } from "../src/solver.js";
-import { depositForPegin } from "../src/settlement.js";
+import { depositForPegin, bindingOf } from "../src/settlement.js";
 import { auction, placeBid, executeAuction, bidOf, withdrawCredit } from "../src/auction.js";
 import { deployVault, vault, vaultDeposit, vaultApprove, sharesOf } from "../src/vault.js";
 import { preflight, requireSettlement, rpcA, fundAccount, waitReceipt, succeeded, reverted, errMsg } from "./_harness.js";
@@ -107,7 +107,7 @@ async function main(): Promise<void> {
 
   // Act 3 — two solvers race to fill the vault intent
   narrate("act 3 · solver race", `the 0.01 BTC peg-in is escrowed. TWO solvers spot the intent; each deposits its own RBTC into the vault for shares and races to deliver them…`);
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btc1), INPUT, hexlify(H1)));
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btc1), INPUT, bindingOf(H1, userA.address)));
   const s2key = Wallet.createRandom().privateKey;
   await waitReceipt(rpcA, await fundAccount(new Wallet(s2key).address, INPUT * 2n));
   const solver1 = new Solver(rpcA.url);
@@ -137,7 +137,7 @@ async function main(): Promise<void> {
   const userB = freshWallet();
   const btc2 = getBytes(randomBytes(32));
   const H2 = randomH();
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btc2), INPUT, hexlify(H2)));
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btc2), INPUT, bindingOf(H2, userB.address)));
   const intent2 = buildIntent(userB, { H: H2, btcTxid: btc2, expiry: (await rpcA.blockNumber()) + 80, minOut: MINOUT, outputToken: RBTC });
   await rpcA.sendRaw(intent2.rawHex);
   const a1 = auction(rpcA.url);

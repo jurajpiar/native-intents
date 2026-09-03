@@ -17,7 +17,7 @@
  */
 import { getBytes, hexlify, randomBytes } from "ethers";
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
-import { depositForPegin, peginIntentOf, peginOf } from "../src/settlement.js";
+import { depositForPegin, peginIntentOf, peginOf, bindingOf } from "../src/settlement.js";
 import { Solver } from "../src/solver.js";
 import { COW_KEY } from "../src/config.js";
 import { fundAccount, preflight, requireSettlement, rpcA, waitReceipt } from "../experiments/_harness.js";
@@ -48,7 +48,7 @@ export async function run(spec: AttackSpec): Promise<number> {
 
   // --- step 1: a properly bound escrow -------------------------------------------------------
   a.step("victim escrows their input, bound to their own H");
-  const dep = await a.tx(depositForPegin(rpcA.url, hexlify(txid), INPUT, hexlify(H)));
+  const dep = await a.tx(depositForPegin(rpcA.url, hexlify(txid), INPUT, bindingOf(H, victim.address)));
   a.check("deposit bound", dep.ok && (await peginIntentOf(rpcA.url, hexlify(txid))).toLowerCase() === hexlify(H).toLowerCase());
 
   // --- step 2: the attacker tops it up with h == 0, bypassing the check -----------------------
@@ -92,7 +92,7 @@ export async function run(spec: AttackSpec): Promise<number> {
   const loose = getBytes(randomBytes(32));
   await a.tx(depositForPegin(rpcA.url, hexlify(loose), INPUT, "0x" + "0".repeat(64)));
   a.check("escrow is unbound", (await peginIntentOf(rpcA.url, hexlify(loose))) === "0x" + "0".repeat(64));
-  const late = await a.tx(depositForPegin(rpcA.url, hexlify(loose), 1n, hexlify(randomH()), attacker.privateKey));
+  const late = await a.tx(depositForPegin(rpcA.url, hexlify(loose), 1n, bindingOf(randomH(), attacker.address), attacker.privateKey));
   a.check("a later h != 0 deposit BINDS it to that H", late.ok,
     (await peginIntentOf(rpcA.url, hexlify(loose))).slice(0, 12) + "…");
   a.note("so an unbound escrow is claimable by the first intent to bind it — the B1 exposure, intact");

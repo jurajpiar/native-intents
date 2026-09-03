@@ -16,7 +16,7 @@
  */
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
 import { Solver } from "../src/solver.js";
-import { depositForPegin } from "../src/settlement.js";
+import { depositForPegin, bindingOf } from "../src/settlement.js";
 import { auction, placeBid, executeAuction, bidOf, withdrawCredit } from "../src/auction.js";
 import { Report, preflight, requireSettlement, rpcA, fundAccount, waitReceipt, succeeded, reverted } from "./_harness.js";
 import { AUCTION_ADDR, RBTC } from "../src/config.js";
@@ -62,7 +62,7 @@ async function main(): Promise<number> {
   const btcTxid = getBytes(randomBytes(32));
   const user = freshWallet();
   const H = randomH();
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, hexlify(H)));
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, bindingOf(H, user.address)));
   const intent = buildIntent(user, { H, btcTxid, expiry: (await rpcA.blockNumber()) + 90, minOut: MINOUT, outputToken: RBTC });
   await rpcA.sendRaw(intent.rawHex);
 
@@ -92,7 +92,7 @@ async function main(): Promise<number> {
   const btcTxid2 = getBytes(randomBytes(32));
   const user2 = freshWallet();
   const H2 = randomH();
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid2), INPUT, hexlify(H2)));
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid2), INPUT, bindingOf(H2, user2.address)));
   const intent2 = buildIntent(user2, { H: H2, btcTxid: btcTxid2, expiry: (await rpcA.blockNumber()) + 90, minOut: MINOUT, outputToken: RBTC });
   await rpcA.sendRaw(intent2.rawHex);
   const plain = await waitReceipt(rpcA, await solver2.solve(intent2.rawHex, MINOUT));

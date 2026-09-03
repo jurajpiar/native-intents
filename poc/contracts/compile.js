@@ -53,6 +53,42 @@ for (const [file, contracts] of Object.entries(out.contracts)) {
 
 console.log("compiled:", Object.keys(result).join(", "));
 
+/**
+ * Sync the SDK's own ABI copies. This used to be a manual step, and it drifted exactly as you would
+ * expect: the Auction gained `failedAt`, the contract was recompiled and injected into genesis, and
+ * the harness then died on `a.failedAt is not a function` HALFWAY THROUGH a live run — after the
+ * assertions that mattered had already passed. Compiling is the only moment at which the truth is
+ * known, so the copy belongs here rather than in someone's memory.
+ *
+ * The existing shape of each file is PRESERVED, because it is not uniform: Settlement.json is a bare
+ * ABI array (consumed as `new Interface(settlementAbi)`) while every other file is `{abi, bytecode}`
+ * (consumed as `artifact.abi` / `artifact.bytecode`). Rewriting a file into the other shape silently
+ * breaks its importers — it has done so before — so normalising them is a deliberate job, not
+ * something to do as a side effect of a build.
+ */
+// A couple of SDK files are named after the ROLE rather than the contract, so the sync would skip
+// them silently — the drift this whole block exists to prevent, one indirection later.
+const ABI_ALIASES = { BtcVault: "Vault" };
+
+const sdkAbi = path.join(__dirname, "..", "sdk", "src", "abi");
+if (fs.existsSync(sdkAbi)) {
+  const synced = [];
+  for (const [name, art] of Object.entries(result)) {
+    const dest = path.join(sdkAbi, (ABI_ALIASES[name] ?? name) + ".json");
+    if (!fs.existsSync(dest)) continue; // the SDK only carries the contracts it actually uses
+    const wasBareArray = Array.isArray(JSON.parse(fs.readFileSync(dest, "utf8")));
+    const next = wasBareArray ? art.abi : art;
+    const before = fs.readFileSync(dest, "utf8");
+    const after = JSON.stringify(next, null, 2) + "\n";
+    if (before !== after) { fs.writeFileSync(dest, after); synced.push(name); }
+  }
+  console.log(synced.length
+    ? `sdk/src/abi synced: ${synced.join(", ")}`
+    : "sdk/src/abi already current");
+} else {
+  console.warn(`sdk/src/abi not found at ${sdkAbi} — the harness will run against stale ABIs`);
+}
+
 // genesis runtime bytecode for the fixed-address contracts (kept as provenance alongside rskj-patch/)
 const genesisDir = path.join(__dirname, "..", "rskj-patch", "genesis");
 fs.mkdirSync(genesisDir, { recursive: true });

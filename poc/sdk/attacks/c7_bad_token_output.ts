@@ -30,7 +30,7 @@
  */
 import { Contract, ContractFactory, JsonRpcProvider, Network, Wallet, getBytes, hexlify, randomBytes } from "ethers";
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
-import { depositForPegin, peginOf } from "../src/settlement.js";
+import { depositForPegin, peginOf, bindingOf } from "../src/settlement.js";
 import { Solver } from "../src/solver.js";
 import { CHAIN_ID, COW_KEY, SETTLEMENT_ADDR } from "../src/config.js";
 import { preflight, requireSettlement, rpcA, waitReceipt } from "../experiments/_harness.js";
@@ -66,7 +66,7 @@ export async function run(spec: AttackSpec): Promise<number> {
     const btcTxid = getBytes(randomBytes(32));
     const H = randomH();
     const user = freshWallet();
-    await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, hexlify(H)));
+    await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, bindingOf(H, user.address)));
     const intent = buildIntent(user, {
       H, btcTxid, expiry: (await rpcA.blockNumber()) + 90, minOut: MINOUT, outputToken: tokenAddr,
     });
