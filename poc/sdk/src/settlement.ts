@@ -8,11 +8,23 @@ function contract(rpcUrl: string, key: string = COW_KEY): Contract {
   return new Contract(SETTLEMENT_ADDR, settlementAbi as import("ethers").InterfaceAbi, new Wallet(key, provider));
 }
 
-/** Model the peg-in: escrow `valueWei` of input RBTC against a BTC txid. Returns the tx hash. */
-export async function depositForPegin(rpcUrl: string, btcTxidHex: string, valueWei: bigint, key: string = COW_KEY): Promise<string> {
+/**
+ * Model the peg-in: escrow `valueWei` of input RBTC against a BTC txid, BOUND to intent commitment
+ * `intentH` (the PoC model of RSKIP176 entry binding — sign first, then deposit). Passing the default
+ * zero H models a legacy/unbound peg-in, which stays exposed to txid squatting (atlas B1).
+ */
+export async function depositForPegin(
+  rpcUrl: string, btcTxidHex: string, valueWei: bigint,
+  intentH: string | Uint8Array = "0x" + "0".repeat(64), key: string = COW_KEY,
+): Promise<string> {
   const s = contract(rpcUrl, key);
-  const tx = await s.depositForPegin(btcTxidHex, { value: valueWei, gasLimit: 200_000, gasPrice: 1_000_000, type: 0, chainId: CHAIN_ID });
+  const tx = await s.depositForPegin(btcTxidHex, intentH, { value: valueWei, gasLimit: 200_000, gasPrice: 1_000_000, type: 0, chainId: CHAIN_ID });
   return tx.hash;
+}
+
+/** Which intent a modelled escrow is bound to (zero hash = unbound/legacy). */
+export async function peginIntentOf(rpcUrl: string, btcTxidHex: string): Promise<string> {
+  return contract(rpcUrl).peginIntent(btcTxidHex);
 }
 
 /** Read the escrowed input for a BTC txid. */
@@ -29,6 +41,8 @@ export async function settleBtcOut(
   rpcUrl: string,
   p: { rawIntentTx: string; salt: Uint8Array | string; btcDest: string; rawBtcTx: string; btcBlockHash: string; merklePath: number; merkleHashes: string[] },
   key: string = COW_KEY,
+  /** _findPayment scans every output, so a wide payout needs more than the default — see attacks/e5. */
+  gasLimit = 1_500_000,
 ): Promise<string> {
   const s = contract(rpcUrl, key);
   const tx = await s.settleBtcOut(
@@ -36,7 +50,7 @@ export async function settleBtcOut(
     p.rawBtcTx.startsWith("0x") ? p.rawBtcTx : "0x" + p.rawBtcTx,
     p.btcBlockHash.startsWith("0x") ? p.btcBlockHash : "0x" + p.btcBlockHash,
     p.merklePath, p.merkleHashes,
-    { gasLimit: 1_500_000, gasPrice: 1_000_000, type: 0, chainId: CHAIN_ID },
+    { gasLimit, gasPrice: 1_000_000, type: 0, chainId: CHAIN_ID },
   );
   return tx.hash;
 }

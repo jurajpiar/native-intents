@@ -47,9 +47,9 @@ function cowWallet(rpcUrl: string): Wallet {
 /** A fresh intent with its peg-in escrow deposited and the raw tx broadcast. */
 async function freshIntent() {
   const btcTxid = getBytes(randomBytes(32));
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT));
   const user = freshWallet();
   const H = randomH();
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, hexlify(H)));
   const intent = buildIntent(user, { H, btcTxid, expiry: (await rpcA.blockNumber()) + 90, minOut: MINOUT, outputToken: RBTC });
   await rpcA.sendRaw(intent.rawHex);
   return { user, H, intent };

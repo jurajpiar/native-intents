@@ -46,7 +46,7 @@ async function main(): Promise<number> {
     const salt = getBytes(randomBytes(32));
     const H = btcOutH(dest, salt);
     const btcTxid = getBytes(randomBytes(32));
-    await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT));
+    await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, hexlify(H)));
     const user = freshWallet();
     const intent = buildIntent(user, { H, btcTxid, expiry: (await rpcA.blockNumber()) + expiryBlocks, minOut: MIN_SATS, outputToken: BTC_OUT });
     await rpcA.sendRaw(intent.rawHex);

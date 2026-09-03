@@ -60,9 +60,9 @@ async function main(): Promise<number> {
 
   // --- an intent with an open auction: direct settles must fail, execute must win ---
   const btcTxid = getBytes(randomBytes(32));
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT));
   const user = freshWallet();
   const H = randomH();
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, hexlify(H)));
   const intent = buildIntent(user, { H, btcTxid, expiry: (await rpcA.blockNumber()) + 90, minOut: MINOUT, outputToken: RBTC });
   await rpcA.sendRaw(intent.rawHex);
 
@@ -90,9 +90,10 @@ async function main(): Promise<number> {
 
   // --- regression: a bid-free intent settles directly exactly as before ---
   const btcTxid2 = getBytes(randomBytes(32));
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid2), INPUT));
   const user2 = freshWallet();
-  const intent2 = buildIntent(user2, { H: randomH(), btcTxid: btcTxid2, expiry: (await rpcA.blockNumber()) + 90, minOut: MINOUT, outputToken: RBTC });
+  const H2 = randomH();
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid2), INPUT, hexlify(H2)));
+  const intent2 = buildIntent(user2, { H: H2, btcTxid: btcTxid2, expiry: (await rpcA.blockNumber()) + 90, minOut: MINOUT, outputToken: RBTC });
   await rpcA.sendRaw(intent2.rawHex);
   const plain = await waitReceipt(rpcA, await solver2.solve(intent2.rawHex, MINOUT));
   r.check("regression: bid-free intent settles directly", succeeded(plain) && BigInt(await rpcA.getBalance(user2.address)) === MINOUT, plain ? plain.status : "no receipt");

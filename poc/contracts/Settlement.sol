@@ -37,6 +37,20 @@ contract Settlement {
     int256 constant MIN_BTC_CONF = 1;
     // blocks a reservation shields the reserver's BTC payment from exit races (see reserveExit)
     uint256 public constant RESERVE_WINDOW = 30;
+    /**
+     * Exit payouts MUST carry a settler commitment: an OP_RETURN output holding
+     * "RSKX" || <20-byte RSK address of the settler>. Rationale (attack E8, "payout hijack"): the
+     * payout is public bytes and the SPV proof is a BEARER object, so without this anyone could
+     * present another solver's payout against their OWN dust intent on the same destination — the
+     * per-output claim then burns the paying solver's bitcoin irreversibly. The reservation gate
+     * cannot help: it keys on H, and the hijacker brings a different H. Committing the SETTLER (not
+     * H) keeps batching intact: one 25-byte output protects every payment in the transaction.
+     * Legitimate here, unlike on the entry side, because the solver BUILDS this transaction and
+     * wants to be repaid — omitting the commitment costs only the omitter.
+     */
+    bytes4 constant SETTLER_TAG = 0x52534b58; // "RSKX"
+    /// Bound on the payout's output count: an unbounded scan lets a wide payout exceed any gas limit.
+    uint256 public constant MAX_PAYOUT_OUTPUTS = 64;
 
     // one real peg-in per btcTxid can be claimed once (the Bridge does not clear its record)
     mapping(bytes32 => bool) public claimedPegin;
@@ -104,8 +118,25 @@ contract Settlement {
         emit Withdrawn(msg.sender, amt);
     }
 
-    /// Model the peg-in credit: escrow `msg.value` of input RBTC against a BTC txid.
-    function depositForPegin(bytes32 btcTxid) external payable {
+    /**
+     * Which intent an escrowed input answers to: btcTxid -> H (0 = unbound). This is the PoC model of
+     * RSKIP176 entry binding: in production the peg-in's DERIVED DEPOSIT ADDRESS carries H, so the
+     * Bridge credits an escrow only the matching intent can claim; here the deposit call carries it.
+     * Without it, the escrow belongs to whoever names the txid first (atlas B1 — txid squatting).
+     */
+    mapping(bytes32 => bytes32) public peginIntent;
+
+    /**
+     * Model the peg-in credit: escrow `msg.value` of input RBTC against a BTC txid, BOUND to the
+     * intent commitment `h` (sign-first ordering, as RSKIP176 requires — H determines the address).
+     * h == 0 models a legacy/unbound peg-in: still claimable by any intent naming the txid, kept only
+     * to mirror the real-pegin path's current exposure (see _releaseInput).
+     */
+    function depositForPegin(bytes32 btcTxid, bytes32 h) external payable {
+        if (h != bytes32(0)) {
+            require(peginIntent[btcTxid] == bytes32(0) || peginIntent[btcTxid] == h, "escrow bound to another intent");
+            peginIntent[btcTxid] = h;
+        }
         pegin[btcTxid] += msg.value;
     }
 
@@ -159,7 +190,7 @@ contract Settlement {
             require(IERC20(outToken).transferFrom(msg.sender, user, minOut), "erc20 transfer failed");
         }
 
-        uint256 input = _releaseInput(btcTxid);
+        uint256 input = _releaseInput(btcTxid, H);
         emit Settled(H, user, outToken, minOut, input);
     }
 
@@ -270,7 +301,7 @@ contract Settlement {
 
         _checkAndClaimBtcPayment(rawBtcTx, btcDest, minOut, btcBlockHash, merklePath, merkleHashes);
         assembly { sstore(H, add(number(), 1)) }
-        uint256 input = _releaseInput(btcTxid);
+        uint256 input = _releaseInput(btcTxid, H);
         // best-effort bond refund: a reserver that cannot receive RBTC must not be able to brick its
         // own settle AFTER having paid real, irreversible BTC (the old "bond refund failed" footgun).
         _pay(msg.sender, bondBack);
@@ -312,13 +343,18 @@ contract Settlement {
             payTxid, btcBlockHash, merklePath, merkleHashes));
         require(okC && retC.length == 32, "confirmations call failed");
         require(abi.decode(retC, (int256)) >= MIN_BTC_CONF, "btc payout not confirmed");
+        require(_settlerOf(rawBtcTx) == msg.sender, "payout not committed to this settler");
         (uint256 voutIdx, ) = _findPayment(rawBtcTx, btcDest, minSats, payTxid);
         claimedBtcOut[keccak256(abi.encodePacked(payTxid, voutIdx))] = true;
     }
 
     /// Release the input to the solver — repayment + spread. Prefer the REAL peg-in credited to this
     /// contract (recorded by the Bridge at peg-in), falling back to the modelled depositForPegin escrow.
-    function _releaseInput(bytes32 btcTxid) internal returns (uint256 input) {
+    /// ENTRY BINDING (atlas B2): a bound modelled escrow answers only to the intent it was deposited
+    /// for — a rival intent naming the same txid reverts here, unwinding its delivery atomically.
+    /// The REAL-pegin branch cannot carry H today (the OP_RETURN has no room for it) — that path keeps
+    /// the B1 exposure by construction and is exactly what RSKIP176 derivation replaces in production.
+    function _releaseInput(bytes32 btcTxid, bytes32 h) internal returns (uint256 input) {
         (bool ok2, bytes memory raw) = BRIDGE.staticcall(abi.encodeWithSignature("getPeginInfo(bytes32)", btcTxid));
         if (ok2 && raw.length >= 128 && !claimedPegin[btcTxid]) {
             bytes memory info = abi.decode(raw, (bytes)); // Bridge returns BYTES wrapping 64 bytes
@@ -331,8 +367,13 @@ contract Settlement {
             }
         }
         if (input == 0) {
-            input = pegin[btcTxid];
-            if (input > 0) pegin[btcTxid] = 0;
+            uint256 esc = pegin[btcTxid];
+            if (esc > 0) {
+                bytes32 bound = peginIntent[btcTxid];
+                require(bound == bytes32(0) || bound == h, "input escrow bound to another intent");
+                input = esc;
+                pegin[btcTxid] = 0;
+            }
         }
         _pay(msg.sender, input); // best-effort — an unpayable claimant's input waits as a credit
     }
@@ -352,6 +393,7 @@ contract Settlement {
             o += sl + 4;                              // scriptSig + sequence
         }
         (n, o) = _varint(t, o);                       // outputs
+        require(n <= MAX_PAYOUT_OUTPUTS, "payout too wide");
         for (uint256 i = 0; i < n; i++) {
             uint256 value = 0;
             for (uint256 j = 0; j < 8; j++) { value |= uint256(uint8(t[o + j])) << (8 * j); } // LE sats
@@ -368,6 +410,36 @@ contract Settlement {
             o += sl;
         }
         revert("no unclaimed payout to dest");
+    }
+
+    /**
+     * The RSK address this payout commits to, read from its OP_RETURN settler commitment:
+     * OP_RETURN (0x6a) PUSH24 (0x18) "RSKX" <20-byte address> = a 26-byte scriptPubKey.
+     * Reverts if the payout carries no such output — an uncommitted payout is unclaimable, which is
+     * exactly what stops a hijacker replaying someone else's proof.
+     */
+    function _settlerOf(bytes calldata t) internal pure returns (address settler) {
+        uint256 o = 4;                                // skip version
+        uint256 n;
+        (n, o) = _varint(t, o);                       // inputs
+        for (uint256 i = 0; i < n; i++) {
+            o += 36;
+            uint256 sl;
+            (sl, o) = _varint(t, o);
+            o += sl + 4;
+        }
+        (n, o) = _varint(t, o);                       // outputs
+        require(n <= MAX_PAYOUT_OUTPUTS, "payout too wide");
+        for (uint256 i = 0; i < n; i++) {
+            o += 8;                                   // value
+            uint256 sl;
+            (sl, o) = _varint(t, o);
+            if (sl == 26 && t[o] == 0x6a && t[o + 1] == 0x18 && bytes4(t[o + 2:o + 6]) == SETTLER_TAG) {
+                return address(bytes20(t[o + 6:o + 26]));
+            }
+            o += sl;
+        }
+        revert("payout carries no settler commitment");
     }
 
     function _varint(bytes calldata t, uint256 o) internal pure returns (uint256 v, uint256 no) {

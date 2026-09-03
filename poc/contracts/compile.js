@@ -16,6 +16,8 @@ const sources = {
   "Griefer.sol": { content: fs.readFileSync(path.join(__dirname, "Griefer.sol"), "utf8") },
   "Turncoat.sol": { content: fs.readFileSync(path.join(__dirname, "Turncoat.sol"), "utf8") },
   "PoisonToken.sol": { content: fs.readFileSync(path.join(__dirname, "PoisonToken.sol"), "utf8") },
+  "Reenterer.sol": { content: fs.readFileSync(path.join(__dirname, "Reenterer.sol"), "utf8") },
+  "BadToken.sol": { content: fs.readFileSync(path.join(__dirname, "BadToken.sol"), "utf8") },
 };
 
 const input = {

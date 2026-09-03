@@ -64,9 +64,9 @@ async function main(): Promise<number> {
   /** fresh rbtc intent with escrow deposited and raw tx broadcast */
   async function freshRbtc(expiryBlocks: number, outputToken: string = RBTC) {
     const btcTxid = getBytes(randomBytes(32));
-    await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT));
     const user = freshWallet();
     const H = randomH();
+    await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, hexlify(H)));
     const intent = buildIntent(user, { H, btcTxid, expiry: (await rpcA.blockNumber()) + expiryBlocks, minOut: MINOUT, outputToken });
     await rpcA.sendRaw(intent.rawHex);
     return { user, H, intent };

@@ -34,13 +34,12 @@ async function main(): Promise<number> {
   await waitReceipt(rpcA, await mint(cowToken, cowWallet().address, MINOUT * 10n));
   await waitReceipt(rpcA, await approve(cowToken, SETTLEMENT_ADDR, MINOUT * 10n));
 
-  // model the peg-in: escrow INPUT rbtc for a unique btcTxid (ticket off, so any txid is fine)
+  // model the peg-in: escrow INPUT rbtc for a unique btcTxid, BOUND to the intent's H (sign-first)
   const btcTxid = getBytes(randomBytes(32));
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT));
-  r.check("input escrowed for the peg-in", (await peginOf(rpcA.url, hexlify(btcTxid))) === INPUT);
-
   const user = freshWallet();
   const H = randomH();
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, hexlify(H)));
+  r.check("input escrowed for the peg-in", (await peginOf(rpcA.url, hexlify(btcTxid))) === INPUT);
   const height = await rpcA.blockNumber();
   const intent = buildIntent(user, { H, btcTxid, expiry: height + 95, minOut: MINOUT, outputToken: tokenAddr });
   await rpcA.sendRaw(intent.rawHex);
