@@ -22,11 +22,11 @@
  */
 import { buildIntent, freshWallet, isConsumed, btcOutH } from "../src/intent.js";
 import {
-  depositForPegin, peginOf, settleBtcOut, reserveExit, exitBondFor, exitReservationOf,
+  depositForPegin, peginIntentOf, peginOf, settleBtcOut, reserveExit, exitBondFor, exitReservationOf,
   settlementCreditOf,
 } from "../src/settlement.js";
 import { branchFromTxOutProof } from "../src/merkle.js";
-import { Bridge } from "../src/bridge.js";
+import { Bridge, syncHeadersTo } from "../src/bridge.js";
 import { BtcRpc } from "../src/btcrpc.js";
 import { Report, preflight, requireSettlement, rpcA, fundAccount, waitReceipt, succeeded, reverted } from "./_harness.js";
 import { BTC_OUT, CHAIN_ID, COW_KEY, SETTLEMENT_ADDR } from "../src/config.js";
@@ -49,8 +49,13 @@ function cowW(): Wallet {
 async function main(): Promise<number> {
   await preflight(rpcA);
   await requireSettlement(rpcA);
-  // generation probe: the hardened exit leg ships the pull-payment ledger
-  try { await settlementCreditOf(rpcA.url, "0x" + "0".repeat(40)); }
+  // generation probe: the hardened exit leg ships the pull-payment ledger AND the entry binding this
+  // experiment's escrows rely on (peginIntent). Probing only credit() let a half-old genesis through,
+  // where the run failed later as three confusing balance-delta mismatches instead of bailing here.
+  try {
+    await settlementCreditOf(rpcA.url, "0x" + "0".repeat(40));
+    await peginIntentOf(rpcA.url, "0x" + "0".repeat(64));
+  }
   catch {
     console.error(`\nSettlement predates the exit pull-payment hardening (no credit()). Rebuild from the repo root:\n` +
       `  docker-compose -f poc/stack/podman-compose.yml down -v && docker-compose -f poc/stack/podman-compose.yml up -d --build\n`);
@@ -70,16 +75,9 @@ async function main(): Promise<number> {
   await btc.sendToAddress(solverBtcAddr, 0.06);
   await btc.generateToAddress(1, faucet);
 
-  async function relayTo(target: number): Promise<void> {
-    const from = await bridge.bestChainHeight();
-    if (from >= target) return;
-    bridge.resetNonce();
-    let last: string | null = null;
-    for (let h = from + 1; h <= target; h++) {
-      last = await bridge.receiveHeader(await btc.getBlockHeaderRaw(await btc.getBlockHash(h)));
-    }
-    if (last) await waitReceipt(rpcA, last);
-  }
+  // Chunked: batch-sending a ~100-header backlog on one nonce run dies at -32010 "nonce too high"
+  // around twenty deep (see syncHeadersTo).
+  const relayTo = (target: number) => syncHeadersTo(rpcA, bridge, btc, target);
   console.log("syncing the Bridge to the BTC tip before any intent exists…");
   await relayTo(await btc.getBlockCount());
 
@@ -88,15 +86,29 @@ async function main(): Promise<number> {
     const salt = getBytes(randomBytes(32));
     const H = btcOutH(userDest, salt);
     const btcTxid = getBytes(randomBytes(32));
-    await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT));
-    const intent = buildIntent(freshWallet(), { H, btcTxid, expiry: (await rpcA.blockNumber()) + 150, minOut: MIN_SATS, outputToken: BTC_OUT });
+    // Assert the escrow landed: a silently failed deposit surfaces much later as an unexplained
+    // "solver claimed nothing" delta, which reads as a falsified claim rather than a setup failure.
+    if (!succeeded(await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, hexlify(H))))) {
+      throw new Error(`escrow deposit failed for ${hexlify(btcTxid).slice(0, 12)}…`);
+    }
+    // +90, not +150: admission caps the expiry span at intent.maxExpirySpan (100, pinned in
+    // podman-compose.yml), so +150 was rejected outright and this experiment never ran a single
+    // check. The widest part needs ~67 blocks — part 2 reserves TWICE in sequence, and each
+    // reserveExit demands block.number + RESERVE_WINDOW(30) < expiry — so 90 leaves ~23 spare and
+    // matches the sibling exit experiments (E19 uses +90).
+    const intent = buildIntent(freshWallet(), { H, btcTxid, expiry: (await rpcA.blockNumber()) + 90, minOut: MIN_SATS, outputToken: BTC_OUT });
     await rpcA.sendRaw(intent.rawHex);
     return { salt, H, btcTxid, intent };
   }
 
-  /** Pay the user on Bitcoin, confirm, relay headers, and return proof parts for settleBtcOut. */
-  async function payAndProve() {
-    const { txid, rawHex } = await btc.payToAddress(solverBtcAddr, userBtcAddr, PAY_BTC);
+  /**
+   * Pay the user on Bitcoin, confirm, relay headers, and return proof parts for settleBtcOut.
+   * `settler` is the RSK address that will CALL settleBtcOut: the payout commits to it, and the
+   * contract requires msg.sender to match (the E8 payout-hijack fix). Part 3's settler is the
+   * unpayable Griefer contract, not cow — committing to the wrong one reverts on that check.
+   */
+  async function payAndProve(settler: string = new Wallet(COW_KEY).address) {
+    const { txid, rawHex } = await btc.payToAddress(solverBtcAddr, userBtcAddr, PAY_BTC, settler);
     await btc.generateToAddress(2, faucet);
     const v = await btc.getRawTransactionVerbose(txid);
     const payHeight = (await btc.getBlockCount()) - ((v.confirmations ?? 1) - 1);
@@ -154,7 +166,7 @@ async function main(): Promise<number> {
   const p3 = await freshExit();
   r.check("p3: griefer reserves through its contract",
     succeeded(await waitReceipt(rpcA, (await griefer.exec(SETTLEMENT_ADDR, iface.encodeFunctionData("reserveExit", [p3.intent.rawHex]), { ...ov, value: bond })).hash)));
-  const proof3 = await payAndProve(); // the BTC payment is real and irreversible
+  const proof3 = await payAndProve(grieferAddr); // real, irreversible — and committed to the GRIEFER, which settles it
   const settleData = iface.encodeFunctionData("settleBtcOut",
     [p3.intent.rawHex, p3.salt, userDest, "0x" + proof3.rawBtcTx.replace(/^0x/, ""), proof3.btcBlockHash, proof3.merklePath, proof3.merkleHashes]);
   const rec3 = await waitReceipt(rpcA, (await griefer.exec(SETTLEMENT_ADDR, settleData, ov)).hash);

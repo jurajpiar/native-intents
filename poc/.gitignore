@@ -2,3 +2,13 @@ _tmp/
 **/node_modules/
 sdk/node_modules/
 *.log
+
+# Stale compiled twins of the TypeScript sources. tsx resolves the .ts (proved: settlement.js pins
+# gasLimit 1_500_000 with no override, yet attacks/e5 case 5b runs at 6_000_000), so these are inert
+# at runtime — but they are byte-for-byte OLD copies of files that have since been fixed, and without
+# this rule `git add -A` commits 45 of them. Regenerate or delete freely; nothing imports them.
+sdk/src/*.js
+sdk/experiments/*.js
+sdk/playground/*.js
+sdk/test/*.js
+sdk/attacks/*.js

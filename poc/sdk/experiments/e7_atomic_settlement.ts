@@ -26,7 +26,7 @@ async function main(): Promise<number> {
   const user = freshWallet();
   const H = randomH();
   const height = await rpcA.blockNumber();
-  const intent = buildIntent(user, { H, btcTxid: new Uint8Array(32), expiry: height + 100, minOut: MINOUT });
+  const intent = buildIntent(user, { H, btcTxid: new Uint8Array(32), expiry: height + 95, minOut: MINOUT });
 
   r.check("user starts at zero balance", BigInt(await rpcA.getBalance(user.address)) === 0n, user.address);
   r.check("H starts unconsumed", !(await isConsumed((to, d) => rpcA.ethCall(to, d), H)));

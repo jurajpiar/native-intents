@@ -16,7 +16,7 @@
 import { buildIntent, freshWallet, isConsumed, btcOutH } from "../src/intent.js";
 import { depositForPegin, settleBtcOut, btcOutClaimed, reserveExit, exitBondFor, exitReservationOf } from "../src/settlement.js";
 import { branchFromTxOutProof } from "../src/merkle.js";
-import { Bridge } from "../src/bridge.js";
+import { Bridge, syncHeadersTo } from "../src/bridge.js";
 import { BtcRpc } from "../src/btcrpc.js";
 import { Report, preflight, requireSettlement, rpcA, waitReceipt, succeeded, reverted } from "./_harness.js";
 import { BTC_OUT, COW_KEY } from "../src/config.js";
@@ -57,16 +57,10 @@ async function main(): Promise<number> {
    * lifetime with a per-header receipt wait, burned ~104 RSK blocks, and the intent EXPIRED before
    * settlement — 5 checks failed on "expired", not on the mechanism under test.
    */
-  async function relayTo(target: number): Promise<void> {
-    const from = await bridge.bestChainHeight();
-    if (from >= target) return;
-    bridge.resetNonce(); // cow signs through other paths between batches — re-sync before batch-sending
-    let last: string | null = null;
-    for (let h = from + 1; h <= target; h++) {
-      last = await bridge.receiveHeader(await btc.getBlockHeaderRaw(await btc.getBlockHash(h)));
-    }
-    if (last) await waitReceipt(rpcA, last);
-  }
+  // Chunked (syncHeadersTo): the single-batch form this comment describes also dies on a fresh
+  // bitcoind for a second reason — rskj's pool rejects a nonce more than ~20 ahead of the mined one
+  // (-32010 "transaction nonce too high"), so a ~102-header backlog never finished relaying.
+  const relayTo = (target: number) => syncHeadersTo(rpcA, bridge, btc, target);
   console.log(`syncing the Bridge to the BTC tip before any intent exists…`);
   await relayTo(await btc.getBlockCount());
 
@@ -75,7 +69,7 @@ async function main(): Promise<number> {
   const salt = getBytes(randomBytes(32));
   const H = btcOutH(userDest, salt);
   const btcTxid = getBytes(randomBytes(32));            // the exit input's escrow key
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT));
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, hexlify(H)));
   const height = await rpcA.blockNumber();
   const intent = buildIntent(user, { H, btcTxid, expiry: height + 90, minOut: MIN_SATS, outputToken: BTC_OUT });
   await rpcA.sendRaw(intent.rawHex);
@@ -93,7 +87,7 @@ async function main(): Promise<number> {
 
   // --- the solver pays the user REAL BTC and proves it ---
   const userBtcBefore = (await btc.listUnspent([userBtcAddr])).reduce((s, u) => s + u.amount, 0);
-  const { txid: payTxid, rawHex: payRaw } = await btc.payToAddress(solverBtcAddr, userBtcAddr, PAY_BTC);
+  const { txid: payTxid, rawHex: payRaw } = await btc.payToAddress(solverBtcAddr, userBtcAddr, PAY_BTC, new Wallet(COW_KEY).address);
   await btc.generateToAddress(2, faucet);               // confirm the payout (+1 spare)
   const payHeight = (await btc.getRawTransactionVerbose(payTxid)).confirmations
     ? await btc.getBlockCount() - ((await btc.getRawTransactionVerbose(payTxid)).confirmations! - 1) : 0;
@@ -114,7 +108,7 @@ async function main(): Promise<number> {
   const wrongDest = await btc.hash160Of(await btc.getNewAddress("e19-wrong", "legacy"));
   const salt2 = getBytes(randomBytes(32));
   const btcTxid2 = getBytes(randomBytes(32));
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid2), INPUT));
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid2), INPUT, hexlify(btcOutH(wrongDest, salt2))));
   const wrongIntent = buildIntent(mallory, { H: btcOutH(wrongDest, salt2), btcTxid: btcTxid2, expiry: (await rpcA.blockNumber()) + 90, minOut: MIN_SATS, outputToken: BTC_OUT });
   const wrong = await waitReceipt(rpcA, await settleBtcOut(rpcA.url, {
     rawIntentTx: wrongIntent.rawHex, salt: salt2, btcDest: wrongDest,
@@ -139,7 +133,7 @@ async function main(): Promise<number> {
   // replay: a SECOND exit intent to the same destination cannot reuse the same payout output
   const salt3 = getBytes(randomBytes(32));
   const btcTxid3 = getBytes(randomBytes(32));
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid3), INPUT));
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid3), INPUT, hexlify(btcOutH(userDest, salt3))));
   const replayIntent = buildIntent(freshWallet(), { H: btcOutH(userDest, salt3), btcTxid: btcTxid3, expiry: (await rpcA.blockNumber()) + 90, minOut: MIN_SATS, outputToken: BTC_OUT });
   const replay = await waitReceipt(rpcA, await settleBtcOut(rpcA.url, {
     rawIntentTx: replayIntent.rawHex, salt: salt3, btcDest: userDest,
@@ -150,7 +144,7 @@ async function main(): Promise<number> {
   // --- squatting is priced: a reservation that lapses unsettled forfeits its bond into the escrow ---
   const salt4 = getBytes(randomBytes(32));
   const btcTxid4 = getBytes(randomBytes(32));
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid4), INPUT));
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid4), INPUT, hexlify(btcOutH(userDest, salt4))));
   const lapseIntent = buildIntent(freshWallet(), { H: btcOutH(userDest, salt4), btcTxid: btcTxid4, expiry: (await rpcA.blockNumber()) + 90, minOut: MIN_SATS, outputToken: BTC_OUT });
   await rpcA.sendRaw(lapseIntent.rawHex);
   r.check("squatter reserves (and will never pay)", succeeded(await waitReceipt(rpcA, await reserveExit(rpcA.url, lapseIntent.rawHex, bond, s2key))));
@@ -159,7 +153,7 @@ async function main(): Promise<number> {
   const { waitFor } = await import("../src/client.js");
   await waitFor(async () => BigInt(await rpcA.blockNumber()) >= squat.until, 60000, 1000);
 
-  const { txid: payTxid2, rawHex: payRaw2 } = await btc.payToAddress(solverBtcAddr, userBtcAddr, PAY_BTC);
+  const { txid: payTxid2, rawHex: payRaw2 } = await btc.payToAddress(solverBtcAddr, userBtcAddr, PAY_BTC, new Wallet(COW_KEY).address);
   await btc.generateToAddress(2, faucet);
   const v2 = await btc.getRawTransactionVerbose(payTxid2);
   const payHeight2 = (await btc.getBlockCount()) - ((v2.confirmations ?? 1) - 1);

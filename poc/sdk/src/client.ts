@@ -1,7 +1,8 @@
 /** Minimal JSON-RPC client (Node 22 global fetch). Kept tiny and explicit so experiments read clearly. */
 
 export class RpcError extends Error {
-  constructor(public code: number, message: string) { super(message); }
+  /** `data` carries rskj's ABI-encoded revert payload on eth_call failures (Error(string), 0x08c379a0…). */
+  constructor(public code: number, message: string, public data?: string) { super(message); }
 }
 
 export class Rpc {
@@ -14,8 +15,8 @@ export class Rpc {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: this.id++, method, params }),
     });
-    const json = (await res.json()) as { result?: T; error?: { code: number; message: string } };
-    if (json.error) throw new RpcError(json.error.code, json.error.message);
+    const json = (await res.json()) as { result?: T; error?: { code: number; message: string; data?: string } };
+    if (json.error) throw new RpcError(json.error.code, json.error.message, json.error.data);
     return json.result as T;
   }
 
