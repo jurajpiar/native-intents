@@ -226,7 +226,7 @@ Keeping settlement in a contract is the lower-risk choice and is what the PoC do
 
 ## References
 
-- RSKIP-draft-native-intent-tx.md, RSKIP-draft-native-intent-fees.md (this repo).
+- RSKIP-draft-native-intents.md (this repo).
 - Design sketch, pressure points 2 (reveal liveness), 3 (instant is a solver property), 4 (permissionless
   softens to "entry"), 5 (refund = peg-in).
 - RSKIP543/545/546 (typed transactions), RSKIP126 (precompiled-contract storage roots), RSKIP199/200

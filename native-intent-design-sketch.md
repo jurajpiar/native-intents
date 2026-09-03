@@ -1,6 +1,6 @@
 # Native intent transaction type on Rootstock — design sketch
 
-Status: Idea stage. Working material from a brainstorming handoff, restructured for review. Nothing here is committed design. Companion diagram: `native-intent-sequence.mermaid`. Formal draft: `RSKIP-draft-native-intent-tx.md`. A proof of concept is built and verified under `poc/` — as of 2026-09-01 milestones 1 (mempool-only admission) and 2 (atomic solve) both pass on a patched rskj regtest node: the two irreducible claims (E1, E1b, E2), replay protection (E3), atomic min-out settlement (E7), and the closed consume-griefing residual (E6).
+Status: Idea stage. Working material from a brainstorming handoff, restructured for review. Nothing here is committed design. Companion diagram: `native-intent-sequence.mermaid`. Formal draft: `RSKIP-draft-native-intents.md`. A proof of concept is built and verified under `poc/` — as of 2026-09-01 milestones 1 (mempool-only admission) and 2 (atomic solve) both pass on a patched rskj regtest node: the two irreducible claims (E1, E1b, E2), replay protection (E3), atomic min-out settlement (E7), and the closed consume-griefing residual (E6).
 
 ## What it is
 

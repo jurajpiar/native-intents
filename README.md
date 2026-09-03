@@ -3,7 +3,7 @@
 A proposed Rootstock-native transaction type in which the user signs *constraints* — a hash-committed
 pipeline, a minimum output, an expiry, and an anti-spam reference — instead of exact calldata, and
 consensus enforces validity before inclusion. Independent solvers compete to satisfy the constraints and
-are paid from the spread. This repository holds the design, two draft RSKIPs, and a working proof of
+are paid from the spread. This repository holds the design, a draft RSKIP, and a working proof of
 concept that has been built and run end to end on a patched rskj regtest node.
 
 Status: RD&I initiative, Idea stage. Everything here is a proposal for discussion, not committed design.
@@ -31,11 +31,9 @@ two claims load-bearing.
   (each revisitable), and the pressure points where the design is most likely wrong.
 - [`native-intent-sequence.mermaid`](native-intent-sequence.mermaid) — the interaction as a sequence
   diagram.
-- [`RSKIP-draft-native-intent-tx.md`](RSKIP-draft-native-intent-tx.md) — the draft RSKIP for the
-  transaction type: envelope, admission, consumed set, settlement, expiry/reorg, anti-spam ticket, plus
-  an implementation-status section reporting what the PoC verified.
-- [`RSKIP-draft-native-intent-fees.md`](RSKIP-draft-native-intent-fees.md) — the companion RSKIP for the
-  fee mechanics: how the solver is paid (claims the input, keeps the spread).
+- [`RSKIP-draft-native-intents.md`](RSKIP-draft-native-intents.md) — the draft RSKIP: the
+  transaction type, admission, consumed set, settlement (input binding, auction, exit path), and
+  activation gate, in one standalone document.
 - [`PRODUCTIONIZATION.md`](PRODUCTIONIZATION.md) — what it would take to remove the PoC's three shortcuts:
   real peg-in→contract crediting, an activation gate, and the solver market.
 - [`poc/`](poc/) — the proof of concept (rskj patch, podman stack, TypeScript harness, experiments).
@@ -92,7 +90,7 @@ solver, and records `H` — reverting visibly on any failure.
 
 ## Findings surfaced by building it
 
-These are recorded in the RSKIPs and are worth carrying into any real implementation:
+These are recorded in the RSKIP and are worth carrying into any real implementation:
 
 - **Zero-`gasPrice` RLP canonicalisation.** rskj serialises a zero `gasPrice` as a raw `0x00` byte while
   a zero `value`/`nonce` serialise as `0x80`; a signer that does not match this recovers the wrong sender.
@@ -106,7 +104,7 @@ These are recorded in the RSKIPs and are worth carrying into any real implementa
 Built and verified: the two irreducible claims, gossip, replay protection, the anti-spam ticket backed by
 a real peg-in, reorg reversion (both deterministically on one node via E9 and under a genuine two-node
 p2p partition/merge via E16), atomic contract settlement, ERC-20 outputs, visible reverts, and the fee
-mechanics (solver input-claim + spread). Both RSKIP drafts are current.
+mechanics (solver input-claim + spread). The RSKIP draft is current.
 
 Also built and verified beyond the core claims, taking the PoC's three deliberate shortcuts to production
 shape (see `PRODUCTIONIZATION.md`): the **activation gate** (a `RSKIPINTENT` consensus rule instead of
