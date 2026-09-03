@@ -37,7 +37,10 @@ try {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", { pretendToBeVisual: true });
   globalThis.window = dom.window;
   globalThis.document = dom.window.document;
-  for (const k of ["Element", "SVGElement", "HTMLElement", "Node", "getComputedStyle", "requestAnimationFrame", "MutationObserver"]) {
+  // `Option` belongs on this list: mermaid's sequence renderer touches it, and without it a perfectly
+  // valid diagram fails with "Option is not defined" — a linter failing on good input, which is the
+  // same species of uselessness as one passing on bad input.
+  for (const k of ["Element", "SVGElement", "HTMLElement", "Node", "getComputedStyle", "requestAnimationFrame", "MutationObserver", "Option"]) {
     if (!(k in globalThis) && k in dom.window) globalThis[k] = dom.window[k];
   }
   // navigator is a getter-only global on modern Node
