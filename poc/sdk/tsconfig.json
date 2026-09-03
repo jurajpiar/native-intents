@@ -12,5 +12,5 @@
     "noUnusedParameters": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "experiments/**/*.ts", "test/**/*.ts", "playground/**/*.ts"]
+  "include": ["src/**/*.ts", "experiments/**/*.ts", "attacks/**/*.ts", "test/**/*.ts", "playground/**/*.ts"]
 }
