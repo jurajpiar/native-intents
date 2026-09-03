@@ -29,6 +29,9 @@ export class Rpc {
   getTx = (hash: string): Promise<TxRpc | null> => this.call<TxRpc | null>("eth_getTransactionByHash", [hash]);
   getReceipt = (hash: string): Promise<Receipt | null> => this.call<Receipt | null>("eth_getTransactionReceipt", [hash]);
   peerCount = async (): Promise<number> => parseInt(await this.call<string>("net_peerCount"), 16);
+  // needed to rebuild an intent's EIP-155 v: the JSON view of a typed tx reports yParity and omits
+  // chainId entirely, so the chain id has to be asked for separately (see src/reconstruct.ts).
+  chainId = async (): Promise<number> => parseInt(await this.call<string>("eth_chainId"), 16);
   // evm_snapshot/evm_revert: roll the chain + state back to a prior height — used to model a reorg
   snapshot = (): Promise<string> => this.call<string>("evm_snapshot");
   revert = (id: string): Promise<boolean> => this.call<boolean>("evm_revert", [id]);
@@ -48,14 +51,30 @@ export class Rpc {
   }
 }
 
+/**
+ * A node's JSON view of a transaction. The optional fields are optional for a real reason: the two
+ * RPCs that return this shape do NOT return the same fields.
+ *
+ *   eth_getTransactionByHash  (TransactionResultDTO)  — everything below, including type and v/r/s,
+ *                                                       and it answers for PENDING txs too.
+ *   txpool_content            (fullSerializer)        — no `type`, no `v`/`r`/`s`.
+ *
+ * So a pool listing cannot be re-encoded into signed bytes on its own. See src/reconstruct.ts.
+ */
 export interface TxRpc {
   hash: string;
   from: string;
   to: string | null;
   input: string;
-  type?: string;   // "0x0249" for RSK-namespace intents
+  type?: string;   // "0x0249" for RSK-namespace intents — ABSENT from txpool_content
   nonce: string;
   blockNumber: string | null;
+  gas?: string;
+  gasPrice?: string;
+  value?: string;
+  v?: string;      // absent from txpool_content
+  r?: string;      // absent from txpool_content
+  s?: string;      // absent from txpool_content
 }
 export interface Receipt { status: string; blockNumber: string | null; gasUsed?: string; }
 interface TxPoolContent {
