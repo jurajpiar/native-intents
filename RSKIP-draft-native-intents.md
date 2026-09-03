@@ -68,6 +68,8 @@ sequenceDiagram
     U->>U: sign intent(H, btcTxid, E, minOut, outputToken)
 
     U->>BTC: broadcast the BTC tx
+    U-->>W: hand over the signed intent bytes — the user's last act
+    Note over U,BR: 100 BTC confirmations on mainnet. Mean 16.7 hours, standard deviation 100 minutes
     BTC-->>BR: headers relayed, confirmations accumulate
 
     Note over W,BR: register — the WALLET does this, not the solver. See below
@@ -75,8 +77,8 @@ sequenceDiagram
     SC->>BR: registerFlyoverBtcTransaction(derivationArgumentsHash = binding)
     BR-->>SC: escrow credited to Settlement, bound to binding
 
-    Note over U,N: only now is the intent admissible
-    U->>N: raw intent (gasPrice 0, value 0)
+    Note over W,N: only now is the intent admissible — and E was signed before any of this
+    W->>N: raw intent (gasPrice 0, value 0) — anyone may broadcast self-authenticating bytes
     N->>N: admit — rule active, signature, 160 bytes, height below E, H unconsumed, ticket visible
     N->>N: gossip — block producers exclude it from candidate blocks
 
@@ -360,6 +362,21 @@ The RSKIP-176 derivation includes the user's refund address, so the rejected-peg
 
 `E` is an absolute Rootstock height and must fall within a bounded horizon from the current block. After a reorg, the intent is evaluated against the replacement branch and is either still valid or expired. A removed settlement also removes its delivery and consumed marker.
 
+### Choosing `E` across the peg-in wait
+
+The user does not have to be online when the intent is broadcast — the bytes are self-authenticating and the wallet backend, which is registering the peg-in anyway, can hold and offer them. But `E` is inside the signed payload, so it is fixed *before the Bitcoin transaction is broadcast*, and admission does not test it until registration completes. The gap is not small and it is not fixed.
+
+Mainnet peg-in requires 100 Bitcoin confirmations (`btc2RskMinimumAcceptableConfirmations`). Confirmation intervals are near-exponential, so the wait is Gamma-distributed: mean 16.7 hours, standard deviation 100 minutes. At a 30-second Rootstock block that is roughly 2000 blocks ahead, give or take 200. Admission then requires both `h < E` and `E − h ≤ maxExpirySpan`, and the reference value of `maxExpirySpan` is 100 blocks — a fifty-minute target the user must hit by forecasting a Poisson process from a day earlier. A fixed `E` lands inside it about one time in five.
+
+The two failure modes are not symmetric, which decides the shape of the answer:
+
+- **`E` too far ahead** is recoverable. Rejection is free and leaves no trace, so the wallet waits and re-offers once `E − h` falls inside the span.
+- **`E` already passed** is not. The intent is dead, the escrow is credited, and the user is left to the expired-escrow recovery path that this proposal still owes a specification.
+
+So a rational wallet sets `E` late. The cost is that the intent then becomes admissible only at `E − maxExpirySpan`, which can be many hours *after* the escrow was credited — the user's value sits idle and exposed, waiting for a horizon rule rather than for anything real. Testnet hides this entirely: 10 confirmations put the mean at 1.7 hours with a 32-minute deviation, comfortably inside the same span.
+
+Three levers exist and this proposal does not yet pull one. `maxExpirySpan` can be sized to cover peg-in latency and its variance, at the cost of a bounded horizon that no longer bounds much. Admission can be relaxed so an intent enters the pool before its ticket is visible, which removes the forecast entirely but weakens the spam filter. Or the escrow-keyed admission rule proposed under the anti-spam ticket can be adopted — noting that it pushes the *wrong* way here, since requiring the escrow to exist can only make admission later, never earlier. These are one decision, not three, and it should be taken together with the open question below.
+
 The interaction with fork-aware consensus under RSKIP-555 remains open and must be resolved before the validity rules are finalised.
 
 ## Bitcoin-backed anti-spam ticket
@@ -455,7 +472,7 @@ The suite should continue to distinguish protocol properties from implementation
 # Open questions
 
 - **Signing key:** should the intent use a wallet-derived EVM key or a signature recoverable from the Bitcoin input?
-- **Admission latency and who registers:** requiring a registered ticket means registration must precede broadcast, which excludes the solver from doing it — it cannot act on an intent it cannot yet see — and leaves the wallet's funded backend as the natural registrant. Should a node instead tolerate a ticket not yet visible to the Bridge, weakening the spam filter but letting the user broadcast first and a solver register as part of filling?
+- **Admission latency, `E` selection, and who registers:** these are one question. Requiring a registered ticket means registration must precede broadcast, which excludes the solver from doing it — it cannot act on an intent it cannot yet see — and leaves the wallet's funded backend as the natural registrant. It also forces the user to sign `E` roughly 2000 Rootstock blocks before admission will test it, against a Bitcoin wait whose standard deviation is twice the reference `maxExpirySpan` (see *Choosing `E` across the peg-in wait*). Should a node tolerate a ticket not yet visible to the Bridge — weakening the spam filter but removing both the forecast and the registrant bottleneck — or should `maxExpirySpan` simply absorb the peg-in latency? Note that the escrow-keyed admission rule proposed for the anti-spam ticket resolves the spam question while making the latency question strictly worse, so the two cannot be decided separately.
 - **Fronting as a first-class mode:** derivation-bound escrow may support early delivery against a credible receivable. Doing so needs deferred input release and an explicit rule for unripe tickets.
 - **Exit parameters:** expiry, reservation duration, confirmation depth, and bond size are coupled. Test values cannot simply be copied to mainnet.
 - **Native permit:** exiting vault shares or LP tokens without another user transaction requires a transfer authorisation the settlement contract can exercise. EIP-2612 covers compatible tokens; a general mechanism remains open.
