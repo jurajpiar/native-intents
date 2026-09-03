@@ -30,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import { ATTACKS, AttackSpec, CLASSES, Expected, OUTCOME_LABEL, ThreatClass, byClass, byId } from "./registry.js";
 import { printSpecHeader } from "./_forensics.js";
 import { StackCtx, StackName, StackUnavailable, disposeStacks, ensureStack, stackWhat, teardown } from "./_stacks.js";
+import { FreshNode, FreshNodeUnavailable, startFresh } from "./_fresh.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const EXPERIMENTS = join(here, "..", "experiments");
@@ -78,7 +79,9 @@ function teardownProvisioned(): void {
     if (mine.length) console.log(`  left the provisioned stack(s) up: ${mine.join(", ")} — add --teardown to remove them\n`);
     return;
   }
-  for (const ctx of stacks.values()) if (ctx.provisioned) teardown(ctx.name);
+  // Only compose stacks are torn down here. A fresh node is removed by the attack that owned it,
+  // in runOne's finally — it must not outlive one attack, let alone the whole board.
+  for (const ctx of stacks.values()) if (ctx.provisioned && ctx.name !== "fresh") teardown(ctx.name);
 }
 
 const pad = (s: string, n: number) => s + " ".repeat(Math.max(0, n - s.length));
@@ -215,15 +218,27 @@ async function runOne(spec: AttackSpec, inBoardRun = false): Promise<Status> {
     return "not-run";
   }
 
-  // Both runnable kinds need their stack resolved first. A missing stack is an ENVIRONMENT result,
-  // not a defence result: reporting "blocked" because nothing was running would be a false pass.
+  // Both runnable kinds need their environment resolved first. A missing one is an ENVIRONMENT
+  // result, not a defence result: reporting "blocked" because nothing was running is a false pass.
+  //
+  // `fresh` attacks get a private node built to their own spec instead of a shared stack — that is
+  // the only way to reach a height below a fork activation, or a node started with different flags.
   let ctx: StackCtx;
+  let freshNode: FreshNode | null = null;
   try {
-    ctx = await stackFor(spec);
+    if (spec.fresh) {
+      freshNode = await startFresh(spec.id, spec.fresh);
+      ctx = freshNode;
+    } else {
+      ctx = await stackFor(spec);
+    }
   } catch (e) {
     console.log(`\n=== ${spec.id.toUpperCase()}  ${spec.name}`);
     console.log(`${pad("needs", 11)}${spec.needs}`);
-    if (e instanceof StackUnavailable) {
+    if (e instanceof FreshNodeUnavailable) {
+      console.log(`\nCANNOT BUILD A FRESH NODE — this attack needs its own, and one could not be started.`);
+      console.log(`  ${e.message}\n`);
+    } else if (e instanceof StackUnavailable) {
       console.log(`\nWRONG STACK — this attack declares the "${e.stack}" stack (${stackWhat(e.stack)}).`);
       console.log(`  ${e.hint}\n`);
     } else {
@@ -232,7 +247,9 @@ async function runOne(spec: AttackSpec, inBoardRun = false): Promise<Status> {
     results.set(spec.id, "environment");
     return "environment";
   }
-  if (ctx.name !== "default") console.log(`\n  [stack: ${ctx.name}] ${stackWhat(ctx.name)}${ctx.provisioned ? " — provisioned by this run" : " — already up, reusing"}`);
+  if (ctx.name === "reorg") {
+    console.log(`\n  [stack: ${ctx.name}] ${stackWhat(ctx.name)}${ctx.provisioned ? " — provisioned by this run" : " — already up, reusing"}`);
+  }
 
   if (spec.impl.kind === "wrapped") {
     const script = spec.impl.script;
@@ -264,6 +281,7 @@ async function runOne(spec: AttackSpec, inBoardRun = false): Promise<Status> {
     results.set(spec.id, st);
     return st;
   } catch (e) {
+    // fall through to the classification below; the finally still removes the node
     // An attack may discover only at runtime that its stack is stale (a genesis contract it needs is
     // missing or older than it needs). That is the stack's problem, not the attack's, so it must not
     // be reported as a broken experiment — the two send the reader to completely different places.
@@ -275,6 +293,13 @@ async function runOne(spec: AttackSpec, inBoardRun = false): Promise<Status> {
     console.error(`\n${spec.id.toUpperCase()} could not run: ${e instanceof Error ? e.message : String(e)}\n`);
     results.set(spec.id, "broken");
     return "broken";
+  } finally {
+    // An ephemeral node belongs to exactly one attack. Removing it here rather than at the end of
+    // the board keeps memory flat across a full run — 28 live JVMs would not fit anywhere.
+    if (freshNode) {
+      console.log(`  [fresh node] removing ${freshNode.container}`);
+      freshNode.stop();
+    }
   }
 }
 
@@ -314,6 +339,16 @@ function summary(specs: AttackSpec[]): void {
   console.log(`\n  ${n("as-predicted")} as predicted · ${n("deviation")} deviation(s) · ` +
     `${n("partial")} partly exercised · ${n("broken")} experiment(s) broken · ` +
     `${n("environment") + n("skipped")} needing another stack · ${n("not-run")} not exercised`);
+  // A "wrong stack" line has a one-command fix, so say it here rather than leaving the reader to
+  // find it. Three rows went unverified on a full board run purely because the reorg stack was down.
+  const needStack = specs.filter((s) => {
+    const st = results.get(s.id) ?? "not-run";
+    return st === "environment" || st === "skipped";
+  });
+  if (needStack.length) {
+    console.log(`  ${needStack.length} row(s) needed a stack that was not up (${needStack.map((s) => s.id).join(", ")}).`);
+    console.log(`  Bring everything up as part of the run:  cd poc && npm run attacks:provision`);
+  }
   const unobserved = specs.filter((s) => !OBSERVED.includes(results.get(s.id) ?? "not-run")).length;
   if (unobserved) {
     console.log(`  [bracketed] = a prediction on record that this run did not test — ${unobserved} of ${specs.length} rows.`);

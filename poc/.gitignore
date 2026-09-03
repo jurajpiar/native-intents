@@ -12,3 +12,6 @@ sdk/experiments/*.js
 sdk/playground/*.js
 sdk/test/*.js
 sdk/attacks/*.js
+
+# per-attack fresh-node configs (generated genesis + node.conf, see sdk/attacks/_fresh.ts)
+stack/.fresh/

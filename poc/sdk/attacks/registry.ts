@@ -13,6 +13,8 @@
  */
 
 import type { StackCtx, StackName } from "./_stacks.js";
+import type { FreshSpec } from "./_fresh.js";
+import { BRIDGE_ADDR, TICKET_VALUE, TICKET_TXID, bridgeTicketSlot } from "./_ticket.js";
 
 export type ThreatClass = "A" | "B" | "C" | "D" | "E" | "F" | "M";
 
@@ -92,6 +94,13 @@ export interface AttackSpec {
    */
   stack?: StackName;
   /**
+   * Boot a PRIVATE node for this attack and hand it the chain state it needs, rather than running
+   * against whatever shared chain is up. Set it when the attack depends on something no transaction
+   * can construct — a height below a fork activation, a node startup flag, or pre-baked contract
+   * storage. Ignored when `stack` is set; the two are alternatives. See ./_fresh.ts.
+   */
+  fresh?: FreshSpec;
+  /**
    * Set when the attack cannot run on the default stack, with the reason. Full-board runs SKIP these
    * rather than reporting a guaranteed failure as a finding (../experiments/run_all.ts excludes E8 for
    * exactly this reason); `--id=<id>` still runs it.
@@ -108,31 +117,37 @@ export const ATTACKS: AttackSpec[] = [
   // ---------------------------------------------------------------- A · admission / consensus
   {
     id: "a1", cls: "A", name: "submit an intent before activation",
-    target: "rskj IntentAdmission — RSKIPINTENT consensus gate",
-    premise: "the intent tx type is parseable by the node before the fork activates, so send it early",
+    target: "rskj IntentAdmission — the RSKIPINTENT consensus gate",
+    premise: "the intent tx type is parseable by the node before the fork that legitimises it, so send one early — if it is admitted, a block containing it splits consensus",
     expected: "blocked", expectedWhy: "activation is a consensus rule, not a policy flag",
-    defence: "rskj-patch IntentAdmission + regtest.conf rskipIntent height",
-    severity: "a pre-fork intent in a block splits consensus",
-    needs: "1 node, run right after `up`",
-    impl: { kind: "wrapped", script: "e13_activation_gate.ts" },
+    defence: "rskj IntentAdmission + the rskipIntent activation height in the node's consensus rules",
+    severity: "a pre-fork intent in a block splits consensus between upgraded and un-upgraded nodes — the cheapest attack on the board with the most expensive failure",
+    needs: "its own node, activation height set low, mining on demand — built automatically",
+    // A height BELOW a fork cannot be reached by mining forward, so this attack ships the state it
+    // needs instead of running against whatever shared chain is up. Mining on demand keeps the
+    // pre-activation window open indefinitely, replacing what used to be a 40-second race.
+    fresh: { activation: 20, opts: { requireBtcTicket: "false", maxExpirySpan: "100" } },
+    conclusion: "the gate holds, and this is the first run that measured it. Below the activation height the node refuses the type outright and names activation as the reason; above it, the IDENTICAL SIGNED BYTES are admitted — so the activation rule is the only variable.",
+    finding: "the shared-chain version of this attack could not test its own claim. A board run happens on a chain thousands of blocks past activation, so the pre-activation window was unobservable — and the experiment asserted `true` and reported a pass anyway. That is worse than an untested line, because the board printed 'attack BLOCKED · as predicted' for a rule nothing had exercised. It now boots a node whose activation height is a parameter.",
+    impl: { kind: "native", load: () => import("./a1_activation_gate.js") },
   },
   {
     id: "a2", cls: "A", name: "flood the mempool with free intents",
-    target: "rskj IntentAdmission — anti-spam ticket",
-    premise: "intents are payer-less and gasPrice 0, so N of them from N fresh keys cost the attacker nothing",
-    expected: "blocked", expectedWhy: "admission demands a confirmed BTC peg-in ticket",
-    defence: "intent.requireBtcTicket=true (Bridge processed-height check at admission)",
-    severity: "free unbounded mempool growth — the core DoS objection to payer-less txs",
-    needs: "1 node, ticket **on**",
-    notInAll: "the default stack pins requireBtcTicket=false (podman-compose.yml:43,59), so the intent is " +
-      "admitted by design. Verified PASSING against a throwaway ticket-on node: `docker run --rm -d " +
-      "--name rskj-ticket -p 4464:4444 -e RSK_CONF=/config/node-a.conf -e JVM_OPTS=-Xmx2g " +
-      "-e INTENT_OPTS=\"-Dintent.requireBtcTicket=true -Dintent.maxExpirySpan=100\" " +
-      "-v \"$PWD/stack/config:/config:ro\" rskj-intent:poc`, then " +
-      "`RPC_A=http://localhost:4464 INTENT_REQUIRE_TICKET=true npm run attack -- --id=a2`. " +
-      "Rejected with \"BTC ticket not visible in Bridge SPV view\". Needs no bitcoind and leaves a " +
-      "populated stack alone",
-    impl: { kind: "wrapped", script: "e8_spam_without_ticket.ts" },
+    target: "rskj IntentAdmission — the BTC-ticket anti-spam rule",
+    premise: "intents are payer-less and carry gasPrice 0, so N of them from N fresh keys cost the attacker nothing — the core DoS objection to a free transaction type",
+    expected: "blocked",
+    expectedWhy: "admission demands the intent's btcTxid be a peg-in the Bridge has processed, so the scarce resource is a confirmed Bitcoin transaction rather than gas",
+    defence: "intent.requireBtcTicket=true — a Bridge processed-height check at admission, before the pool",
+    severity: "free unbounded mempool growth, which is the objection that decides whether a payer-less type is viable at all",
+    needs: "its own node with the ticket flag ON — built automatically",
+    // The rule is a NODE FLAG, and the shared stack pins it to false so the core claims run without
+    // Bitcoin setup. No on-chain state reaches a startup flag, so this attack used to live as a
+    // `docker run` line in a README. Starting the node here also removes E8's ambiguity: an admission
+    // can no longer be explained by the rule being off, because the attack set the flag itself.
+    fresh: { activation: 5, opts: { requireBtcTicket: "true", maxExpirySpan: "100" } },
+    conclusion: "the bound on a payer-less pool is a confirmed Bitcoin transaction, not gas: an attacker mints keys and commitments freely but cannot mint peg-ins, so the cost of an admitted intent is pushed onto Bitcoin where it is already priced. Not covered here, for want of a Bitcoin node: that a VALID ticket is admitted — that positive half is e8pos, on the stack that has bitcoind.",
+    finding: "this rule was unverified by the board for as long as it needed a hand-pasted `docker run`. The flag it depends on is process configuration, which no amount of chain setup reaches, so it sat outside every automated run until an attack could bring its own node.",
+    impl: { kind: "native", load: () => import("./a2_mempool_flood.js") },
   },
   {
     id: "a3", cls: "A", name: "admit an already-expired intent",
@@ -163,6 +178,30 @@ export const ATTACKS: AttackSpec[] = [
     severity: "a parse that returns attacker-chosen fields would forge user/minOut",
     needs: "1 node",
     impl: { kind: "native", load: () => import("./a5_malformed_payload.js") },
+  },
+  {
+    id: "a6", cls: "A", name: "reuse one valid ticket across unlimited intents",
+    target: "rskj IntentAdmission — the BTC-ticket rule (a lookup, not an accounting)",
+    premise: "the ticket rule asks whether a txid is a processed peg-in and nothing more, so pay for ONE peg-in and name it in as many intents as you like — fresh H and a fresh key each time, so nothing dedups and no per-account pool limit bites",
+    expected: "succeeds",
+    expectedWhy: "there is no counter, no dedup and no sender binding on btcTxid anywhere in the admission path — the ticket is a cost per ATTACKER, not per intent",
+    defence: "none. A2 covers the case where the ticket is ABSENT; nothing covers the case where one valid ticket is reused",
+    severity: "the anti-spam rule is the whole answer to 'a free transaction type invites unbounded mempool growth'. If one peg-in buys unlimited admitted intents, the bound is on entry, not on volume",
+    needs: "its own node with the ticket flag ON and a ticket planted in genesis — built automatically",
+    /**
+     * A valid ticket without any Bitcoin: admission reads the Bridge's processed-peg-in map with
+     * getStorageBytes, and genesis `contract.data` writes to that same store. So the node boots with
+     * one peg-in already "processed", which is exactly the attacker's starting position after paying
+     * once — and it removes bitcoind, header relay and confirmation timing from the result.
+     */
+    fresh: {
+      activation: 5,
+      opts: { requireBtcTicket: "true", maxExpirySpan: "100" },
+      alloc: { [BRIDGE_ADDR]: { contract: { data: { [bridgeTicketSlot(TICKET_TXID)]: TICKET_VALUE } } } },
+    },
+    conclusion: "the ticket bounds who may enter, not how much they may send. The fix is to key admission on the ESCROW rather than the txid — require an escrow bound to keccak256(H || signer), the same binding settlement already checks — so each intent needs its own derived deposit and the flood costs one Bitcoin transaction per intent. That is the design's own premise, and it makes the relaxed-admission question moot: what gets checked becomes escrow existence rather than confirmation depth.",
+    finding: "A2 and A6 both pass their own claims and disagree about what the rule is worth. A2 floods with BOGUS txids and is refused, which shows the rule EXISTS; A6 reuses one VALID txid, which shows it bounds nothing. An attack that proves a rule fires is not the same as one that proves the rule is load-bearing, and the board needed both to see it.",
+    impl: { kind: "native", load: () => import("./a6_ticket_reuse.js") },
   },
 
   // ---------------------------------------------------------------- B · entry escrow (peg-in side)
@@ -210,6 +249,19 @@ export const ATTACKS: AttackSpec[] = [
     severity: "theft of a real pegged-in input (the b1 severity, on the path that actually matters)",
     needs: "1 node + bitcoind; relays headers",
     impl: { kind: "untested", why: "needs E14's real-peg-in driver re-run with a rival intent naming the same txid" },
+  },
+  {
+    id: "b5", cls: "B", name: "a rival intent with the victim's OWN H",
+    target: "Settlement.bindingOf / _releaseInput — what the escrow is keyed on",
+    premise: "H is public the moment the intent is, so copy the victim's H and btcTxid into your own intent with a dust minOut and let a solver settle THAT — settlement recovers the user from the signature, so the dust goes to you and the whole escrow to the solver",
+    expected: "blocked",
+    expectedWhy: "the escrow binds to keccak256(H || signer), so a rival with a different key computes a different binding and commands no funds",
+    defence: "Settlement.bindingOf(H, signer), stored by depositForPegin and re-derived in _releaseInput from the signature-recovered user",
+    severity: "pre-fix: total capture of the victim's input for gas plus one wei, by anyone who could read the mempool — and the solver needed no accomplice, since it could sign the twin itself",
+    needs: "1 node, signer-bound genesis",
+    conclusion: "FIXED. The pipeline commitment was never an authenticator: settlement is outcome-based and never needs the preimage, so an opaque H is as settleable as a known one. Only the signature says who may claim, and the binding now commits to it.",
+    finding: "found by drawing the RSKIP's entry-flow diagram — the ordering forces the question of what the deposit address is derived FROM, and the answer was 'a value anyone can copy'. It was a DESIGN property, not a PoC artefact: RSKIP-176's derivation hash is built from (H, userRefundBtcAddress, lbcAddress, lpBtcAddress), none of which is the Rootstock signer, so a production deposit address would have bound to H alone in exactly the same way. The RSKIP now specifies keccak256(H || signer) as the derivation argument.",
+    impl: { kind: "native", load: () => import("./b5_same_h_rival.js") },
   },
 
   // ---------------------------------------------------------------- C · settlement atomicity

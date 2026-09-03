@@ -60,8 +60,10 @@ async function preflight(): Promise<void> {
     catch {
       console.error(
         `\nCannot reach ${node} at ${url}. Bring up the reorg stack first:\n` +
-        `  docker-compose -f stack/docker-compose.reorg.yml up -d\n` +
-        `(build the image once with the main stack if needed: docker-compose -f stack/podman-compose.yml build)\n`
+        `  cd poc && npm run stack:reorg:up\n` +
+        `or let a board run do it for you:\n` +
+        `  cd poc && npm run attacks:provision      # provisions whatever each attack declares\n` +
+        `(if the image is missing, npm run stack:up builds it — the reorg stack reuses it)\n`
       );
       process.exit(2);
     }

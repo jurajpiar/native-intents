@@ -16,7 +16,9 @@
  *   2. a.mark() appears before any a.deltas()
  *   3. every native attack's module exists and exports run()
  *   4. every registry id is unique, lowercase, and matches its class letter
- *   5. an attack declaring a non-default stack does not silently take the default one
+ *   5. an attack that controls block production declares an on-demand environment
+ *   6. an attack about fork activation runs on its own node, not a shared chain past the fork
+ *   7. the SDK's ABI copies match the last compile (a stale ABI killed a live suite run)
  *
  * Run: npm run test:board
  */
@@ -67,14 +69,34 @@ for (const spec of ATTACKS) {
     check(`${spec.id}: watch() is paired with a mark()`, marks.length > 0,
       marks.length === 0 ? "watched parties but never took a baseline" : "");
   }
-  // 5: an attack that controls block production must have asked for a stack that can
+  // 5: an attack that controls block production must have asked for an environment that can.
+  // Either a non-default stack (on-demand mining) or its own fresh node (always on-demand).
   if (/\bctx\.(mine|autoMine|partition|heal)\b/.test(src)) {
-    check(`${spec.id}: controls block production, so declares a non-default stack`,
-      spec.stack !== undefined && spec.stack !== "default",
-      spec.stack === undefined ? "uses ctx.mine/autoMine but stack is unset — it would run on the timer stack" : "");
+    const onDemand = (spec.stack !== undefined && spec.stack !== "default") || spec.fresh !== undefined;
+    check(`${spec.id}: controls block production, so declares an on-demand environment`, onDemand,
+      onDemand ? "" : "uses ctx.mine/autoMine but declares neither `stack` nor `fresh` — it would run on the timer stack");
   }
 }
 check("native attacks were found and scanned", scanned > 0, `${scanned} module(s)`);
+
+/**
+ * 6: an attack about fork activation must run on its own node.
+ *
+ * Checked across EVERY entry, not just the native ones — a1 was `wrapped` when it had precisely this
+ * bug, delegating to an experiment that could not reach a pre-activation height and asserted a pass
+ * regardless. A shared chain is always long past the fork, so "reasons about activation" and "runs on
+ * a shared chain" cannot both be true of an honest test.
+ */
+for (const spec of ATTACKS) {
+  if (spec.impl.kind === "untested") continue;
+  // Matched on the vocabulary these entries actually use. A narrower /activation/ pattern made this
+  // rule DEAD ON ARRIVAL: a1's own premise says "before the fork that legitimises it" and its target
+  // says "consensus gate", so the one entry the rule exists for did not match it.
+  const about = `${spec.premise} ${spec.target} ${spec.name}`;
+  if (!/activation|activat|rskipintent|consensus gate|before the fork|pre-fork/i.test(about)) continue;
+  check(`${spec.id}: reasons about activation, so declares its own fresh node`, spec.fresh !== undefined,
+    spec.fresh ? "" : "a shared chain is always past activation — this is how a1 asserted a pass it never tested");
+}
 
 // ---- 3: every native module exists and exports run() ------------------------------------------
 for (const spec of ATTACKS) {
@@ -125,6 +147,38 @@ for (const spec of ATTACKS) {
     check(`${spec.id}: runnable entry predicts an outcome`, spec.expected !== "untested",
       "a run cannot agree with a prediction that was never made");
   }
+}
+
+/**
+ * 7: the SDK's ABI copies must match what was last compiled.
+ *
+ * This is the failure that cost a live suite run: the Auction gained `failedAt`, the contract was
+ * recompiled and injected into genesis, and the harness died on `a.failedAt is not a function`
+ * HALFWAY THROUGH — after the assertions that mattered had already passed, so the output looked like
+ * a contract bug rather than a stale file. Eleven files turned out to be behind, not one.
+ *
+ * `compile.js` now writes these copies itself, so drift should be impossible. This check is the belt
+ * to that braces: if the two ever disagree again, it costs a second to find out instead of a run.
+ */
+const BUILD_DIR = join(here, "..", "..", "contracts", "build");
+const ABI_ALIASES: Record<string, string> = { BtcVault: "Vault" };
+if (existsSync(BUILD_DIR)) {
+  let checked = 0;
+  for (const f of readdirSync(BUILD_DIR).filter((f) => f.endsWith(".json"))) {
+    const name = f.replace(/\.json$/, "");
+    const sdkFile = join(here, "..", "src", "abi", (ABI_ALIASES[name] ?? name) + ".json");
+    if (!existsSync(sdkFile)) continue; // the SDK carries only what it uses
+    const built = JSON.parse(readFileSync(join(BUILD_DIR, f), "utf8")) as { abi: unknown[] };
+    const shipped = JSON.parse(readFileSync(sdkFile, "utf8")) as unknown;
+    // Settlement.json is a bare ABI array; everything else is {abi, bytecode}. Both shapes are live.
+    const shippedAbi = Array.isArray(shipped) ? shipped : (shipped as { abi: unknown[] }).abi;
+    checked++;
+    check(`${name}: sdk/src/abi matches contracts/build`,
+      JSON.stringify(shippedAbi) === JSON.stringify(built.abi),
+      JSON.stringify(shippedAbi) === JSON.stringify(built.abi) ? ""
+        : `stale — run \`npm run compile\` from poc/ (this is how "a.failedAt is not a function" happened mid-run)`);
+  }
+  check("ABI copies were compared", checked > 0, `${checked} contract(s)`);
 }
 
 /** attacks/<id>_<something>.ts — the naming the registry's dynamic imports rely on. */

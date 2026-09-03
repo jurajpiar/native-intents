@@ -30,8 +30,7 @@ import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Rpc, waitFor, sleep } from "../src/client.js";
-import { SETTLEMENT_ADDR } from "../src/config.js";
-import { ACTIVATION_HEIGHT } from "../experiments/_harness.js";
+import { ACTIVATION_HEIGHT, REBUILD_HINT, genesisProblems } from "../experiments/_harness.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const POC = join(here, "..", "..");
@@ -75,7 +74,8 @@ export interface AutoMine {
 }
 
 export interface StackCtx {
-  name: StackName;
+  /** "fresh" is an ephemeral single node built per attack — see ./_fresh.ts. */
+  name: StackName | "fresh";
   /** primary node — pass this to `new Attack(spec, ctx.rpc)` and to anything taking a url */
   rpc: Rpc;
   /** the second node: the rival miner, or the far side of a partition */
@@ -136,7 +136,7 @@ const alive = async (rpc: Rpc): Promise<boolean> => {
 };
 
 export class StackUnavailable extends Error {
-  constructor(readonly stack: StackName, readonly hint: string) {
+  constructor(readonly stack: StackName | "fresh", readonly hint: string) {
     super(`stack "${stack}" is not up — ${hint}`);
   }
 }
@@ -153,10 +153,12 @@ export async function ensureStack(name: StackName, opts: { provision?: boolean }
   let provisioned = false;
 
   if (!(await alive(rpc))) {
-    const up = `docker-compose -f ${def.compose} up -d`;
     if (!opts.provision) {
+      const byHand = name === "reorg" ? "npm run stack:reorg:up" : "npm run stack:up";
       throw new StackUnavailable(name,
-        `${def.what}.\n  bring it up yourself:  cd poc && ${up}\n  or let the runner do it:  npm run attacks -- ${name === "default" ? "" : "--provision "}<ids>`);
+        `${def.what}.\n` +
+        `  bring it up yourself:     cd poc && ${byHand}\n` +
+        `  or let the runner do it:  cd poc && npm run attacks -- ${name === "default" ? "" : "--provision "}<ids>`);
     }
     const [bin, pre] = compose();
     console.log(`\n  provisioning the "${name}" stack — ${def.what}`);
@@ -166,7 +168,7 @@ export async function ensureStack(name: StackName, opts: { provision?: boolean }
     } catch (e) {
       throw new StackUnavailable(name, `compose failed: ${e instanceof Error ? e.message : String(e)}\n` +
         `  the reorg stack reuses the image built by the main stack — build it once with:\n` +
-        `    cd poc && ${bin} ${[...pre, "-f", "stack/podman-compose.yml", "build"].join(" ")}`);
+        `    cd poc && npm run stack:up`);
     }
     provisioned = true;
     console.log(`  waiting for both nodes' RPC…`);
@@ -179,15 +181,9 @@ export async function ensureStack(name: StackName, opts: { provision?: boolean }
 
   const ctx = makeCtx(name, def, rpc, rpc2, provisioned);
 
-  // Genesis check AFTER readiness: the contracts are baked into the image, so a missing Settlement
-  // means a persisted DB from before they were added, not a wrong stack.
-  const code = await rpc.getCode(SETTLEMENT_ADDR).catch(() => "0x");
-  if (!code || code === "0x") {
-    throw new StackUnavailable(name,
-      `Settlement is not deployed at ${SETTLEMENT_ADDR} on this stack.\n` +
-      `  Genesis applies only to a FRESH chain, so recreate with wiped volumes:\n` +
-      `    cd poc && docker-compose -f ${def.compose} down -v && docker-compose -f ${def.compose} up -d`);
-  }
+  // Genesis check AFTER readiness: the contracts are baked into the image, so wrong or missing
+  // bytecode means a persisted DB from an older build, not a wrong stack.
+  await requireCurrentGenesis(ctx);
 
   // On-demand stacks start at height 0 and the intent rules are gated on a fork height, so nothing
   // works until someone mines past it. Doing it here means an attack never has to think about it.
@@ -253,43 +249,20 @@ function makeCtx(name: StackName, def: StackDef, rpc: Rpc, rpc2: Rpc, provisione
 }
 
 /**
- * Assert that the genesis contracts an attack needs are present AND current on this stack.
+ * Refuse to run against a node whose genesis contracts are not the ones just compiled.
  *
- * A code check alone is not enough, and this is not hypothetical: the reorg stack was built for E16,
- * which only ever touches Settlement, so its nodes happily served a chain with no Auction account at
- * all — `ensureStack` waved it through and the attack then died on its first contract call, reported
- * as "experiment broken". A stale stack is an ENVIRONMENT result. Misfiling it as a broken experiment
- * points the reader at the attack instead of at their containers.
- *
- * So each entry may carry a `probe`: calldata for a getter that must return something. That is what
- * distinguishes "no contract" from "an older contract that predates the function this attack needs" —
- * genesis is baked into the image, so an old image looks exactly like a correct one until you call it.
+ * Delegates the comparison to the harness so the experiments and the attack board cannot drift apart
+ * on what "current" means; only the failure behaviour differs (experiments exit 2, attacks throw so
+ * the runner can class it as an ENVIRONMENT result rather than a broken attack).
  */
-export async function requireContracts(
-  ctx: StackCtx,
-  needs: { addr: string; label: string; probe?: { data: string; fn: string } }[],
-): Promise<void> {
-  const missing: string[] = [];
-  for (const n of needs) {
-    const code = await ctx.rpc.getCode(n.addr).catch(() => "0x");
-    if (!code || code === "0x") { missing.push(`${n.label} has NO CODE at ${n.addr}`); continue; }
-    if (n.probe) {
-      const ret = await ctx.rpc.ethCall(n.addr, n.probe.data).catch(() => "0x");
-      if (!ret || ret === "0x") {
-        missing.push(`${n.label} at ${n.addr} has code but no ${n.probe.fn} — older bytecode than this attack needs`);
-      }
-    }
-  }
-  if (!missing.length) return;
-  const def = STACKS[ctx.name];
+export async function requireCurrentGenesis(ctx: StackCtx): Promise<void> {
+  const problems = await genesisProblems(ctx.rpc);
+  if (!problems.length) return;
   throw new StackUnavailable(ctx.name,
-    `the "${ctx.name}" stack is on stale genesis:\n` +
-    missing.map((m) => `    - ${m}`).join("\n") + "\n" +
-    `  Genesis is baked into the image and applies only to a FRESH chain, so rebuild AND wipe:\n` +
-    `    cd poc\n` +
-    `    docker-compose -f stack/podman-compose.yml build\n` +
-    `    docker-compose -f ${def.compose} down -v\n` +
-    `    docker-compose -f ${def.compose} up -d`);
+    `the "${ctx.name}" stack is not running the current contracts:\n` +
+    problems.map((m) => `    - ${m}`).join("\n") + "\n" +
+    `  Genesis applies only to a FRESH chain, and each stack keeps its OWN volumes:\n` +
+    REBUILD_HINT);
 }
 
 /** Tear down a stack this process started. Never called for one that was already up. */
@@ -301,4 +274,5 @@ export function teardown(name: StackName): void {
   catch (e) { console.error(`  teardown failed: ${e instanceof Error ? e.message : String(e)}`); }
 }
 
-export const stackWhat = (name: StackName): string => STACKS[name].what;
+export const stackWhat = (name: StackName | "fresh"): string =>
+  name === "fresh" ? "an ephemeral single node built for this attack alone" : STACKS[name].what;

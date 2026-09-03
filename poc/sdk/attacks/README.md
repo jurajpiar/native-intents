@@ -8,6 +8,9 @@ This directory re-files the same work by the surface it attacks, adds the forens
 that a claim does not, and — the part that matters most — makes the **gaps visible**. An attack surface
 with nothing written against it appears in the menu marked `UNTESTED`, not absent from it.
 
+All commands below run from **`poc/`**, not `poc/sdk/` — the thing under test is the whole PoC
+(contracts, the patched node, the stacks), not the SDK package that drives it.
+
 ```
 npm run attack                 interactive menu
 npm run attacks                run the whole board (CI form)
@@ -186,16 +189,18 @@ Attacks that changed what we believe, rather than confirming it:
 
 ## Known gaps in the board
 
-**A2** (mempool flood) is the only entry that cannot run on the default stack, which pins
-`requireBtcTicket=false`. It has been verified against a throwaway ticket-on node, which leaves a
-populated stack alone — no bitcoind, no recreated containers, ~40s to mine past activation:
+**A2** (mempool flood) needs a node started with `requireBtcTicket=true`, and the default stack pins
+it to `false`. That is process configuration rather than chain state, so the `fresh` mechanism above is
+the right home for it — `fresh: { opts: { requireBtcTicket: "true" } }` — and converting it is the next
+job. Until then it is verified by hand against a throwaway ticket-on node, which leaves a populated
+stack alone:
 
 ```
 docker run --rm -d --name rskj-ticket -p 4464:4444 \
   -e RSK_CONF=/config/node-a.conf -e JVM_OPTS=-Xmx2g \
   -e INTENT_OPTS="-Dintent.requireBtcTicket=true -Dintent.maxExpirySpan=100" \
   -v "$PWD/stack/config:/config:ro" rskj-intent:poc
-( cd sdk && RPC_A=http://localhost:4464 INTENT_REQUIRE_TICKET=true npm run attacks -- a2 )
+RPC_A=http://localhost:4464 INTENT_REQUIRE_TICKET=true npm run attacks -- a2
 docker rm -f rskj-ticket
 ```
 
@@ -216,9 +221,9 @@ permanent one.
 So a registry entry may name its infrastructure with `stack:`, and the runner brings it up:
 
 ```
-npm run attacks -- --provision m3     # provision whatever m3 declares, run it, leave it up
+npm run attacks -- --provision m3     # from poc/ — provision what m3 declares, run, leave it up
 npm run attacks -- --provision --teardown m3
-npm run stack:reorg:up                # or bring it up yourself and just run `-- m3`
+npm run stack:reorg:up                # or bring it up yourself, then just `-- m3`
 ```
 
 `_stacks.ts` declares each stack (compose file, host ports, container names) and hands the attack a
@@ -243,14 +248,58 @@ and `ctx.autoMine`. Three properties are deliberate:
   `environment` too: "your containers are stale" and "this attack is broken" point the reader at
   completely different places.
 
+### An attack can bring its own node and its own chain state
+
+Declaring a *stack* covers attacks that need on-demand mining. Two things it cannot cover, because no
+transaction can construct them:
+
+- **a height below a fork activation.** You cannot mine backwards, and a shared chain is always
+  thousands of blocks past the fork. This is not hypothetical: `a1` delegated to E13, which reported
+  `r.check("pre-activation window already passed", true)` — an unconditional pass — so the board
+  printed "attack BLOCKED · as predicted" for a consensus rule nothing had exercised.
+- **node startup flags.** `a2` needs `intent.requireBtcTicket=true`, which is process configuration.
+  It lived as a `docker run` in this README rather than on the board.
+
+So an entry may declare `fresh` instead, and get a private node built to order:
+
+```ts
+fresh: { activation: 20, opts: { requireBtcTicket: "false", maxExpirySpan: "100" } }
+```
+
+`_fresh.ts` writes a genesis and a node conf to a temp dir, runs one container on a docker-assigned
+port, hands the attack a normal `StackCtx`, and removes it in `runOne`'s `finally` — one node per
+attack, never two alive at once. rskj supports all of it without a Java change:
+
+| what the attack ships | how |
+|---|---|
+| pre-funded accounts | `alloc[addr].balance` / `.nonce` |
+| **contract storage** — escrows funded, `H`s consumed, credits, standing bids | `alloc[addr].contract.data`, applied slot by slot (`GenesisLoaderImpl:262`) |
+| its own genesis file | `genesis = /config/genesis.json` — the loader falls back to a filesystem path, so it is mounted, not baked |
+| **its own activation height** | `blockchain.config.consensusRules.rskipIntent = N`, overlaying the regtest profile |
+
+Fresh nodes always mine **on demand**, so a pre-activation window stays open until the attack closes
+it — what used to be a 40-second race against regtest's block timer is now an ordinary assertion.
+
+Three limits, stated so nobody plans around them:
+
+- **Bitcoin state cannot be shipped.** bitcoind is a separate process, so E-class attacks still need a
+  matured faucet and a relayed header backlog. They stay on a warm shared stack.
+- **Storage values are unprefixed hex, both key and value** — `DataWord.valueFromHex` and
+  `Hex.decode` (`GenesisLoaderImpl:182`). A `0x` prefix misparses silently.
+- **A wrong mapping slot is a phantom-pass generator.** It writes a real slot that simply is not the
+  one the contract reads, and the attack then runs against a starting state it only believes it has.
+  Use `slot()` / `word()` to compute them, and `verifyAlloc` to read every shipped value back through
+  the contract's own getters *before* asserting anything else.
+
+Why forward-from-fresh rather than `evm_snapshot`/`evm_revert`, which is far cheaper: revert is the
+same fork-choice and state-reversion machinery that `f1`/`f2` exist to attack. Using it as test
+infrastructure would make every "isolated" result depend on the correctness of something under test.
+
 Genesis lives in the image and applies only to a **fresh** chain, so after the contracts change, a
 stack whose volumes predate them needs wiping, not restarting:
 
 ```
-cd poc
-docker-compose -f stack/podman-compose.yml build
-docker-compose -f stack/docker-compose.reorg.yml down -v
-docker-compose -f stack/docker-compose.reorg.yml up -d
+cd poc && npm run stack:reset      # wipes BOTH stacks' volumes, rebuilds, starts the everyday one
 ```
 
 Wrapped experiments need no changes to move: they read `RPC_A`/`RPC_B` from the environment, and the
