@@ -13,13 +13,18 @@
  *                    a bot can react, ten blocks have passed. The window is real in blocks and zero in
  *                    wall-clock time.
  *   DECAY SQUEEZE    Let a rival win the auction honestly, then simply decline to mine execute() until
- *                    exclusivity decays, and settle directly at minOut. The rival's higher bid never
- *                    reaches the user.
+ *                    exclusivity decays, and settle directly at minOut. FIXED — this half is now a
+ *                    regression test: exclusivity decays GRACE blocks after execute() is SEEN to
+ *                    fail, not GRACE blocks after the deadline, so withholding execute() releases
+ *                    nothing and the direct settle is still refused.
  *
- * The second one is the more uncomfortable finding, because the decay is OUR OWN FIX: GRACE was added
- * so that an auction whose execute() reverts forever cannot brick an intent (S4). This shows what that
- * safety valve costs — it is also a documented, permissionless route to the floor price for whoever
- * controls block production. That trade is worth stating out loud rather than discovering later.
+ * The second one was the more uncomfortable finding, because the decay was OUR OWN FIX: GRACE was
+ * added so an auction whose execute() reverts forever cannot brick an intent (S4), and it doubled as
+ * a permissionless route to the floor price for whoever produces blocks. Worse, for an RBTC intent it
+ * had no legitimate trigger at all — the auction holds the winning bid, so the settle inside execute()
+ * cannot fail for want of funds, and the only party who ever reached a time-based decay was one who
+ * chose not to execute. Keying the decay on demonstrated failure keeps the safety valve and removes
+ * the lever.
  *
  * Note what is NOT at risk in either case: minOut is honoured, H is consumed exactly once, and the
  * outbid rival can reclaim its stake. The loss is the SURPLUS the auction exists to discover — a
@@ -35,7 +40,7 @@
 import { Contract, JsonRpcProvider, Network, NonceManager, Wallet, getBytes, hexlify, randomBytes } from "ethers";
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
 import { depositForPegin, peginOf } from "../src/settlement.js";
-import { auction, placeBid, bidOf, executeAuction, lockedUntil, reclaimBid } from "../src/auction.js";
+import { auction, placeBid, bidOf, executeAuction, lockedUntil, failedAtOf } from "../src/auction.js";
 import { Solver } from "../src/solver.js";
 import { AUCTION_ADDR, CHAIN_ID, COW_KEY, SETTLEMENT_ADDR } from "../src/config.js";
 import auctionArtifact from "../src/abi/Auction.json" with { type: "json" };
@@ -211,37 +216,42 @@ export async function run(spec: AttackSpec, ctx: StackCtx): Promise<number> {
 
   a.step(`mine past the deadline AND the ${GRACE}-block grace, without ever including execute()`);
   await ctx.mineTo(Number(b3.deadline) + GRACE);
-  a.check("exclusivity has decayed — the auction no longer owns the intent",
-    (await lockedUntil(attackerAuction, p3.H)) === 0n, `lockedUntil == 0 at block ${await rpc.blockNumber()}`);
+  a.check("exclusivity did NOT decay — nothing has been shown to fail",
+    (await lockedUntil(attackerAuction, p3.H)) === b3.deadline,
+    `lockedUntil == ${await lockedUntil(attackerAuction, p3.H)} at block ${await rpc.blockNumber()} (0 would mean decayed)`);
+  a.check("and no execute failure is on record", (await failedAtOf(attackerAuction, p3.H)) === 0n);
 
-  a.step("settle it directly at minOut, going around the higher bid entirely");
+  a.step("try to settle directly at minOut anyway, going around the higher bid");
   const direct = await mined(attackerSolver.solve(p3.intent.rawHex, MINOUT), "direct settle at the floor");
-  a.check("the direct settle SUCCEEDED despite a higher standing bid", direct.ok, direct.reason ?? "");
-  a.check("H consumed", await isConsumed((to, d) => rpc.ethCall(to, d), p3.H));
+  a.check("the direct settle was REFUSED — the auction still owns the intent", !direct.ok, direct.reason ?? "no reason");
+  a.check("refused because the auction owns it, not incidentally",
+    /auction owns this intent/.test(direct.reason ?? ""), direct.reason ?? "");
+  a.check("H untouched", !(await isConsumed((to, d) => rpc.ethCall(to, d), p3.H)));
+
+  a.step("so the price the auction found is the price the user gets: execute it");
+  const exec3 = await mined(executeAuction(attackerAuction, p3.intent.rawHex), "execute");
+  a.check("execute succeeded long after the window closed", exec3.ok, exec3.reason ?? "");
   const d2 = await a.deltas();
   const decayed = d2.get("user 3 (decay squeeze)") ?? 0n;
-  a.check("the user was paid minOut, not the winning bid", decayed === MINOUT,
-    `${decayed} wei, while the standing bid was ${b3.amount}`);
+  a.check("the user was paid the WINNING BID, not the floor", decayed === b3.amount,
+    `${decayed} wei — withholding execute() bought the attacker nothing`);
 
-  a.step("check the bounds: the outbid rival must be able to get its stake back");
-  const back = await mined(reclaimBid(rivalAuction, p3.H), "rival reclaims");
-  a.check("the rival reclaimed its bid (H is consumed, so reclaim is unlocked)", back.ok, back.reason ?? "");
-  const d3 = await a.deltas();
-  a.check("the rival is whole apart from gas", (d3.get("rival solver") ?? 0n) > RIVAL_BID - 10_000_000_000_000n,
-    `${d3.get("rival solver")}`);
-
-  a.note("so GRACE cuts both ways: it stops a reverting auction bricking an intent (the S4 fix), and it");
-  a.note("hands whoever controls block production a permissionless route to the floor price.");
-  a.note("Nothing here is stolen — minOut holds, H is consumed once, stakes are reclaimable. What is");
-  a.note("lost is price discovery, which is the entire product of an auction.");
+  a.note("the decay squeeze is CLOSED: exclusivity now ends GRACE blocks after execute() is SEEN to");
+  a.note("fail, not GRACE blocks after the deadline, so declining to include execute() decays nothing.");
+  a.note("The S4 safety valve survives — a genuinely wedged auction still releases the intent — but it");
+  a.note("takes one transaction to demonstrate the failure, which any solver wanting the intent will send.");
+  a.note("What the trade costs: the user's old 'minOut after GRACE whatever happens' fallback is now");
+  a.note("'the best bid, or nothing until expiry'. Worth it only because withholding now gains nobody anything.");
 
   // Stop the ticker: an attack owns block production only while it runs. Leaving it on used to hang
   // the process after the board finished, since a live setInterval keeps Node's event loop alive.
   // Anything that runs next starts its own.
   await ctx.autoMine.stop();
-  const observed: Outcome = squeezed < controlPaid || decayed < b3.amount ? "succeeds" : "blocked";
   a.check("both halves of the attack were actually exercised, not assumed",
     controlPaid === RIVAL_BID && squeezed === FLOOR_BID && b3.amount === RIVAL_BID,
     `control ${controlPaid} · squeezed ${squeezed} · standing bid ${b3.amount}`);
+  // The WINDOW squeeze still lands, so the attack as a whole still works — only its second half is
+  // closed. Scoring it "blocked" because one of two levers was removed would overstate the fix.
+  const observed: Outcome = squeezed < controlPaid || decayed < b3.amount ? "succeeds" : "blocked";
   return a.finish(observed);
 }

@@ -17,6 +17,7 @@ pragma solidity 0.8.19;
  */
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address who) external view returns (uint256);
 }
 
 contract Settlement {
@@ -108,6 +109,38 @@ contract Settlement {
         }
     }
 
+    /**
+     * Deliver `amount` of an ERC-20 to `to`, and verify it ARRIVED.
+     *
+     * The obvious form — `require(token.transferFrom(...))` — checks what the token SAYS, not what the
+     * user received, and those differ for two common kinds of token. A fee-on-transfer token moves 90%
+     * and returns true; an outright liar moves nothing and returns true. In both cases the settlement
+     * succeeded, H was consumed and the input released, while the user got less than the minimum they
+     * signed for. `minOut` has to mean "arrived", not "asked", or it guarantees nothing.
+     *
+     * So the balance is measured either side of the call and the DELTA is what must reach minOut. That
+     * is the only check that cannot be talked out of by the token's own return value.
+     *
+     * The call is also made low-level rather than through the typed interface, for the pre-EIP-20
+     * tokens that return no data at all: Solidity cannot decode a missing bool, so the typed form
+     * reverts on tokens that transferred perfectly well. Empty returndata is accepted as success, and
+     * the delta check is what makes that safe — a non-token address returns empty too, and moves
+     * nothing, so it fails on the delta instead of passing on the silence.
+     *
+     * Not defended against, because it cannot be: a token whose issuer can claw the balance back after
+     * this transaction. No on-chain check survives an adversarial issuer, which is why the output asset
+     * being the USER'S OWN signed choice matters — wallets must not offer arbitrary tokens as outputs.
+     */
+    function _deliverToken(address token, address to, uint256 amount) internal {
+        uint256 before = IERC20(token).balanceOf(to);
+        (bool ok, bytes memory ret) = token.call(
+            abi.encodeWithSelector(IERC20.transferFrom.selector, msg.sender, to, amount));
+        require(ok, "erc20 transfer failed");
+        // A token that returns data must return `true`; one that returns nothing is the pre-EIP-20 form.
+        require(ret.length == 0 || abi.decode(ret, (bool)), "erc20 returned false");
+        require(IERC20(token).balanceOf(to) - before >= amount, "erc20 under-delivered");
+    }
+
     /// Claim accrued credits. Effects-first: a failed transfer reverts only this call, never the ledger.
     function withdraw() external {
         uint256 amt = credit[msg.sender];
@@ -187,7 +220,7 @@ contract Settlement {
             _pay(msg.sender, excess); // best-effort refund — an unpayable solver cannot revert delivery
         } else {
             require(msg.value == 0, "no rbtc for token intent");
-            require(IERC20(outToken).transferFrom(msg.sender, user, minOut), "erc20 transfer failed");
+            _deliverToken(outToken, user, minOut);
         }
 
         uint256 input = _releaseInput(btcTxid, H);

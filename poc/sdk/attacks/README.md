@@ -91,23 +91,41 @@ Attacks that changed what we believe, rather than confirming it:
   intents**, and an always-on seed bid (what the playground's broker does) is the practical
   mitigation. Nothing in the board covered miner-level behaviour before this class existed.
 
-- **M3 — GRACE cuts both ways, and a block-height deadline is not a clock.** Both auction limits are
-  block counts, so a block producer does not race the auction, it *moves* it: bid the floor and mine
-  the whole window out and rivals never get to enter; or let a rival win honestly, decline to include
-  `execute()` until exclusivity decays, and settle directly at `minOut` around the higher standing
-  bid. The second half is the uncomfortable one, because the decay is **our own fix** — GRACE was
-  added so a persistently reverting `execute()` cannot brick an intent (S4), and it is simultaneously
-  a documented, permissionless route to the floor price. Nothing is stolen: `minOut` binds, `H` is
-  consumed once, the outbid rival reclaims its stake. What is lost is price discovery, which is the
-  whole product of an auction. Both halves of that trade now sit in the RSKIP rather than only in the
-  fix's commit message.
+- **M3 (decay half) — FIXED, and the fix exposed that the old rule had no honest use.** Exclusivity
+  now ends GRACE blocks after `execute()` is *seen to fail*, not GRACE blocks after the deadline. The
+  argument that settled it: for an RBTC intent the auction holds the winning bid, so the settlement
+  inside `execute()` cannot fail for want of funds — meaning the only party who ever reached a
+  time-based decay was one who **chose not to execute**. The safety valve was only ever walked by the
+  attacker. E18 and E21 asserted the old behaviour and now assert its inverse. The trade, stated
+  plainly: the user's "minOut after GRACE whatever happens" fallback becomes "the best bid, or nothing
+  until expiry" — acceptable only because withholding `execute()` now gains the withholder nothing.
+  The try/catch this needs is guarded by `MIN_EXECUTE_GAS`, without which EIP-150's 63/64 rule would
+  let anyone under-gas `execute()` so the inner settle dies while the catch still records a failure.
 
-- **C7 — `minOut` means "asked", not "arrived".** The token branch checks `transferFrom`'s return
-  value, never a balance delta, so a fee-on-transfer token short-changes the user and an outright
-  liar delivers nothing — in both cases `H` is consumed and the input released. The loss falls
-  entirely on the user who *named that token in their own signed intent*, so it is a wallet-safety
-  rule (never offer arbitrary tokens as outputs) rather than a third-party exploit. Return-less
-  (pre-EIP-20) tokens are simply unusable as outputs, and fail in the safe direction.
+- **M3 (window half) — still open, and not a parameter problem.** The bidding window is a block
+  count, so a producer does not race the auction, it *moves* it: bid the floor, mine the whole window
+  out in no wall-clock time, and rivals never get to enter. Switching the unit does not fix it —
+  a block's timestamp must exceed its parent's but may run up to `NEW_BLOCK_MAX_SECONDS_IN_THE_FUTURE`
+  (**540s** on Rootstock; `Constants.java:61` — the "15 minutes" in `BlockChainImpl`'s comment is
+  stale) ahead of real time, so a timestamped window is closeable instantly too, just not repeatedly.
+  That is a rate limit, not a defence. Nothing is stolen: `minOut` binds, `H` is consumed once, the
+  outbid rival reclaims its stake. What is lost is price discovery, which is the whole product of an
+  auction. The structural answer is that on-chain, time-windowed discovery is capturable by whoever
+  orders blocks — discovery belongs off-chain, with the chain enforcing the floor and settling.
+
+- **C7 — `minOut` meant "asked", not "arrived". FIXED.** The token branch checked `transferFrom`'s
+  return value and never a balance delta, so a fee-on-transfer token short-changed the user and an
+  outright liar delivered nothing — with `H` consumed and the input released in both cases. Settlement
+  now measures the user's balance either side of the transfer and requires the delta to reach
+  `minOut`, so both cases revert with nothing consumed and the failure stays inside the solver's own
+  transaction. The fix reversed a second, quieter defect in the same line: the typed call could not
+  decode a missing bool, so honest pre-EIP-20 tokens were *refused* — they now settle normally, and
+  accepting empty returndata is safe precisely because a non-token address also returns empty and
+  fails on the delta. The Auction's token-bid escrow had the identical defect and got the same rule,
+  because a bid recorded larger than the escrow actually held is the same bug wearing different
+  clothes. What remains undefendable: a token whose issuer claws the balance back later — which is
+  why the output asset being the user's own signed choice still matters.
+
 - **C5 — the pull-payment cap closed a reentrancy surface it was not written for.** `PUSH_GAS =
   30_000` was added to `_pay` so an unpayable payee could not revert a settlement (F1-F4). Because
   30,000 gas does not cover one `SSTORE` (20,000) plus the cold `SLOAD`s before it, a contract

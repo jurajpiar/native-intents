@@ -58,6 +58,14 @@ export async function bidOf(a: Contract, H: Uint8Array | string): Promise<{ bidd
   const b = await a.bids(H);
   return { bidder: b.bidder, amount: b.amount, deadline: b.deadline };
 }
+/**
+ * Block at which execute() was first seen to fail for H, or 0 if it never has.
+ * Exclusivity decays GRACE blocks after THIS, not after the bidding deadline.
+ */
+export async function failedAtOf(a: Contract, H: Uint8Array | string): Promise<bigint> {
+  return a.failedAt(H);
+}
+
 export async function lockedUntil(a: Contract, H: Uint8Array | string): Promise<bigint> {
   return a.lockedUntil(H);
 }

@@ -9,20 +9,24 @@
  *  part 2: an UNPAYABLE OUTBID BIDDER can no longer block price discovery — a higher bid
  *          succeeds and the refund downgrades to a credit. Pre-fix: bid() reverted
  *          "outbid refund failed", freezing the auction at the griefer's price.
- *  part 3: EXCLUSIVITY DECAYS — if execute() has not landed within GRACE blocks of the
- *          deadline, lockedUntil() returns 0 and direct settlement reopens at minOut, so a
- *          persistently failing auction cannot hold the intent hostage until expiry.
+ *  part 3: EXCLUSIVITY DOES NOT DECAY ON TIME — GRACE blocks past the deadline with nothing
+ *          having failed, the lock still holds and a direct settle at minOut is still refused, so a
+ *          producer cannot take an auctioned intent at the floor simply by withholding execute().
+ *  part 4: BUT THE SAFETY VALVE REMAINS — once execute() is actually attempted and the settlement
+ *          inside it reverts, that failure is RECORDED (execute returns rather than reverting, or
+ *          the record would roll back with it) and exclusivity ends GRACE blocks later.
  *
  * Falsifier: execute() reverts with an unpayable winner (the brick survives), an unpayable
  * outbid bidder blocks higher bids, a failed withdraw corrupts or drains the credit ledger,
- * or the lock fails to decay (or decays while still inside the grace window).
+ * the lock decays with nothing having failed (the M3 squeeze reopens), or a demonstrated
+ * failure never releases the intent (the S4 brick returns).
  *
  * Needs the hardened genesis auction (pull-payments + GRACE): down -v + rebuild if stale.
  */
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
 import { Solver } from "../src/solver.js";
 import { depositForPegin } from "../src/settlement.js";
-import { auction, placeBid, executeAuction, reclaimBid, bidOf, withdrawCredit, creditOf, lockedUntil } from "../src/auction.js";
+import { auction, placeBid, executeAuction, reclaimBid, bidOf, withdrawCredit, creditOf, lockedUntil, failedAtOf } from "../src/auction.js";
 import { Report, preflight, requireSettlement, rpcA, fundAccount, waitReceipt, succeeded, reverted } from "./_harness.js";
 import { AUCTION_ADDR, CHAIN_ID, COW_KEY, RBTC } from "../src/config.js";
 import { waitFor } from "../src/client.js";
@@ -44,15 +48,23 @@ function cowWallet(rpcUrl: string): Wallet {
   return new Wallet(COW_KEY, provider);
 }
 
-/** A fresh intent with its peg-in escrow deposited and the raw tx broadcast. */
-async function freshIntent() {
+/**
+ * A fresh intent with its peg-in escrow deposited and the raw tx broadcast.
+ *
+ * `expirySpan` is a parameter because part 4 needs an intent that can be allowed to EXPIRE within a
+ * test's patience: letting it die is the cheapest way to make the settlement inside execute() revert
+ * for real, which is what exclusivity now decays from. The auction requires WINDOW < span, so the
+ * short form still has to leave room for a full bidding window.
+ */
+async function freshIntent(expirySpan = 90) {
   const btcTxid = getBytes(randomBytes(32));
   const user = freshWallet();
   const H = randomH();
   await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, hexlify(H)));
-  const intent = buildIntent(user, { H, btcTxid, expiry: (await rpcA.blockNumber()) + 90, minOut: MINOUT, outputToken: RBTC });
+  const expiry = (await rpcA.blockNumber()) + expirySpan;
+  const intent = buildIntent(user, { H, btcTxid, expiry, minOut: MINOUT, outputToken: RBTC });
   await rpcA.sendRaw(intent.rawHex);
-  return { user, H, intent };
+  return { user, H, intent, expiry };
 }
 
 async function main(): Promise<number> {
@@ -70,7 +82,7 @@ async function main(): Promise<number> {
   }
   const r = new Report(
     "E18 failure containment",
-    "an unpayable winner or outbid bidder loses alone (pull-payment credits), and exclusivity decays GRACE blocks after the deadline instead of holding the intent to expiry"
+    "an unpayable winner or outbid bidder loses alone (pull-payment credits), and exclusivity decays GRACE blocks after execute() is SEEN TO FAIL — never on elapsed time alone, which would hand the intent to whoever withholds execute()"
   );
 
   const cow = cowWallet(rpcA.url);
@@ -120,7 +132,14 @@ async function main(): Promise<number> {
   const s2delta = BigInt(await rpcA.getBalance(new Wallet(s2key).address)) - s2before;
   r.check("honest winner made whole (input, net of gas)", s2delta > INPUT - GAS_BOUND * 2n, `delta=${s2delta}`);
 
-  // ---- part 3: exclusivity DECAYS — a never-executing auction cannot hold the intent to expiry ----
+  // ---- part 3: exclusivity decays on DEMONSTRATED FAILURE, not on elapsed time ----------------
+  //
+  // This part used to assert the opposite: wait GRACE blocks past the deadline and a direct settle
+  // reopens at minOut. That rule handed every auctioned intent to whoever controlled block
+  // production — decline to include execute(), wait, then settle at the floor around a higher bid
+  // (attack M3). And for an RBTC intent it had no legitimate use at all: the auction holds the
+  // winning bid, so the settle inside execute() cannot fail for want of funds. The only party who
+  // ever reached a time-based decay was one who chose not to execute.
   const p3 = await freshIntent();
   await waitReceipt(rpcA, await placeBid(a1, p3.intent.rawHex, BID));
   const bid3 = await bidOf(a1, p3.H);
@@ -128,20 +147,47 @@ async function main(): Promise<number> {
 
   await waitFor(async () => BigInt(await rpcA.blockNumber()) >= bid3.deadline, 60000, 1000);
   const inGrace = await waitReceipt(rpcA, await solver2.solve(p3.intent.rawHex, MINOUT));
-  r.check("inside the grace window the lock still holds (no execute front-run)", reverted(inGrace), inGrace ? inGrace.status : "no receipt");
+  r.check("past the deadline, the lock still holds (no execute front-run)", reverted(inGrace), inGrace ? inGrace.status : "no receipt");
 
   await waitFor(async () => BigInt(await rpcA.blockNumber()) >= bid3.deadline + grace, 90000, 1000);
-  r.check("lockedUntil reports 0 after deadline + GRACE", (await lockedUntil(a1, p3.H)) === 0n);
+  r.check("GRACE blocks later the lock STILL holds — nothing has failed", (await lockedUntil(a1, p3.H)) === bid3.deadline,
+    `lockedUntil=${await lockedUntil(a1, p3.H)} (was 0 under the old time-based rule)`);
   const late = await waitReceipt(rpcA, await solver2.solve(p3.intent.rawHex, MINOUT));
-  r.check("direct settle reopens at minOut after decay (pre-fix: hostage until expiry)", succeeded(late), late ? late.status : "no receipt");
-  r.check("user received minOut (surplus forfeited — the documented decay trade-off)", BigInt(await rpcA.getBalance(p3.user.address)) === MINOUT);
+  r.check("so a direct settle at minOut is still REFUSED — the M3 decay squeeze is closed", reverted(late), late ? late.status : "no receipt");
+  r.check("no failure has been recorded, because none happened", (await failedAtOf(a1, p3.H)) === 0n);
+
+  const userBefore3 = BigInt(await rpcA.getBalance(p3.user.address));
+  r.check("and the auction still executes, paying the BEST BID rather than the floor",
+    succeeded(await waitReceipt(rpcA, await executeAuction(a1, p3.intent.rawHex))));
+  r.check("user received the best bid, not minOut", BigInt(await rpcA.getBalance(p3.user.address)) - userBefore3 === BID,
+    `delta=${BigInt(await rpcA.getBalance(p3.user.address)) - userBefore3}`);
+
+  // ---- part 4: the safety valve still exists, but a real failure has to be shown -------------
+  //
+  // Letting the intent EXPIRE is the cheapest way to make the settle inside execute() genuinely
+  // revert, which is what the decay now keys on. The intent is worthless by then, so this tests the
+  // MECHANISM (record → GRACE → release) rather than a scenario worth rescuing.
+  const p4 = await freshIntent(20); // short-lived on purpose: expiry is the cheap way to wedge it
+  await waitReceipt(rpcA, await placeBid(a1, p4.intent.rawHex, BID));
+  console.log(`p4: waiting for the intent to expire at block ${p4.expiry} so execute() genuinely fails…`);
+  await waitFor(async () => BigInt(await rpcA.blockNumber()) >= BigInt(p4.expiry), 180000, 1000);
+
+  const failedExec = await waitReceipt(rpcA, await executeAuction(a1, p4.intent.rawHex));
+  r.check("execute() on a wedged auction does NOT revert — it records the failure", succeeded(failedExec),
+    failedExec ? failedExec.status : "no receipt");
+  const noted = await failedAtOf(a1, p4.H);
+  r.check("the failure is on record (a revert would have rolled it back)", noted > 0n, `failedAt=${noted}`);
+  r.check("the auction stayed open for a retry, not closed", (await lockedUntil(a1, p4.H)) !== 0n);
+  await waitFor(async () => BigInt(await rpcA.blockNumber()) >= noted + grace, 90000, 1000);
+  r.check("GRACE blocks after the recorded failure, exclusivity decays", (await lockedUntil(a1, p4.H)) === 0n);
 
   const cowBefore = BigInt(await rpcA.getBalance(cow.address));
-  r.check("stale bidder reclaims its full escrow (H consumed)", succeeded(await waitReceipt(rpcA, await reclaimBid(a1, p3.H))));
+  r.check("stale bidder reclaims its full escrow", succeeded(await waitReceipt(rpcA, await reclaimBid(a1, p4.H))));
   const reclaimed = BigInt(await rpcA.getBalance(cow.address)) - cowBefore;
   r.check("reclaim returned the bid (minus gas)", reclaimed > BID - GAS_BOUND, `delta=${reclaimed}`);
 
-  console.log("\nfailure is now contained: unpayable payees lose alone, and a stuck auction degrades to open competition at minOut instead of killing the intent.");
+  console.log("\nfailure is contained: unpayable payees lose alone, and exclusivity ends when execute() is");
+  console.log("SEEN to fail rather than when a timer expires — so withholding execute() no longer wins the intent.");
   return r.done();
 }
 
