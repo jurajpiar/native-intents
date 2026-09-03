@@ -55,18 +55,40 @@ Prerequisites: podman + podman-compose, and Node 20+. Build needs network egress
 Maven, deps.rsklabs.io). The rskj image build is heavy and takes a while the first time.
 
 ```
-# 1. build the patched rskj image (run from the REPO ROOT, so the rskj/ clone is in context)
-podman build -f poc/stack/Containerfile.rskj -t rskj-intent:poc .
+# everything runs from poc/ — the thing under test is the whole PoC, not just the SDK
 
-# 2. bring up bitcoind + two rskj nodes
-podman-compose -f stack/podman-compose.yml up -d
+# 1. one-time: install the harness's dependencies
+npm run install:sdk
 
-# 3. run the harness
-cd sdk
-npm install
-npm test          # offline: verifies the intent wire-encoding is byte-exact for rskj
-npm run all       # runs the full suite (E1 … E18, minus E8/E9/E13/E14/E16 which need special setups)
+# 2. bring up bitcoind + two rskj nodes (builds the image only if the tag is missing)
+npm run stack:up
+
+# 3. run things
+npm test                    # offline: wire-encoding, revert-decoding, and the attack board's own rules
+npm run all                 # the experiment suite (E1 … E23, minus the ones needing special setups)
+npm run attacks             # the attack board — every runnable attack, with its verdict
+npm run attacks -- a1 c7    # or named ones; `npm run attacks -- list` prints the whole board
+npm run sdk -- e19          # any individual experiment by its script name
 ```
+
+Two stacks exist and they are **separate compose projects with their own volumes**, so wiping one does
+not wipe the other. `npm run stack:down` wipes both; `npm run stack:reset` wipes both and rebuilds the
+everyday one. The second (on-demand mining, for reorg and block-ordering attacks) comes up on demand
+via `npm run attacks -- --provision <id>`, or by hand with `npm run stack:reorg:up`.
+
+`stack:up` does **not** force a rebuild — ask for one with `stack:rebuild` (or `stack:build` alone) when
+you have patched `rskj/`. That distinction matters because the genesis carrying the settlement and
+auction bytecode lives *inside* the rskj tree (`rskj-core/src/main/resources/genesis/rsk-dev.json`), so a
+contracts change means a real rebuild, while a config-only change does not — `stack/config` is
+bind-mounted. A rebuild no longer re-downloads anything: `Containerfile.rskj` keeps `GRADLE_USER_HOME` on
+a persistent cache mount (~450 MB: the Gradle distribution, the dependency jars, the task-output build
+cache) and runs `configure.sh` above the source `COPY`, so patching rskj costs ~20s instead of a fresh
+download of the world. `npm run stack:prune` reclaims orphaned build stages if a rebuild loop got away
+from you.
+
+Genesis applies only to a **fresh** chain, so after the contracts change a node on a persisted DB keeps
+serving the old bytecode. Every entry point now compares the deployed code against what `npm run
+compile` produced and refuses to run against a stale node, naming which contract drifted.
 
 Node A RPC is on `http://localhost:4444`, node B on `http://localhost:4445`. Override with the `RPC_A` /
 `RPC_B` env vars (fish: `set -x RPC_A http://localhost:4444`).

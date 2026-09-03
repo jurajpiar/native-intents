@@ -58,7 +58,7 @@ settle. From `poc/`:
 ```
 docker-compose -f stack/podman-compose.yml build            # once, if rskj-intent:poc isn't built yet
 docker-compose -f stack/docker-compose.reorg.yml up -d
-( cd sdk && npm run e16 )
+npm run sdk -- e16
 docker-compose -f stack/docker-compose.reorg.yml down -v
 ```
 
@@ -123,7 +123,7 @@ threat class — admission, entry escrow, settlement atomicity, auction, exit, r
 outcome declared per attack and the untested surfaces listed rather than omitted:
 
 ```
-cd ../sdk && npm run attack          # menu
+npm run attack                       # menu (from poc/)
 npm run attacks                      # whole board, CI form
 ```
 

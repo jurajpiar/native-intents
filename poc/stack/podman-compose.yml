@@ -1,6 +1,10 @@
 # Native-intent PoC stack. The image builds from the LOCAL rskj checkout at the repo root (rskj/),
 # which carries the intent patch applied directly. Run from the repo root:
-#   docker-compose -f poc/stack/podman-compose.yml up -d --build
+#   docker-compose -f poc/stack/podman-compose.yml up -d            # builds only if the tag is missing
+#   docker-compose -f poc/stack/podman-compose.yml up -d --build    # force a rebuild after patching rskj/
+#
+# Prefer `up -d`. `--build` on every start is what left 17 orphaned 2 GB build stages behind; the
+# Containerfile's gradle cache mount now makes a genuine rebuild cheap, so ask for one when you mean it.
 #
 # Services:
 #   bitcoind  regtest BTC node (harness builds BTC txs / drives peg-ins here)

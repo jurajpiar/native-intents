@@ -9,6 +9,20 @@
 #
 # The repo-root .dockerignore keeps rskj/.git and build artifacts out of the context. Version info
 # normally comes from git; without .git the build falls back to the COMMIT_* env vars set below.
+#
+# NOTHING HERE SHOULD RE-DOWNLOAD ON A SOURCE EDIT. Two mechanisms keep that true, and both matter
+# because patching rskj/ is the whole point of this PoC — every edit invalidates the source COPY:
+#   1. configure.sh (which curls the gradle wrapper jar) runs ABOVE the source COPY, off the gradle
+#      scaffolding alone, so a source edit never re-fetches it.
+#   2. GRADLE_USER_HOME is a persistent cache mount, so the Gradle 8.6 distribution, the whole Maven
+#      dependency set and the task-output build cache survive across builds even when every layer
+#      below the source COPY is rebuilt. Verified on podman 6.0.2 / buildah.
+# If you find yourself watching Gradle download the world again, one of those two broke.
+#
+# The cache mount outlives even `--no-cache`, which is the point but also the one gotcha: to force a
+# genuinely clean dependency fetch (e.g. to re-check gradle/verification-metadata.xml from scratch) the
+# cache has to be removed from inside the podman machine, where buildah keeps it:
+#   podman machine ssh 'sudo rm -rf /var/tmp/buildah-cache-$(id -u)'    # ~450 MB, refetched next build
 
 # ---- build stage ----
 FROM docker.io/library/eclipse-temurin:17-jdk AS build
@@ -17,16 +31,28 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-COPY rskj/ /src/
+ENV GRADLE_USER_HOME=/root/.gradle
+
+# Gradle scaffolding FIRST, source SECOND. configure.sh needs only these, and it downloads the
+# wrapper jar into gradle/wrapper/ — a later COPY merges over this layer without deleting it.
+COPY rskj/configure.sh rskj/gradlew rskj/settings.gradle rskj/build.gradle /src/
+COPY rskj/gradle/ /src/gradle/
+# configure.sh mkdir's ./rskj-core/libs, so that parent has to exist before the source arrives.
+RUN chmod +x configure.sh gradlew \
+ && mkdir -p rskj-core \
+ && ./configure.sh
 
 # rskj-core/build.gradle resolves branch/hash from these when `git` is unavailable (no .git in context)
 ENV COMMIT_BRANCH=native-intent-poc \
     COMMIT_HASH=local
 
-# build the fat jar (skip tests; the upstream gpg/sha verify is dropped — the tree is patched by design)
-RUN chmod +x configure.sh gradlew \
- && ./configure.sh \
- && ./gradlew --no-daemon clean build -x test \
+COPY rskj/ /src/
+
+# The fat jar (skip tests; the upstream gpg/sha verify is dropped — the tree is patched by design).
+# No `clean`: the build dir is not cached, so there is never anything to clean. --build-cache reuses
+# task outputs from $GRADLE_USER_HOME/caches/build-cache-1, which lives in the cache mount.
+RUN --mount=type=cache,target=/root/.gradle,sharing=locked \
+    ./gradlew --no-daemon --build-cache build -x test \
  && cp $(ls rskj-core/build/libs/rskj-core-*-all.jar | head -n1) /rsk.jar
 
 # ---- runtime stage ----

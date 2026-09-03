@@ -9,6 +9,8 @@
     "test": "tsx test/encoding.test.ts",
     "test:forensics": "tsx test/forensics.test.ts",
     "test:board": "tsx test/board.test.ts",
+    "test:reconstruct": "tsx test/reconstruct.test.ts",
+    "test:all": "npm run test && npm run test:forensics && npm run test:board && npm run test:reconstruct",
     "diag": "tsx experiments/diag.ts",
     "e1": "tsx experiments/e1_zero_balance_admission.ts",
     "e1b": "tsx experiments/e1b_gossip.ts",
@@ -36,19 +38,20 @@
     "attack": "tsx attacks/run.ts",
     "attacks": "tsx attacks/run.ts -- --default-all",
     "attacks:provision": "tsx attacks/run.ts -- --default-all --provision",
-    "stack:reorg:up": "docker-compose -f ../stack/docker-compose.reorg.yml up -d",
-    "stack:reorg:down": "docker-compose -f ../stack/docker-compose.reorg.yml down -v",
     "e18": "tsx experiments/e18_failure_containment.ts",
     "e20": "tsx experiments/e20_exit_containment.ts",
     "e21": "tsx experiments/e21_credit_claims.ts",
     "e22": "tsx experiments/e22_exit_bond_expiry.ts",
-    "e23": "tsx experiments/e23_entry_binding.ts"
+    "e23": "tsx experiments/e23_entry_binding.ts",
+    "e24": "tsx experiments/e24_mempool_sourced_settlement.ts"
   },
   "dependencies": {
     "ethers": "^6.13.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "jsdom": "^25.0.0",
+    "mermaid": "^11.17.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   }
