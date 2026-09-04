@@ -61,7 +61,7 @@ sequenceDiagram
     participant SC as Settlement contract
 
     Note over U,W: commit first — nothing here has touched a chain yet
-    U->>U: H = keccak256(pipeline)
+    U->>U: pick H — a unique 32-byte identifier for this intent
     U->>U: binding = keccak256(H || signer)
     W->>W: deposit address = derive(federation, Settlement, binding, refund addr)
     U->>U: build + sign the BTC tx to that address — btcTxid is now fixed
@@ -91,7 +91,7 @@ sequenceDiagram
     S->>SC: settle(rawIntentTx) — an ordinary gas-paying transaction
     SC->>SC: STATICCALL parse → (user, H, btcTxid, E, minOut, outputToken)
     SC->>SC: check unexpired, H unconsumed, escrow bound to keccak256(H || user)
-    SC->>SC: mark H consumed — effects before interactions
+    SC->>SC: markConsumed(H) at the consumed-set precompile — effects before interactions
     SC->>U: deliver at least minOut (balance-delta verified for tokens)
     SC->>S: release the escrowed input
 
@@ -186,16 +186,23 @@ Block producers remove intent objects from their candidate transaction list. The
 
 ## Parser and consumed set
 
-Two fixed, protocol-designated addresses divide the work.
+Three fixed, protocol-designated addresses divide the work.
 
 - **Parsing precompile:** a stateless precompile accepts the raw signed intent, reconstructs the RSK-namespace signing hash, recovers the user, and returns `(user, H, btcTxid, E, minOut, outputToken)`. This is the one part that is impractical to reproduce safely in Solidity. Any contract may call it with `STATICCALL`.
-- **Settlement contract:** a contract deployed at activation owns the consumed set in ordinary storage, using `H` as the slot key. Admission reads that slot directly. `isConsumed(bytes32 H)` exposes the same state to callers, and ordinary storage proofs can prove it.
+- **Consumed-set precompile:** a stateful precompile owning the consumed set at its own address. `isConsumed(bytes32 H)` returns zero when `H` is unconsumed and otherwise the height at which it was marked; `markConsumed(bytes32 H)` records it and MUST be callable only by the settlement contract, never under `STATICCALL`, and MUST refuse a second mark. The storage key MUST be domain-separated — a derivation of `H`, not `H` itself. Mempool admission reads this address with the same derivation.
+- **Settlement contract:** a contract deployed at activation that parses, delivers the output, releases the input, and calls `markConsumed`. It does not own the consumed set.
 
-Every node must agree on the deployed settlement bytecode because mempool admission reads its state at a designated address. Its specified behaviour is therefore part of this proposal even though the implementation runs as ordinary VM code.
+**Why the consumed set is not contract storage.** An earlier version of this proposal placed it in the settlement contract at `slot == H`. That is unsafe, and the reason generalises beyond any one implementation: Solidity places `someMapping[k]` at `keccak256(abi.encode(k, declarationIndex))`, a public formula over public inputs, while `H` is thirty-two bytes the user chooses freely and no rule constrains its provenance. An attacker can therefore compute the storage address of a chosen mapping entry, sign an intent whose `H` is that address, and have settlement write into a variable the contract believes only it can reach. Measured on a node (attack B6): a boolean guarding a peg-in claim was set with no peg-in ever claimed, and poisoning the escrow-binding entry for a not-yet-registered `btcTxid` made that escrow permanently unfundable, because the deposit path refuses any binding that does not match what is already stored. The attacker learns the victim's `btcTxid` from Bitcoin, roughly a hundred confirmations before registration can occur, so the exposure window is the peg-in wait itself.
 
-The consumed marker commits only when the entire settlement succeeds. If settlement reverts, the marker and every transfer revert together. A chain reorganisation behaves in the same way: removing the settlement block removes both delivery and consumption, allowing the intent to be solved again if it has not expired.
+Two properties follow, and both are requirements rather than implementation advice. The set MUST occupy a namespace nothing else shares — a distinct address, and a domain-separated key within it. And the derivation MUST be identical in the node's admission path and in the precompile: a divergence would leave admission reading a permanently empty slot and silently ceasing to reject consumed intents.
 
-The useful mental model is that the consumed set plays the same role for intents that account nonces play for ordinary transactions.
+This also answers where the state belongs. The consumed set plays the same role for intents that account nonces play for ordinary transactions, and nonces are node state. Placing it in a precompile does not enlarge the consensus surface either, because mempool admission reads it: under the contract-storage design every node already had to agree on the settlement bytecode, so consensus-critical state was merely wearing a contract's clothes. Ordinary storage proofs still prove membership, at the derived key.
+
+The consumed marker commits only when the entire settlement succeeds. If settlement reverts, the marker and every transfer revert together — for a precompile this requires that a failed call roll back its own writes and surface as a failed call to the caller, which the reference implementation obtains from the post-RSKIP-197 precompile error path. A chain reorganisation behaves in the same way: removing the settlement block removes both delivery and consumption, allowing the intent to be solved again if it has not expired.
+
+**The derivation is fixed at activation and cannot be revised.** Markers written under one derivation are invisible under another, so changing it would make every previously consumed `H` replayable. It must be settled before the first settlement occurs.
+
+**Implementation note.** In rskj, a stateful precompile must extend `Bridge`, `RemascContract` or `NativeContract`: `Program.callToPrecompiledAddress` builds `PrecompiledContractArgs` and calls `init()` only for those three types, so any other base class receives no repository and every call fails as an unexplained `ok=false`. The stateless parsing precompile is unaffected because it needs no state. `NativeContract` also supplies ABI coding, but it does not expose the calling frame, so the caller check above requires capturing `ProgramInvoke` during `init` and reading `getOwnerAddress()`.
 
 ## Value flow
 
@@ -411,7 +418,7 @@ A reference implementation exists as a set of patches on top of the rskj typed-t
 
 - intent subtype recognition and canonical signing;
 - activation-gated, zero-cost admission and block-producer exclusion;
-- the stateless parsing precompile and contract-owned consumed set;
+- the stateless parsing precompile, and the consumed set as a stateful precompile at its own address under a domain-separated key;
 - intent-bound input escrow using a real peg-in path;
 - atomic RBTC and ERC-20 settlement with visible reverts;
 - both forms of the above-`minOut` auction, including credit fallbacks and failure-triggered release of exclusivity;
@@ -454,6 +461,7 @@ The suite should continue to distinguish protocol properties from implementation
 - **Bitcoin input double-spend:** settlement may claim the input only after the Bridge accepts the peg-in under its confirmation rules.
 - **Rival-intent escrow capture:** escrow is bound to `keccak256(H || signer)` through the derived deposit address. An intent that merely copies `btcTxid` controls no funds, and neither does one that copies `H` as well — the signer cannot be forged, because settlement recovers it from the signature. Binding to `H` alone would be insufficient precisely because `H` is public and identifies the intent rather than the party entitled to the input.
 - **Consumption griefing:** an attacker cannot consume `H` without completing every required transfer. A failed attempt costs gas and leaves the intent available.
+- **Consumed-set aliasing:** `H` is attacker-chosen, so a consumed set keyed on a raw `H` inside a contract's own storage lets a crafted intent write into that contract's other variables — measured, not hypothetical (see *Parser and consumed set*). The set therefore requires its own address and a domain-separated key. The write is confined to entries that are currently zero, and its value is a block height, so the exposure is in booleans and bindings rather than in amounts — which does not make it small: one poisoned escrow binding strands that input permanently. Marking must also be restricted to the settlement contract, since an open `markConsumed` would let anyone kill a stranger's intent for the price of gas.
 - **Unpayable participants:** solver, bidder, and reserver payouts use credit fallbacks so a recipient cannot block unrelated progress, and each push carries a bounded gas stipend rather than forwarding the remaining gas.
 - **Hostile output tokens:** the output asset is named in the user's own signed intent, so no third party can choose it, and the balance-delta rule bounds what a misbehaving token can do *during* settlement. It cannot bound what the token's issuer does afterwards — an issuer able to freeze or claw back balances defeats any on-chain check — so wallets composing intents on a user's behalf SHOULD restrict output assets to a vetted set rather than accepting an arbitrary address.
 - **Auction liveness:** enforced exclusivity must release a wedged intent back to open settlement — but on a *demonstrated* execution failure rather than on elapsed time, or the release becomes a lever for whoever withholds the execution.

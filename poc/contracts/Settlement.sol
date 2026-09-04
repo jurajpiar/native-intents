@@ -12,8 +12,11 @@ pragma solidity 0.8.19;
  * the RSK-namespace signing hash and ecrecover is impractical in Solidity). This contract STATICCALLs
  * the parse precompile with the raw intent bytes and receives the authenticated fields.
  *
- * The consumed set is this contract's own storage at slot == H (via assembly), so the node's
- * admission check reads it exactly as before, just at this address.
+ * The consumed set is NOT here. It lives at the consumed-set precompile (CONSUMED, below), which owns
+ * its own address and derives its keys under a domain tag. It used to be this contract's own storage
+ * at slot == H, and because H is chosen by the user that put it in the same address space as the
+ * mappings declared below — attack B6 wrote into them through it. `legacyIsConsumed` is retained as a
+ * deprecated reader of that old namespace so the regression test can show it is no longer written.
  */
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -33,6 +36,14 @@ contract Settlement {
     // sentinel outputToken meaning "the output is BTC, delivered ON BITCOIN" (exit intents / E19).
     // No code lives here — it is only a marker an intent's outputToken field can carry.
     address constant BTC_OUT = 0x0000000000000000000000000000000001000023;
+    /**
+     * Consumed-set precompile. The set USED to live in this contract's own storage at slot == H,
+     * which put it in the same address space as every mapping declared below — and H is chosen by
+     * the user, so an intent whose H equalled keccak256(abi.encode(key, declarationIndex)) wrote
+     * straight into one of them. Attack B6 confirmed it on a node. The set now lives at its own
+     * address, under a domain-tagged key, where nothing else can alias with it.
+     */
+    address constant CONSUMED = 0x0000000000000000000000000000000001000024;
     // confirmations the solver's BTC payout needs in the Bridge's SPV view before it settles. Regtest
     // PoC value; mainnet policy would set this per reorg-risk appetite (the solver bears that risk).
     int256 constant MIN_BTC_CONF = 1;
@@ -194,6 +205,56 @@ contract Settlement {
 
     /// consumed-set view: true once H has been settled
     function isConsumed(bytes32 h) external view returns (bool) {
+        return _consumedMarker(h) != 0;
+    }
+
+    /**
+     * 0 when unconsumed, else the block number at which H was marked, plus one.
+     *
+     * The two failures are reported separately on purpose. A staticcall to an address with NO code
+     * returns ok=true with an empty result, while a precompile that THROWS returns ok=false — so one
+     * combined require collapses "the precompile is missing" and "the precompile rejected us" into a
+     * single message, and that ambiguity cost a diagnosis round.
+     */
+    function _consumedMarker(bytes32 h) internal view returns (uint256) {
+        (bool ok, bytes memory ret) = CONSUMED.staticcall(abi.encodeWithSignature("isConsumed(bytes32)", h));
+        require(ok, "consumed-set threw");
+        require(ret.length == 32, "consumed-set absent");
+        return abi.decode(ret, (uint256));
+    }
+
+    /**
+     * Diagnostic view: the raw outcome of the consumed-set staticcall, without reverting.
+     *
+     * `eth_call` cannot tell a missing precompile from a throwing one — both come back as `0x` — so
+     * probing 0x…24 directly is not a usable instrument. This asks the question from inside the
+     * contract, where the distinction is visible:
+     *     ok=true,  len=32  the precompile is registered and answering
+     *     ok=false, len=0   registered, but it rejected the call
+     *     ok=true,  len=0   not registered at this address at all
+     */
+    function consumedSetProbe(bytes32 h) external view returns (bool ok, uint256 len, uint256 value) {
+        bytes memory ret;
+        (ok, ret) = CONSUMED.staticcall(abi.encodeWithSignature("isConsumed(bytes32)", h));
+        len = ret.length;
+        value = len == 32 ? abi.decode(ret, (uint256)) : 0;
+    }
+
+    /// Mark H consumed. The precompile refuses any caller but this contract, and refuses a second mark.
+    function _markConsumed(bytes32 h) internal {
+        (bool ok, ) = CONSUMED.call(abi.encodeWithSignature("markConsumed(bytes32)", h));
+        require(ok, "consumed-set: mark failed");
+    }
+
+    /**
+     * @custom:deprecated The pre-B6 consumed set: a marker at slot == H in THIS contract's storage.
+     *
+     * Kept, not deleted, so the regression test can still read the namespace the attack used and show
+     * it is no longer written. Nothing on the live path touches it, and no new code should: an
+     * attacker chooses H, so any read or write keyed on a raw H reintroduces the aliasing this
+     * contract was fixed to remove.
+     */
+    function legacyIsConsumed(bytes32 h) external view returns (bool) {
         uint256 v;
         assembly { v := sload(h) }
         return v != 0;
@@ -223,12 +284,10 @@ contract Settlement {
             }
         }
 
-        uint256 consumed;
-        assembly { consumed := sload(H) }
-        require(consumed == 0, "H already consumed");
+        require(_consumedMarker(H) == 0, "H already consumed");
 
         // effects before interactions: record H consumed up front (a reentrant settle for the same H reverts)
-        assembly { sstore(H, add(number(), 1)) }
+        _markConsumed(H);
 
         // deliver >= minOut of the output asset to the user
         if (outToken == address(0)) {
@@ -278,9 +337,7 @@ contract Settlement {
         require(user != address(0), "bad intent");
         require(outToken == BTC_OUT, "not a btc-out intent");
         require(block.number < expiry, "expired");
-        uint256 consumed;
-        assembly { consumed := sload(H) }
-        require(consumed == 0, "H already consumed");
+        require(_consumedMarker(H) == 0, "H already consumed");
 
         // the window must not outlive the intent (Auction.sol:91 precedent) — otherwise an honest
         // reserver could be handed exclusivity it cannot possibly use, and forfeit at expiry (below)
@@ -310,9 +367,7 @@ contract Settlement {
         (address user, bytes32 H,, uint256 expiry,, address outToken) =
             abi.decode(ret, (address, bytes32, bytes32, uint256, uint256, address));
         require(outToken == BTC_OUT, "not a btc-out intent");
-        uint256 consumed;
-        assembly { consumed := sload(H) }
-        require(consumed == 0, "settled - reservation already resolved");
+        require(_consumedMarker(H) == 0, "settled - reservation already resolved");
         require(block.number >= expiry, "intent still live");
         ExitReservation storage r = exitReservations[H];
         require(r.solver != address(0), "no reservation");
@@ -352,7 +407,7 @@ contract Settlement {
         }
 
         _checkAndClaimBtcPayment(rawBtcTx, btcDest, minOut, btcBlockHash, merklePath, merkleHashes);
-        assembly { sstore(H, add(number(), 1)) }
+        _markConsumed(H);
         uint256 input = _releaseInput(btcTxid, H, user);
         // best-effort bond refund: a reserver that cannot receive RBTC must not be able to brick its
         // own settle AFTER having paid real, irreversible BTC (the old "bond refund failed" footgun).
@@ -374,9 +429,7 @@ contract Settlement {
         require(outToken == BTC_OUT, "not a btc-out intent");
         require(block.number < expiry, "expired");
         require(H == keccak256(abi.encodePacked("BTCOUT", btcDest, salt)), "dest not committed in H");
-        uint256 consumed;
-        assembly { consumed := sload(H) }
-        require(consumed == 0, "H already consumed");
+        require(_consumedMarker(H) == 0, "H already consumed");
     }
 
     /// SPV-verify the solver's BTC payout via the Bridge's header chain, find an unclaimed P2PKH output

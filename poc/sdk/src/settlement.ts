@@ -49,6 +49,23 @@ export async function peginOf(rpcUrl: string, btcTxidHex: string): Promise<bigin
   return contract(rpcUrl).pegin(btcTxidHex);
 }
 
+/** Whether a REAL Bridge peg-in for this txid has already been claimed by a settlement. */
+export async function claimedPeginOf(rpcUrl: string, btcTxidHex: string): Promise<boolean> {
+  return contract(rpcUrl).claimedPegin(btcTxidHex);
+}
+
+/**
+ * Reads the DEPRECATED pre-B6 consumed set: slot == H inside the settlement contract's own storage.
+ *
+ * Only the B6 regression uses this, and it is the half of the pair that makes the fix provable: after
+ * a settlement, isConsumed(H) must be true (the marker was written) while legacyIsConsumedOf(H) is
+ * false (it was not written HERE). Checking only that the old namespace is clean would also pass if
+ * the settlement had silently done nothing.
+ */
+export async function legacyIsConsumedOf(rpcUrl: string, H: string | Uint8Array): Promise<boolean> {
+  return contract(rpcUrl).legacyIsConsumed(hexlify(H));
+}
+
 /**
  * Settle an EXIT intent (E19): prove the solver's BTC payout (raw legacy tx + SPV branch against the
  * Bridge's header chain) paid >= minOut sats to the destination committed in H, consume H, and claim

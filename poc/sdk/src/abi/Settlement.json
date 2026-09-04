@@ -221,6 +221,35 @@
   {
     "inputs": [
       {
+        "internalType": "bytes32",
+        "name": "h",
+        "type": "bytes32"
+      }
+    ],
+    "name": "consumedSetProbe",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "ok",
+        "type": "bool"
+      },
+      {
+        "internalType": "uint256",
+        "name": "len",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "value",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
         "internalType": "address",
         "name": "",
         "type": "address"
@@ -325,6 +354,25 @@
       }
     ],
     "name": "isConsumed",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "h",
+        "type": "bytes32"
+      }
+    ],
+    "name": "legacyIsConsumed",
     "outputs": [
       {
         "internalType": "bool",
