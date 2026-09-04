@@ -26,6 +26,8 @@
     "test:mermaid": "python3 sdk/test/mermaid_lint.py && node sdk/test/mermaid_parse.mjs",
     "typecheck": "cd sdk && npm run typecheck --",
     "sdk": "cd sdk && npm run",
-    "install:sdk": "cd sdk && npm install"
+    "install:sdk": "cd sdk && npm install",
+    "measure": "cd sdk && npm run measure --",
+    "m01": "cd sdk && npm run m01 --"
   }
 }

@@ -43,7 +43,9 @@
     "e21": "tsx experiments/e21_credit_claims.ts",
     "e22": "tsx experiments/e22_exit_bond_expiry.ts",
     "e23": "tsx experiments/e23_entry_binding.ts",
-    "e24": "tsx experiments/e24_mempool_sourced_settlement.ts"
+    "e24": "tsx experiments/e24_mempool_sourced_settlement.ts",
+    "m01": "tsx measure/m01_admission_staircase.ts",
+    "measure": "tsx measure/m01_admission_staircase.ts"
   },
   "dependencies": {
     "ethers": "^6.13.0"
