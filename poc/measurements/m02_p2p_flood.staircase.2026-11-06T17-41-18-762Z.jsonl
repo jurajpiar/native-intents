@@ -1,0 +1,7 @@
+{"env":{"when":"2026-11-06T17:41:18.763Z","commit":"bb729a3","dirty":true,"host":"WorkBook","platform":"darwin/arm64","cpu":"Apple M4 Pro","cores":14,"memGB":52,"node":"v26.12.1","measurement":"m02_p2p_flood","mode":"staircase","engine":"podman","rates":[5,10,15,20,30,60],"seconds":75,"eAdmitted":25,"containerB":"stack-rskj-b-1"}}
+{"mode":"staircase","rate":5,"seconds":75,"sent":375,"admittedAtA":375,"lagBefore":0,"maxLag":1,"lagAfter":0,"sampled":75,"sampledSeenAtB":75,"deliveredShare":1,"cpuUsec":7115099,"windowMs":77149}
+{"mode":"staircase","rate":10,"seconds":75,"sent":750,"admittedAtA":750,"lagBefore":0,"maxLag":1,"lagAfter":0,"sampled":75,"sampledSeenAtB":75,"deliveredShare":1,"cpuUsec":6169123,"windowMs":77357}
+{"mode":"staircase","rate":15,"seconds":75,"sent":1125,"admittedAtA":1125,"lagBefore":0,"maxLag":1,"lagAfter":0,"sampled":75,"sampledSeenAtB":75,"deliveredShare":1,"cpuUsec":8206299,"windowMs":77295}
+{"mode":"staircase","rate":20,"seconds":75,"sent":1500,"admittedAtA":1500,"lagBefore":0,"maxLag":11,"lagAfter":0,"sampled":75,"sampledSeenAtB":63,"deliveredShare":0.84,"cpuUsec":8912951,"windowMs":77473}
+{"mode":"staircase","rate":30,"seconds":75,"sent":2250,"admittedAtA":2250,"lagBefore":0,"maxLag":28,"lagAfter":0,"sampled":75,"sampledSeenAtB":47,"deliveredShare":0.6266666666666667,"cpuUsec":9182253,"windowMs":77322}
+{"mode":"staircase","rate":60,"seconds":75,"sent":4500,"admittedAtA":4500,"lagBefore":0,"maxLag":43,"lagAfter":3,"sampled":75,"sampledSeenAtB":31,"deliveredShare":0.41333333333333333,"cpuUsec":10336393,"windowMs":77466}

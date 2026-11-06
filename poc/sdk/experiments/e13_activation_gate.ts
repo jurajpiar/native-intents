@@ -31,7 +31,28 @@ async function main(): Promise<number> {
     console.log(`waiting for height >= ${ACTIVATION}...`);
     await waitFor(async () => (await rpcA.blockNumber()) >= ACTIVATION, 120000, 1000);
   } else {
-    r.check("pre-activation window already passed (run e13 right after `up` to see it)", true, `height ${height} >= ${ACTIVATION}`);
+    /**
+     * The pre-activation window is GONE, and there is no honest way to report that as a pass.
+     *
+     * This used to be `r.check(..., true, ...)` — a check that asserted nothing and always passed, so
+     * the board printed "attack BLOCKED · as predicted" for the activation gate on a chain where the
+     * gate could not possibly be exercised. That is a phantom pass: the output looks like evidence and
+     * contains none.
+     *
+     * Exit 2 is the runner's ENVIRONMENT code, which is exactly what this is — the claim is testable,
+     * just not on a chain that is already past the fork. It costs nothing in coverage: the
+     * post-activation half of this claim is exercised by every other experiment that admits an intent.
+     */
+    console.error(
+      `\nThe pre-activation window has already passed: height ${height} >= activation ${ACTIVATION}.\n` +
+      `This experiment can only observe the gate on a chain BELOW the activation height, so there is\n` +
+      `nothing here to test — reporting a pass would assert something this run cannot know.\n\n` +
+      `Two ways to see the gate:\n` +
+      `  cd poc && npm run attacks -- a1     # a1 builds its own node with a settable activation height,\n` +
+      `                                      # mining on demand, so the window never closes (preferred)\n` +
+      `  cd poc && npm run stack:reset && npm run sdk -- e13   # or race a fresh chain: ~40s of window\n`
+    );
+    process.exit(2);
   }
 
   const h2 = await rpcA.blockNumber();

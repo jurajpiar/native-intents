@@ -18,7 +18,7 @@
  * Needs the E21+ genesis (forfeitExpiredExitBond): down -v + rebuild if the probe fails.
  */
 import { buildIntent, freshWallet, btcOutH } from "../src/intent.js";
-import { depositForPegin, reserveExit, exitBondFor, exitReservationOf, forfeitExpiredExitBond, settlementCreditOf } from "../src/settlement.js";
+import { depositForPegin, reserveExit, exitBondFor, exitReservationOf, forfeitExpiredExitBond, settlementCreditOf, bindingOf } from "../src/settlement.js";
 import { Report, preflight, requireSettlement, rpcA, fundAccount, waitReceipt, succeeded, reverted } from "./_harness.js";
 import { BTC_OUT } from "../src/config.js";
 import { waitFor } from "../src/client.js";
@@ -46,8 +46,10 @@ async function main(): Promise<number> {
     const salt = getBytes(randomBytes(32));
     const H = btcOutH(dest, salt);
     const btcTxid = getBytes(randomBytes(32));
-    await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT));
+    // The signer has to exist BEFORE the escrow, because the binding commits to it. That is the real
+    // ordering the RSKIP now states: commit (H, signer) first, derive the deposit from both.
     const user = freshWallet();
+    await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, bindingOf(H, user.address)));
     const intent = buildIntent(user, { H, btcTxid, expiry: (await rpcA.blockNumber()) + expiryBlocks, minOut: MIN_SATS, outputToken: BTC_OUT });
     await rpcA.sendRaw(intent.rawHex);
     return { user, salt, H, btcTxid, intent };

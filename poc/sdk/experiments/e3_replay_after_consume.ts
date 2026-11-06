@@ -23,7 +23,7 @@ async function main(): Promise<number> {
 
   const H = randomH();
   const height = await rpcA.blockNumber();
-  const intentA = buildIntent(freshWallet(), { H, btcTxid: new Uint8Array(32), expiry: height + 100, minOut: MINOUT });
+  const intentA = buildIntent(freshWallet(), { H, btcTxid: new Uint8Array(32), expiry: height + 95, minOut: MINOUT });
   await rpcA.sendRaw(intentA.rawHex);
   r.check("first intent admitted", true, intentA.hash);
 
@@ -32,7 +32,7 @@ async function main(): Promise<number> {
   r.check("isConsumed(H) == true after solve", await isConsumed((to, d) => rpcA.ethCall(to, d), H));
 
   // replay: a brand-new intent (fresh sender) committing to the SAME H
-  const intentB = buildIntent(freshWallet(), { H, btcTxid: new Uint8Array(32), expiry: height + 100, minOut: MINOUT });
+  const intentB = buildIntent(freshWallet(), { H, btcTxid: new Uint8Array(32), expiry: height + 95, minOut: MINOUT });
   let rejected = false;
   let msg = "";
   try {

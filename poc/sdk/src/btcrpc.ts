@@ -9,6 +9,19 @@ export interface BtcRpcOpts {
   wallet?: string; // default "poc"
 }
 
+/**
+ * The data payload of an exit payout's SETTLER COMMITMENT: "RSKX" || 20-byte RSK address. bitcoind
+ * wraps it as OP_RETURN PUSH24 <payload>, which is the 26-byte scriptPubKey Settlement looks for.
+ */
+export function settlerCommitmentData(rskAddress: string): string {
+  return "52534b58" + rskAddress.replace(/^0x/, "").toLowerCase().padStart(40, "0").slice(-40);
+}
+
+/** The full scriptPubKey of that commitment, for callers hand-serialising a payout. */
+export function settlerCommitmentScript(rskAddress: string): string {
+  return "6a18" + settlerCommitmentData(rskAddress);
+}
+
 export class BtcRpc {
   private id = 1;
   readonly base: string;
@@ -136,7 +149,7 @@ export class BtcRpc {
    * payout parser handles non-segwit P2PKH). Returns { txid, rawHex } — the raw bytes are what the
    * contract parses and double-sha256s.
    */
-  async payToAddress(fromAddress: string, toAddress: string, amountBtc: number): Promise<{ txid: string; rawHex: string }> {
+  async payToAddress(fromAddress: string, toAddress: string, amountBtc: number, settler?: string): Promise<{ txid: string; rawHex: string }> {
     const FEE = 0.0002, DUST = 0.00001;
     const utxos = (await this.listUnspent([fromAddress])).filter((u) => u.spendable);
     const inputs: { txid: string; vout: number }[] = [];
@@ -144,6 +157,9 @@ export class BtcRpc {
     for (const u of utxos) { inputs.push({ txid: u.txid, vout: u.vout }); inSum += u.amount; if (inSum >= amountBtc + FEE) break; }
     if (inSum < amountBtc + FEE) throw new Error(`insufficient BTC at ${fromAddress}: have ${inSum}, need ${amountBtc + FEE}`);
     const outputs: Record<string, unknown>[] = [{ [toAddress]: Number(amountBtc.toFixed(8)) }];
+    // settler commitment (required by settleBtcOut): OP_RETURN "RSKX" || 20-byte RSK address.
+    // Without it the payout is a bearer proof anyone could replay against their own intent.
+    if (settler) outputs.push({ data: settlerCommitmentData(settler) });
     const change = inSum - amountBtc - FEE;
     if (change > DUST) outputs.push({ [fromAddress]: Number(change.toFixed(8)) });
     const raw = await this.createRawTransaction(outputs, inputs);

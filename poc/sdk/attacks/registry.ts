@@ -1,0 +1,589 @@
+/**
+ * The attack registry — the single source of truth for what has been attacked, what defends it, and
+ * what has NOT been attacked yet.
+ *
+ * The experiments in ../experiments/ are organised by the order they were invented (E1…E23). That is
+ * the wrong axis for red-teaming: it tells you nothing about which part of the surface is covered.
+ * Here every attack is filed under the surface it targets, carries the defence that stops it (as a
+ * file:line you can go read), and — crucially — declares its EXPECTED outcome up front. A run that
+ * agrees with the registry is a pass; a run that disagrees is the finding.
+ *
+ * `expected: "untested"` entries are deliberate: an attack surface with no attack written against it
+ * should be VISIBLE in the menu, not absent from it.
+ */
+
+import type { StackCtx, StackName } from "./_stacks.js";
+import type { FreshSpec } from "./_fresh.js";
+import { BRIDGE_ADDR, TICKET_VALUE, TICKET_TXID, bridgeTicketSlot } from "./_ticket.js";
+
+export type ThreatClass = "A" | "B" | "C" | "D" | "E" | "F" | "M";
+
+export const CLASSES: Record<ThreatClass, string> = {
+  A: "admission / consensus (pre-inclusion)",
+  B: "entry escrow (peg-in side)",
+  C: "settlement atomicity",
+  D: "auction / exclusivity",
+  E: "exit (BTC-out)",
+  F: "reorg / liveness",
+  M: "miner / block producer (ordering, censorship, reorg as strategy)",
+};
+
+/** What the attacker achieves. `contained` = it lands but the damage stays with the attacker. */
+export type Outcome = "blocked" | "contained" | "succeeds";
+export type Expected = Outcome | "untested";
+
+/**
+ * How an outcome is PRINTED. The keys above are terse because they are code; on a report they were
+ * ambiguous in the worst possible way — a bare "succeeds" reads equally as "the attack succeeded" and
+ * "the defence successfully stopped it", which are opposite findings. Every label therefore names its
+ * SUBJECT, so no line can be read backwards:
+ *
+ *   blocked    -> "attack BLOCKED"    the attack could not land at all
+ *   contained  -> "harm CONTAINED"    it landed, and the damage stayed with the attacker
+ *   succeeds   -> "ATTACK WORKS"      it landed and cost someone else something
+ *
+ * "ATTACK WORKS" is deliberately the loudest of the three: it is the only one that describes the
+ * system doing something it should not.
+ */
+export const OUTCOME_LABEL: Record<Expected, string> = {
+  blocked: "attack BLOCKED",
+  contained: "harm CONTAINED",
+  succeeds: "ATTACK WORKS",
+  untested: "UNTESTED",
+};
+
+/** Sentence form, for a run's closing RESULT line. */
+export const OUTCOME_SENTENCE: Record<Outcome, string> = {
+  blocked: "the ATTACK WAS BLOCKED",
+  contained: "the attack LANDED but the HARM WAS CONTAINED",
+  succeeds: "the ATTACK WORKED",
+};
+
+export type Impl =
+  /** Written against the forensics harness: full step / revert-reason / balance-delta reporting. */
+  | { kind: "native"; load: () => Promise<{ run: (spec: AttackSpec, ctx: StackCtx) => Promise<number> }> }
+  /** An existing experiment that already performs this attack; the runner shells out and streams it. */
+  | { kind: "wrapped"; script: string }
+  /** No attack written yet. Listed so the gap is visible rather than silently absent. */
+  | { kind: "untested"; why: string };
+
+export interface AttackSpec {
+  /** menu selector, lowercase: class letter + index. */
+  id: string;
+  cls: ThreatClass;
+  name: string;
+  /** what the attack points at — contract function or consensus rule, with a line where useful. */
+  target: string;
+  /** the attacker's theory of the case, in one sentence. */
+  premise: string;
+  expected: Expected;
+  /** why that outcome is expected (shown next to it). */
+  expectedWhy?: string;
+  /** the code that stops it, or an honest "none". */
+  defence: string;
+  /** what it would cost if the defence were absent. */
+  severity: string;
+  /** environment the run needs. */
+  needs: string;
+  /**
+   * The infrastructure the attack runs against. Omitted means "default" — the everyday stack.
+   * An attack about BLOCK CONTENTS (ordering, censorship, a block-height window, a deliberate reorg)
+   * cannot be expressed on a stack that mines on a timer, so it names one that mines on demand and the
+   * runner brings that up for it (see ./_stacks.ts). Declaring this is what stops "needs another
+   * stack" from being a permanent excuse for leaving a surface unexercised.
+   */
+  stack?: StackName;
+  /**
+   * Boot a PRIVATE node for this attack and hand it the chain state it needs, rather than running
+   * against whatever shared chain is up. Set it when the attack depends on something no transaction
+   * can construct — a height below a fork activation, a node startup flag, or pre-baked contract
+   * storage. Ignored when `stack` is set; the two are alternatives. See ./_fresh.ts.
+   */
+  fresh?: FreshSpec;
+  /**
+   * Set when the attack cannot run on the default stack, with the reason. Full-board runs SKIP these
+   * rather than reporting a guaranteed failure as a finding (../experiments/run_all.ts excludes E8 for
+   * exactly this reason); `--id=<id>` still runs it.
+   */
+  notInAll?: string;
+  /** printed after the verdict — the one-line takeaway. */
+  conclusion?: string;
+  /** printed as FINDING(S) when the attack teaches something the docs get wrong or omit. */
+  finding?: string | string[];
+  impl: Impl;
+}
+
+export const ATTACKS: AttackSpec[] = [
+  // ---------------------------------------------------------------- A · admission / consensus
+  {
+    id: "a1", cls: "A", name: "submit an intent before activation",
+    target: "rskj IntentAdmission — the RSKIPINTENT consensus gate",
+    premise: "the intent tx type is parseable by the node before the fork that legitimises it, so send one early — if it is admitted, a block containing it splits consensus",
+    expected: "blocked", expectedWhy: "activation is a consensus rule, not a policy flag",
+    defence: "rskj IntentAdmission + the rskipIntent activation height in the node's consensus rules",
+    severity: "a pre-fork intent in a block splits consensus between upgraded and un-upgraded nodes — the cheapest attack on the board with the most expensive failure",
+    needs: "its own node, activation height set low, mining on demand — built automatically",
+    // A height BELOW a fork cannot be reached by mining forward, so this attack ships the state it
+    // needs instead of running against whatever shared chain is up. Mining on demand keeps the
+    // pre-activation window open indefinitely, replacing what used to be a 40-second race.
+    fresh: { activation: 20, opts: { requireBtcTicket: "false", maxExpirySpan: "100" } },
+    conclusion: "the gate holds, and this is the first run that measured it. Below the activation height the node refuses the type outright and names activation as the reason; above it, the IDENTICAL SIGNED BYTES are admitted — so the activation rule is the only variable.",
+    finding: "the shared-chain version of this attack could not test its own claim. A board run happens on a chain thousands of blocks past activation, so the pre-activation window was unobservable — and the experiment asserted `true` and reported a pass anyway. That is worse than an untested line, because the board printed 'attack BLOCKED · as predicted' for a rule nothing had exercised. It now boots a node whose activation height is a parameter.",
+    impl: { kind: "native", load: () => import("./a1_activation_gate.js") },
+  },
+  {
+    id: "a2", cls: "A", name: "flood the mempool with free intents",
+    target: "rskj IntentAdmission — the BTC-ticket anti-spam rule",
+    premise: "intents are payer-less and carry gasPrice 0, so N of them from N fresh keys cost the attacker nothing — the core DoS objection to a free transaction type",
+    expected: "blocked",
+    expectedWhy: "admission demands the intent's btcTxid be a peg-in the Bridge has processed, so the scarce resource is a confirmed Bitcoin transaction rather than gas",
+    defence: "intent.requireBtcTicket=true — a Bridge processed-height check at admission, before the pool",
+    severity: "free unbounded mempool growth, which is the objection that decides whether a payer-less type is viable at all",
+    needs: "its own node with the ticket flag ON — built automatically",
+    // The rule is a NODE FLAG, and the shared stack pins it to false so the core claims run without
+    // Bitcoin setup. No on-chain state reaches a startup flag, so this attack used to live as a
+    // `docker run` line in a README. Starting the node here also removes E8's ambiguity: an admission
+    // can no longer be explained by the rule being off, because the attack set the flag itself.
+    fresh: { activation: 5, opts: { requireBtcTicket: "true", maxExpirySpan: "100" } },
+    conclusion: "the bound on a payer-less pool is a confirmed Bitcoin transaction, not gas: an attacker mints keys and commitments freely but cannot mint peg-ins, so the cost of an admitted intent is pushed onto Bitcoin where it is already priced. Not covered here, for want of a Bitcoin node: that a VALID ticket is admitted — that positive half is e8pos, on the stack that has bitcoind.",
+    finding: "this rule was unverified by the board for as long as it needed a hand-pasted `docker run`. The flag it depends on is process configuration, which no amount of chain setup reaches, so it sat outside every automated run until an attack could bring its own node.",
+    impl: { kind: "native", load: () => import("./a2_mempool_flood.js") },
+  },
+  {
+    id: "a3", cls: "A", name: "admit an already-expired intent",
+    target: "rskj IntentAdmission — expiry check",
+    premise: "an expired intent that still gets admitted leaves junk in the pool for free",
+    expected: "blocked", expectedWhy: "expiry is checked at admission, before the pool",
+    defence: "IntentAdmission expiry rule (E2 asserts nothing lands on chain)",
+    severity: "free pool pollution with intents nobody can ever settle",
+    needs: "1 node",
+    impl: { kind: "wrapped", script: "e2_expiry_costs_nothing.ts" },
+  },
+  {
+    id: "a4", cls: "A", name: "race the expiry boundary",
+    target: "IntentAdmission expiry vs Settlement.settle (:150)",
+    premise: "an intent admitted at expiry-1 and mined at expiry passes admission but fails settlement — burning the solver's gas and its delivered output's approval",
+    expected: "untested",
+    defence: "settle re-checks `block.number < expiry`; whether the two checks can disagree is unmeasured",
+    severity: "solvers griefed into gas loss on intents that were valid when they committed",
+    needs: "1 node",
+    impl: { kind: "untested", why: "needs a settle submitted at exactly expiry-1 with deterministic block timing" },
+  },
+  {
+    id: "a5", cls: "A", name: "malformed intent payload",
+    target: "parse precompile 0x…20 / Settlement.settle (:144)",
+    premise: "a truncated or over-long data field might parse to garbage rather than reverting",
+    expected: "blocked", expectedWhy: "IntentAdmission checks the 160-byte length before slicing, so a bad payload is declined rather than fatal",
+    defence: "`require(ok && ret.length == 192)` — but the precompile's own behaviour on short input is unprobed",
+    severity: "a parse that returns attacker-chosen fields would forge user/minOut",
+    needs: "1 node",
+    impl: { kind: "native", load: () => import("./a5_malformed_payload.js") },
+  },
+  {
+    id: "a6", cls: "A", name: "reuse one valid ticket across unlimited intents",
+    target: "rskj IntentAdmission — the BTC-ticket rule (a lookup, not an accounting)",
+    premise: "the ticket rule asks whether a txid is a processed peg-in and nothing more, so pay for ONE peg-in and name it in as many intents as you like — fresh H and a fresh key each time, so nothing dedups and no per-account pool limit bites",
+    expected: "succeeds",
+    expectedWhy: "there is no counter, no dedup and no sender binding on btcTxid anywhere in the admission path — the ticket is a cost per ATTACKER, not per intent",
+    defence: "none. A2 covers the case where the ticket is ABSENT; nothing covers the case where one valid ticket is reused",
+    severity: "the anti-spam rule is the whole answer to 'a free transaction type invites unbounded mempool growth'. If one peg-in buys unlimited admitted intents, the bound is on entry, not on volume",
+    needs: "its own node with the ticket flag ON and a ticket planted in genesis — built automatically",
+    /**
+     * A valid ticket without any Bitcoin: admission reads the Bridge's processed-peg-in map with
+     * getStorageBytes, and genesis `contract.data` writes to that same store. So the node boots with
+     * one peg-in already "processed", which is exactly the attacker's starting position after paying
+     * once — and it removes bitcoind, header relay and confirmation timing from the result.
+     */
+    fresh: {
+      activation: 5,
+      opts: { requireBtcTicket: "true", maxExpirySpan: "100" },
+      alloc: { [BRIDGE_ADDR]: { contract: { data: { [bridgeTicketSlot(TICKET_TXID)]: TICKET_VALUE } } } },
+    },
+    conclusion: "the ticket bounds who may enter, not how much they may send. The fix is to key admission on the ESCROW rather than the txid — require an escrow bound to keccak256(H || signer), the same binding settlement already checks — so each intent needs its own derived deposit and the flood costs one Bitcoin transaction per intent. That is the design's own premise, and it makes the relaxed-admission question moot: what gets checked becomes escrow existence rather than confirmation depth.",
+    finding: "A2 and A6 both pass their own claims and disagree about what the rule is worth. A2 floods with BOGUS txids and is refused, which shows the rule EXISTS; A6 reuses one VALID txid, which shows it bounds nothing. An attack that proves a rule fires is not the same as one that proves the rule is load-bearing, and the board needed both to see it.",
+    impl: { kind: "native", load: () => import("./a6_ticket_reuse.js") },
+  },
+
+  // ---------------------------------------------------------------- B · entry escrow (peg-in side)
+  {
+    id: "b1", cls: "B", name: "txid squatting (steal a peg-in escrow)",
+    target: "Settlement._releaseInput (:358)",
+    premise: "name the victim's btcTxid in a dust-minOut intent of your own and claim their escrowed input",
+    expected: "blocked", expectedWhy: "the escrow is bound to the intent it was deposited for",
+    defence: "Settlement.peginIntent binding (:113) — the PoC model of RSKIP176 entry binding",
+    severity: "direct theft of the user's entire pegged-in input",
+    needs: "1 node, entry-binding genesis",
+    conclusion: "E23 also keeps the pre-fix theft reproducible against a legacy UNBOUND escrow, as evidence.",
+    impl: { kind: "wrapped", script: "e23_entry_binding.ts" },
+  },
+  {
+    id: "b2", cls: "B", name: "binding front-run",
+    target: "Settlement.depositForPegin (:121)",
+    premise: "depositForPegin is permissionless, so bind the victim's btcTxid to an H you control for 1 wei — their own deposit then reverts and their intent becomes unservable",
+    expected: "succeeds", expectedWhy: "a PoC-model artefact of a permissionless deposit call",
+    defence: "none in the PoC. In production the binding is not a call argument — RSKIP176 derives the deposit ADDRESS from H, so only the matching intent's peg-in can land there.",
+    severity: "denial of entry: a 1-wei tx makes a user's peg-in unescrowable and their intent worthless to solvers",
+    needs: "1 node",
+    conclusion: "the exposure is in the PoC's escrow MODEL, not in the design — but it is the model every other B-class experiment runs on.",
+    finding: "b1's binding fix closes theft and opens denial: whoever binds first owns the txid. Production must derive the binding, never accept it as an argument.",
+    impl: { kind: "native", load: () => import("./b2_binding_frontrun.js") },
+  },
+  {
+    id: "b3", cls: "B", name: "top-up a bound escrow via the legacy path",
+    target: "Settlement.depositForPegin (:122) — the `h != 0` guard",
+    premise: "passing h == 0 skips the binding check entirely, so top up an escrow already bound to somebody else",
+    expected: "succeeds", expectedWhy: "the guard is inside `if (h != 0)`; the legacy path never reads peginIntent",
+    defence: "none — and none needed, see the finding",
+    severity: "none: the top-up is claimable only by the bound intent, so the attacker is donating",
+    needs: "1 node",
+    conclusion: "verified benign. Worth keeping in the suite precisely because it LOOKS exploitable.",
+    finding: "the h==0 branch cannot be turned against the bound holder, but it does mean a legacy escrow can never be retro-bound: unbound peg-ins stay B1-exposed by construction, exactly as _releaseInput's comment admits.",
+    impl: { kind: "native", load: () => import("./b3_unbound_topup.js") },
+  },
+  {
+    id: "b4", cls: "B", name: "squat a REAL peg-in credit",
+    target: "Settlement._releaseInput real-pegin branch (:343)",
+    premise: "the Bridge's peg-in record carries no H, so the b1 theft should still work against a genuine peg-in",
+    expected: "untested",
+    defence: "none by construction — the OP_RETURN has no room for H; RSKIP176 derivation is the production answer",
+    severity: "theft of a real pegged-in input (the b1 severity, on the path that actually matters)",
+    needs: "1 node + bitcoind; relays headers",
+    impl: { kind: "untested", why: "needs E14's real-peg-in driver re-run with a rival intent naming the same txid" },
+  },
+  {
+    id: "b6", cls: "B", name: "steer the consumed set onto the contract's own storage",
+    target: "Settlement — the consumed set is written with sstore(H, ...) at slot number H itself, in the same address space as every declared mapping",
+    premise: "Solidity puts someMapping[k] at keccak256(abi.encode(k, declarationIndex)), which is a public formula over public inputs — so compute the address of a chosen mapping entry, sign an intent whose H IS that address, and settling writes block.number+1 into a variable the contract believes only it can reach",
+    expected: "blocked",
+    expectedWhy: "the consumed set now lives at its own precompile address (0x…24) under a domain-tagged key, so a chosen H reaches nothing but the set itself",
+    defence: "IntentConsumedSetContract — the set moved out of Settlement entirely. Its own address, keys derived as keccak256(\"intentConsumed-\" || hex(H)), and markConsumed callable only by the settlement contract (checked via ProgramInvoke.getOwnerAddress) and never under STATICCALL",
+    severity: "pre-fix, peginIntent was the worst target: depositForPegin refuses any binding that does not match what is already stored, so one poisoned slot stranded that txid's input permanently. The attacker needed the victim's btcTxid in advance and the design handed it to them — it is public on Bitcoin for roughly a hundred confirmations before registration can happen. claimedBtcOut was worse still and was never exercised: the same write makes a solver's already-paid, irreversible bitcoin unclaimable",
+    needs: "1 node, no bitcoind",
+    conclusion: "FIXED. Confirmed as a live attack first — claimedPegin[victimTxid] flipped to true with no peg-in ever claimed — then closed by moving the consumed set to a precompile. The test now asserts a PAIR: isConsumed(H) true (the marker really was written) and legacyIsConsumed(H) false (it did not go to the retired namespace), because either half alone would also pass if the settlement had silently done nothing.",
+    finding: "found by asking what 'the consumed set is raw storage at slot == H' actually means. Solidity puts someMapping[k] at keccak256(abi.encode(k, declarationIndex)) — a public formula over public inputs — so no preimage search was needed: an attacker computed the address of a mapping entry and used it as H. It was a SPEC defect, not a PoC artefact: RSKIP-XXX specifies the consumed set as 'ordinary storage, using H as the slot key' with 'admission reads that slot directly'. The fix also answers where the state belongs — the proposal's own line that the consumed set 'plays the same role for intents that account nonces play for ordinary transactions' argues for node state, and its concession that every node must already agree on the settlement bytecode means a precompile relocates consensus surface rather than adding it.",
+    impl: { kind: "native", load: () => import("./b6_slot_collision.js") },
+  },
+  {
+    id: "b5", cls: "B", name: "a rival intent with the victim's OWN H",
+    target: "Settlement.bindingOf / _releaseInput — what the escrow is keyed on",
+    premise: "H is public the moment the intent is, so copy the victim's H and btcTxid into your own intent with a dust minOut and let a solver settle THAT — settlement recovers the user from the signature, so the dust goes to you and the whole escrow to the solver",
+    expected: "blocked",
+    expectedWhy: "the escrow binds to keccak256(H || signer), so a rival with a different key computes a different binding and commands no funds",
+    defence: "Settlement.bindingOf(H, signer), stored by depositForPegin and re-derived in _releaseInput from the signature-recovered user",
+    severity: "pre-fix: total capture of the victim's input for gas plus one wei, by anyone who could read the mempool — and the solver needed no accomplice, since it could sign the twin itself",
+    needs: "1 node, signer-bound genesis",
+    conclusion: "FIXED. The pipeline commitment was never an authenticator: settlement is outcome-based and never needs the preimage, so an opaque H is as settleable as a known one. Only the signature says who may claim, and the binding now commits to it.",
+    finding: "found by drawing the RSKIP's entry-flow diagram — the ordering forces the question of what the deposit address is derived FROM, and the answer was 'a value anyone can copy'. It was a DESIGN property, not a PoC artefact: RSKIP-176's derivation hash is built from (H, userRefundBtcAddress, lbcAddress, lpBtcAddress), none of which is the Rootstock signer, so a production deposit address would have bound to H alone in exactly the same way. The RSKIP now specifies keccak256(H || signer) as the derivation argument.",
+    impl: { kind: "native", load: () => import("./b5_same_h_rival.js") },
+  },
+
+  // ---------------------------------------------------------------- C · settlement atomicity
+  {
+    id: "c1", cls: "C", name: "consume H without delivering",
+    target: "Settlement.settle (:169)",
+    premise: "burn the intent's H while paying the user nothing, so no honest solver can serve it",
+    expected: "blocked", expectedWhy: "consumption and delivery are the same transaction",
+    defence: "Settlement.settle minOut check + atomic revert (:169-171)",
+    severity: "griefing every intent to death for the price of gas (the m1 hole)",
+    needs: "1 node",
+    impl: { kind: "wrapped", script: "e6_consume_griefing.ts" },
+  },
+  {
+    id: "c2", cls: "C", name: "replay a settled intent",
+    target: "Settlement consumed set (:160)",
+    premise: "re-submit the same signed intent after it settled and get paid the input twice",
+    expected: "blocked", expectedWhy: "H is stored consumed before any interaction",
+    defence: "sstore(H) effects-first (:164) + admission-side consumed check",
+    severity: "double release of the input escrow",
+    needs: "1 node",
+    impl: { kind: "wrapped", script: "e3_replay_after_consume.ts" },
+  },
+  {
+    id: "c3", cls: "C", name: "under-deliver and keep the input",
+    target: "Settlement.settle (:169-176)",
+    premise: "deliver less than minOut but still claim the escrowed input",
+    expected: "blocked", expectedWhy: "delivery is asserted before the input is released",
+    defence: "settle's minOut require + _releaseInput ordering",
+    severity: "the solver keeps the spread AND the shortfall",
+    needs: "1 node",
+    impl: { kind: "wrapped", script: "e7_atomic_settlement.ts" },
+  },
+  {
+    id: "c4", cls: "C", name: "fail invisibly",
+    target: "Settlement.settle — VM revert visibility",
+    premise: "a failing settle that reports success (the m2 precompile behaviour) hides griefing from everyone watching receipts",
+    expected: "blocked", expectedWhy: "settlement is a VM contract, so failure is status 0x0",
+    defence: "m3 moved settlement into the VM (Settlement.sol)",
+    severity: "silent failures — no monitoring can distinguish a grief from a fill",
+    needs: "1 node",
+    impl: { kind: "wrapped", script: "e11_visible_revert.ts" },
+  },
+  {
+    id: "c5", cls: "C", name: "reenter settle from a payee's callback",
+    target: "Settlement._pay (:104) and withdraw (:116) — the two places a contract payee gets control",
+    premise: "settle pushes to msg.sender twice (excess refund, input release), so a contract solver's receive() runs mid-settlement and can call straight back in",
+    expected: "blocked",
+    expectedWhy: "two independent defences: the settle-path pushes are capped at 30,000 gas so a callback cannot run at all, and effects-first ordering (sstore(H) before any external call) makes a same-H reentry from the UNCAPPED withdraw() meet a consumed H",
+    defence: "PUSH_GAS = 30_000 on _pay (:104) closes the settle path; sstore(H) at :164 closes the withdraw path",
+    severity: "double release of a second escrow inside one transaction",
+    needs: "1 node, hardened genesis",
+    conclusion: "the reachable surface is not where it looks. settle's callbacks are gas-capped below a single SSTORE, so a contract solver executes no code there; withdraw() is uncapped by necessity and is the real surface, where ordering rather than a guard is what refuses the reentry. A nested settle of a DIFFERENT intent stays permitted, which is correct — a blanket reentrancy guard would break nesting for no gain.",
+    finding: "the F1-F4 pull-payment cap closed a reentrancy surface it was not written for. PUSH_GAS = 30_000 was added so an unpayable payee could not revert a settlement; because 30,000 gas does not cover one SSTORE (20,000) plus the cold SLOADs before it, it also means a contract solver's receive() cannot execute ANY logic on the settle path — it runs out of gas and the payout falls back to credit. The first version of this attack aimed at that surface and reported a deviation precisely because the callback never fired.",
+    impl: { kind: "native", load: () => import("./c5_reenter_settle.js") },
+  },
+  {
+    id: "c6", cls: "C", name: "reenter withdraw() to drain the credit ledger",
+    target: "Settlement.withdraw (:98)",
+    premise: "re-enter withdraw during its push and collect the same credit twice",
+    expected: "blocked", expectedWhy: "both credit ledgers zero the balance before transferring, so a nested withdraw finds nothing",
+    defence: "credit zeroed before the call (:101) — effects-first, so a reentry sees 0 and reverts",
+    severity: "drain of the whole pull-payment ledger",
+    needs: "1 node, new attacker contract",
+    impl: { kind: "native", load: () => import("./c6_reenter_withdraw.js") },
+  },
+  {
+    id: "c7", cls: "C", name: "misbehaving ERC-20 output",
+    target: "Settlement._deliverToken — the token branch of settle",
+    premise: "a fee-on-transfer or silently-failing token means the user receives less than minOut while H is consumed and the input is released",
+    expected: "blocked",
+    expectedWhy: "delivery is verified by the user's BALANCE DELTA, not by what transferFrom returns, so a short or absent transfer reverts the whole settlement",
+    defence: "balance measured either side of the call, `require(after - before >= minOut)`; the low-level call additionally accepts empty returndata so pre-EIP-20 tokens work",
+    severity: "pre-fix: the user was short-changed on every token intent using such a token, with H consumed and the input released",
+    needs: "1 node, delta-check genesis",
+    conclusion: "FIXED. `minOut` now means arrived, not asked. A fee-on-transfer token and an outright liar both revert on the delta with nothing consumed, so the failure is confined to the solver's own transaction — and return-less tokens, which used to be unusable as outputs, now settle normally.",
+    finding: "checking transferFrom's RETURN VALUE checks what the token says, not what the user received, and the two differ for a whole class of real tokens. The fix reversed a second, quieter defect in the same line: the typed call could not decode a missing bool, so honest pre-EIP-20 tokens were refused. Accepting empty returndata is only safe because the delta check is there — a non-token address returns empty too, and now fails on the delta rather than passing on the silence. What remains undefendable is a token whose issuer can claw the balance back later, which is why the output asset being the user's own signed choice still matters.",
+    impl: { kind: "native", load: () => import("./c7_bad_token_output.js") },
+  },
+
+  // ---------------------------------------------------------------- D · auction / exclusivity
+  {
+    id: "d1", cls: "D", name: "bypass an open auction at minOut",
+    target: "Settlement.settle auction lock (:152-156)",
+    premise: "settle directly at minOut while an auction holds bids above it, pocketing the difference",
+    expected: "blocked", expectedWhy: "settlement consults the genesis auction's lock",
+    defence: "Settlement's lockedUntil check against auction 0x…22",
+    severity: "the user loses the entire auction premium on every intent",
+    needs: "1 node, E17b genesis",
+    conclusion: "E17 keeps the UNENFORCED case reproducible next to it, so the difference is visible.",
+    impl: { kind: "wrapped", script: "e17b_enforced_auction.ts" },
+  },
+  {
+    id: "d2", cls: "D", name: "brick an intent with an unpayable winning bid",
+    target: "Auction.execute — winner payout",
+    premise: "win with a contract that rejects RBTC, so execute can never complete and the intent is frozen until expiry",
+    expected: "contained", expectedWhy: "the payout downgrades to a withdrawable credit",
+    defence: "pull-payment fallback (Settlement._pay / auction credit ledger)",
+    severity: "any intent can be frozen for the price of one bid",
+    needs: "1 node, hardened genesis",
+    impl: { kind: "wrapped", script: "e18_failure_containment.ts" },
+  },
+  {
+    id: "d3", cls: "D", name: "block higher bids with a poisoned token refund",
+    target: "Auction.placeBidToken — outbid refund",
+    premise: "bid with a token whose transfers you can switch off, so refunding you reverts and no higher bid can land",
+    expected: "contained", expectedWhy: "the refund downgrades to creditToken, recoverable via withdrawToken",
+    defence: "auction token credit ledger (E21 part 3)",
+    severity: "lock the auction at the attacker's own bid",
+    needs: "1 node, credit-ledger genesis",
+    impl: { kind: "wrapped", script: "e21_credit_claims.ts" },
+  },
+  {
+    id: "d4", cls: "D", name: "front-run the closing bid / ride the decay boundary",
+    target: "Auction lockedUntil + GRACE decay",
+    premise: "bid in the window's last block, or settle directly one block before the decay opens",
+    expected: "untested",
+    defence: "E18 proves the lock decays AFTER grace and not inside it; the exact boundary block is not attacked",
+    severity: "off-by-one either strands the intent or reopens it a block early at minOut",
+    needs: "1 node, hardened genesis",
+    impl: { kind: "untested", why: "needs block-exact submission at lockedUntil+GRACE and ±1" },
+  },
+
+  // ---------------------------------------------------------------- E · exit (BTC-out)
+  {
+    id: "e1", cls: "E", name: "settle an exit by paying the wrong BTC address",
+    target: "Settlement._checkBtcOutIntent (:310)",
+    premise: "prove a real, confirmed BTC payment — to an address you control rather than the user's",
+    expected: "blocked", expectedWhy: "H commits to the destination hash160",
+    defence: "H == keccak256(\"BTCOUT\" || dest20 || salt) (:310)",
+    severity: "the solver claims the input having paid itself — total loss for the user",
+    needs: "1 node + bitcoind, E19 genesis",
+    impl: { kind: "wrapped", script: "e19_btc_exit.ts" },
+  },
+  {
+    id: "e2", cls: "E", name: "poach a reserved exit with a valid proof",
+    target: "Settlement.settleBtcOut reservation gate (:277)",
+    premise: "another solver's payout is public on Bitcoin — copy its proof and claim the input first",
+    expected: "blocked", expectedWhy: "a live reservation is exclusive to its reserver",
+    defence: "reservation gate (:275-278)",
+    severity: "the paying solver loses real, irreversible BTC to a proof thief",
+    needs: "1 node + bitcoind, E19 genesis",
+    impl: { kind: "wrapped", script: "e19_btc_exit.ts" },
+  },
+  {
+    id: "e3", cls: "E", name: "replay one BTC payout across several exits",
+    target: "Settlement._findPayment claimed-set (:388) / claimedBtcOut key (:337)",
+    premise: "one confirmed payout transaction, several exit intents committing the same destination — settle them all off a single payment",
+    expected: "contained", expectedWhy: "the claimed set is keyed per OUTPUT, so one output settles exactly one intent",
+    defence: "claimedBtcOut[keccak256(payTxid, voutIdx)] (:337), checked inside the output scan (:388)",
+    severity: "the solver claims N escrows for one payment — theft of N-1 users' inputs",
+    needs: "1 node + bitcoind, E19 genesis",
+    conclusion: "E19 already replays a single-output payout; this probes the multi-output case the key was designed for.",
+    impl: { kind: "native", load: () => import("./e3_payout_replay.js") },
+  },
+  {
+    id: "e4", cls: "E", name: "squat an exit to death",
+    target: "Settlement.reserveExit / forfeitExpiredExitBond (:241)",
+    premise: "reserve an exit and never pay, repeatedly, so the intent expires with the user unpaid and your bond stranded",
+    expected: "blocked", expectedWhy: "an expired-while-reserved bond is forfeited to the user by anyone",
+    defence: "forfeitExpiredExitBond (:241) + the window-outlives-intent check (:221)",
+    severity: "free denial of every exit intent (pre-fix the bond stranded forever)",
+    needs: "1 node, forfeit genesis; ~45-block wait",
+    impl: { kind: "wrapped", script: "e22_exit_bond_expiry.ts" },
+  },
+  {
+    id: "e5", cls: "E", name: "abuse the payout parser",
+    target: "Settlement._findPayment / _varint (:367-405)",
+    premise: "the payout parser is hand-rolled Solidity over attacker-supplied bytes — feed it serialisations it was not written for",
+    expected: "contained", expectedWhy: "calldata indexing is bounds-checked, so a malformed tx reverts rather than mis-parsing",
+    defence: "the segwit guard (:370), calldata bounds checks, and _varint's 0xfe/0xff revert (:403)",
+    severity: "a mis-parse that reads an attacker-chosen value or destination forges a payout that never happened",
+    needs: "1 node + bitcoind, E19 genesis; relays headers",
+    finding: ["the segwit guard at :370 is DEAD CODE, and \"legacy payout transactions only\" is wrong twice over. A real witness serialisation never reaches the guard — _checkAndClaimBtcPayment hashes it first, and sha256d of witness bytes is the wtxid, so the Bridge rejects it as unconfirmed. Strip the witness and the same payout settles normally, because the stripped bytes ARE the txid the merkle proof commits to. Segwit solvers are not locked out; they just have to strip before they call, and nothing documents that.",
+      "_findPayment's output scan WAS O(outputs), unbounded, and paid for by the SETTLER: a 254-output payout with the payment last exhausted the 1,500,000 gas limit every SDK caller sends, and the safe batch size was written down nowhere. FIXED alongside the E8 settler commitment: MAX_PAYOUT_OUTPUTS bounds the scan, so an over-wide payout is refused cheaply and by name, and the batch ceiling is now a named constant a solver can read.",
+      "the parser did not mis-parse once: Solidity 0.8 bounds-checks calldata indexing and slicing, so every malformed shape reverted with a named reason rather than reading past its buffer. The hand-rolled parse is sound; its restrictions are just mis-documented."],
+    impl: { kind: "native", load: () => import("./e5_payout_parser.js") },
+  },
+  {
+    id: "e8", cls: "E", name: "burn a solver's payout with a dust intent",
+    target: "Settlement.settleBtcOut (:260) — the reservation gate keys on H, not on the payment",
+    premise: "a Bitcoin payout is public bytes naming the user's address in the clear; point your own one-satoshi intent at the same destination and settle it with the honest solver's proof",
+    expected: "blocked", expectedWhy: "the payout must carry an OP_RETURN settler commitment (\"RSKX\" || settler address) and settleBtcOut requires msg.sender to match it",
+    defence: "settler commitment in the payout itself — entitlement travels with the payment, not with the (public, replayable) proof. Committing the SETTLER rather than H keeps batching: one 25-byte output protects every payment in the transaction.",
+    severity: "pre-fix: the paying solver lost its BTC irreversibly for the price of dust plus gas, repeatable on every payout",
+    needs: "1 node + bitcoind, E19 genesis; relays headers",
+    conclusion: "FIXED. The hijack is refused on the commitment check, the paying solver settles normally, and a payout built without a commitment is unclaimable by anyone (mandatory by design — an optional commitment would just be harvested when omitted).",
+    finding: "reserveExit is documented as the protection against 'losing an UNRESERVED exit race costs real bitcoin' (settlement.ts), and it does stop e2's poach. It does not stop this: the gate is keyed by H, so a rival intent on the same destination is outside it. Binding a claim to the payout's own funding — or committing the settler in H — is the missing piece.",
+    impl: { kind: "native", load: () => import("./e8_payout_hijack.js") },
+  },
+  {
+    id: "e6", cls: "E", name: "grind a salt so one payout fits two intents",
+    target: "Settlement._checkBtcOutIntent H commitment (:310)",
+    premise: "H = keccak256(\"BTCOUT\" || dest || salt) with an attacker-chosen salt — find two salts that let one payout answer two intents",
+    expected: "untested",
+    defence: "keccak256 preimage resistance; the per-output claimed set makes the win worthless even if found",
+    severity: "none if the claimed set holds (see e3) — listed because the salt is attacker-chosen and the coupling is not obvious",
+    needs: "1 node",
+    impl: { kind: "untested", why: "an attack on keccak256 itself; kept as an explicit non-goal rather than an unlisted assumption" },
+  },
+  {
+    id: "e7", cls: "E", name: "brick your own exit settle as an unpayable reserver",
+    target: "Settlement.settleBtcOut bond refund (:292)",
+    premise: "reserve from a contract that rejects RBTC, pay real BTC, then find your own settle reverts on the bond refund — opening a double-payment window",
+    expected: "contained", expectedWhy: "the bond refund is best-effort and downgrades to a credit",
+    defence: "_pay fallback on the bond refund (:292)",
+    severity: "a solver that has paid irreversible BTC cannot settle, and after the lapse someone else can be paid too",
+    needs: "1 node + bitcoind, E20 genesis; two 30-block lapses",
+    conclusion: "verified: E20's checks pass. Two harness faults found along the way, neither in the mechanism. (1) It had never run — e20_exit_containment.ts built its intents with expiry = head + 150, above the admission cap of 100 (intent.maxExpirySpan, pinned in podman-compose.yml), so the script threw before its first check; now +90, since the widest part needs ~67 blocks for its takeover reserve to clear RESERVE_WINDOW. (2) The E8 settler-commitment fix then broke part 3: its payout committed to cow while the SETTLER is the unpayable Griefer contract, so settleBtcOut refused it on the new check. payAndProve now takes the settler explicitly — a fair warning that the commitment must name whoever calls settle, not whoever funds the BTC.",
+    impl: { kind: "wrapped", script: "e20_exit_containment.ts" },
+  },
+
+  // ---------------------------------------------------------------- F · reorg / liveness
+  {
+    id: "f1", cls: "F", name: "keep the output when the settle is orphaned",
+    target: "consumed set + delivery under state reversion",
+    premise: "get paid, then reorg the settle away so H is free again and the escrow can be claimed twice",
+    expected: "blocked", expectedWhy: "delivery and H revert together with the block",
+    defence: "state reversion — H lives in contract storage, not off-chain bookkeeping",
+    severity: "double spend of the input across the reorg",
+    needs: "1 node (evm_snapshot/evm_revert)",
+    impl: { kind: "wrapped", script: "e9_reorg.ts" },
+  },
+  {
+    id: "f2", cls: "F", name: "orphan a settle with a heavier chain (real p2p)",
+    target: "fork choice vs settlement finality",
+    premise: "out-mine the chain containing the settle from a partitioned node, then heal",
+    expected: "blocked", expectedWhy: "the orphaned settle's effects revert and the intent is re-solvable",
+    defence: "fork choice + state reversion (the f1 argument under genuine p2p)",
+    severity: "as f1, without the single-node modelling caveat",
+    needs: "**reorg stack** (docker-compose.reorg.yml) + docker CLI; slow",
+    impl: { kind: "wrapped", script: "e16_cross_node_reorg.ts" },
+  },
+  {
+    id: "f3", cls: "F", name: "replay a payout proof across a BTC header reorg",
+    target: "Bridge SPV view vs claimedBtcOut",
+    premise: "settle an exit, then reorg the BTC chain so the payout is no longer confirmed — the user's BTC is gone but H stays consumed",
+    expected: "untested",
+    defence: "MIN_BTC_CONF (:331) prices the reorg depth; nothing re-validates a settled exit afterwards",
+    severity: "the user's exit is marked settled by a payment that no longer exists on Bitcoin",
+    needs: "1 node + bitcoind with invalidateblock",
+    impl: { kind: "untested", why: "needs bitcoind invalidateblock past MIN_BTC_CONF plus a Bridge header re-relay" },
+  },
+  {
+    id: "m1", cls: "M", name: "lift the intent out of a pending settle and front-run it",
+    target: "the settle transaction's own calldata — it carries the whole authenticated intent",
+    premise: "a solver's settle broadcasts rawIntentTx in the clear; copy those bytes out of the mempool and settle the same intent first, with a higher gas price (a miner does the same for free, by ordering its own block)",
+    expected: "succeeds", expectedWhy: "first-valid-inclusion with no exclusivity: whoever lands first consumes H, and a miner decides what lands first",
+    defence: "none for a bid-free intent. An OPEN auction is the only thing that reserves an intent (D1), and it must be bid upon first",
+    severity: "the honest solver loses its gas and, for a compound intent, the real capital it spent acquiring the output; repeatable on every profitable settle",
+    needs: "1 node, ticket off",
+    conclusion: "the intent is self-authenticating, which is what lets ANYONE relay it — and equally what lets anyone who sees it settle it. The auction lock is the mitigation the design already has; without a bid there is none.",
+    impl: { kind: "native", load: () => import("./m1_settle_frontrun.js") },
+  },
+  {
+    id: "m2", cls: "M", name: "censor rival solvers while settling as yourself",
+    target: "block construction — MinerUtils has no intent-specific rule beyond excluding intents",
+    premise: "a mining solver drops every OTHER solver's settle from its blocks and includes only its own, becoming a privileged solver without breaking a single rule",
+    expected: "succeeds", expectedWhy: "transaction selection is a miner's prerogative; nothing in the design can compel inclusion",
+    defence: "none at the protocol level — the honest framing is that liveness rests on 'some miner will include a profitable settle', not on any single one doing so",
+    severity: "spread capture concentrates in mining solvers; the user still gets minOut, so it is a competition harm rather than a theft",
+    needs: "on-demand mining (the reorg stack), plus a node-side transaction-selection hook",
+    stack: "reorg",
+    impl: {
+      kind: "untested",
+      why: "on-demand mining now exists (see ./_stacks.ts), but persistent exclusion does not: evm_mine " +
+        "includes whatever the pool holds, so declining to include a specific sender needs a patched " +
+        "MinerUtils in the rskj clone. Withholding the tx by partitioning the nodes instead would " +
+        "demonstrate a network split, not censorship — a different claim wearing this one's name.",
+    },
+  },
+  {
+    id: "m3", cls: "M", name: "starve an auction by ordering, then take it at the floor",
+    target: "Auction.bid — the bidding window is a block count; Auction.lockedUntil — exclusivity decay",
+    premise: "hold rival bids out of blocks until the deadline passes, or hold execute() out until exclusivity decays, then settle at minOut yourself",
+    expected: "succeeds",
+    expectedWhy: "the bidding WINDOW is still a block count, and a producer decides when blocks happen — it can close a ten-block window in no wall-clock time. The decay half is fixed and now runs as a regression test",
+    defence: "for the decay: exclusivity ends GRACE blocks after execute() is SEEN to fail, not after the deadline, so withholding execute() releases nothing (Auction.lockedUntil + failedAt, MIN_EXECUTE_GAS guarding the try/catch against EIP-150 under-gassing). For the window: none — see the conclusion",
+    severity: "the user loses the auction surplus the mechanism exists to give them",
+    needs: "on-demand mining (the reorg stack) — provisioned automatically with --provision",
+    stack: "reorg",
+    conclusion: "half closed. The DECAY squeeze is fixed: a producer that withholds execute() now decays nothing and can settle nothing, so the lever stops paying. The WINDOW squeeze remains, and is not fixable by choosing a different unit — timestamps only rate-limit it, since rskj lets a block run up to NEW_BLOCK_MAX_SECONDS_IN_THE_FUTURE (540s) ahead of real time. On-chain, time-windowed price discovery is capturable by whoever orders blocks; the structural answer is to discover the price off-chain and use the chain to enforce the floor and settle.",
+    finding: [
+      "GRACE cut both ways, and for an RBTC intent its time-based form had NO legitimate trigger: the auction holds the winning bid, so the settle inside execute() cannot fail for want of funds, and the only party who ever reached a time-based decay was one who chose not to execute. Keying decay on demonstrated failure keeps the S4 safety valve and removes the lever — at the price of replacing the user's 'minOut after GRACE whatever happens' fallback with 'the best bid, or nothing until expiry'.",
+      "a deadline denominated in BLOCKS is a clock for users and a counter for miners. This is a property of on-chain time windows, not of the parameter chosen: switching to timestamps bounds the theft to the chain's future-time allowance rather than preventing it.",
+    ],
+    impl: { kind: "native", load: () => import("./m3_auction_clock.js") },
+  },
+  {
+    id: "m4", cls: "M", name: "reorg a settled exit after the BTC payment is irreversible",
+    target: "the consumed set under a deliberate (not accidental) reorg",
+    premise: "a mining majority orphans a settleBtcOut after the solver's Bitcoin payment has confirmed, so H un-consumes while the bitcoin stays spent",
+    expected: "contained", expectedWhy: "the claimedBtcOut entry reverts with everything else, so the solver can re-present the SAME proof and settle again — its BTC is not lost, only delayed",
+    defence: "ordinary state reversion (F1/F2) plus the per-output claim reverting in step with it",
+    severity: "if the claim did NOT revert in step, the solver's payment would be unclaimable and its BTC gone",
+    needs: "an on-demand-mining stack WITH bitcoind — the reorg stack deliberately has none",
+    stack: "reorg",
+    impl: {
+      kind: "untested",
+      why: "E16's partition technique already orphans a settle, and ./_stacks.ts can now drive it from " +
+        "the board. What is missing is bitcoind on that stack: an EXIT settle needs a real BTC payment " +
+        "and header proof, and the reorg stack has no Bitcoin node. Wants a third compose file " +
+        "(on-demand mining + bitcoind) rather than any new attack logic.",
+    },
+  },
+];
+
+export const byId = (id: string): AttackSpec | undefined => ATTACKS.find((a) => a.id === id.toLowerCase());
+/** Attacks in a class, ordered by their numeric id so insertions do not scramble the menu. */
+export const byClass = (cls: string): AttackSpec[] =>
+  ATTACKS.filter((a) => a.cls === cls.toUpperCase())
+    .sort((x, y) => Number(x.id.slice(1)) - Number(y.id.slice(1)));

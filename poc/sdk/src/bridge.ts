@@ -4,7 +4,7 @@
  * account. All three write/read methods used here are public on regtest (all forks active).
  */
 import { Interface, JsonRpcProvider, Network, NonceManager, Wallet, getBytes } from "ethers";
-import { Rpc } from "./client.js";
+import { Rpc, waitFor } from "./client.js";
 import { BRIDGE_ADDR, CHAIN_ID, COW_KEY } from "./config.js";
 
 const iface = new Interface([
@@ -79,4 +79,51 @@ export class Bridge {
       height,
       getBytes(pmtHex.startsWith("0x") ? pmtHex : "0x" + pmtHex),
     ]);
+}
+
+/** The slice of a BTC client syncHeadersTo needs — structural, so bridge.ts stays free of btcrpc. */
+export interface HeaderSource {
+  getBlockHash(height: number): Promise<string>;
+  getBlockHeaderRaw(hash: string): Promise<string>;
+}
+
+/**
+ * Bring the Bridge's SPV view up to `target` BTC height, relaying headers in CHUNKS and draining
+ * each chunk before queuing the next.
+ *
+ * The obvious implementation batch-sends the whole backlog on one nonce run and waits for the last
+ * receipt. That works for the two or three headers a warm chain needs, which is why it survived, but
+ * not for the ~100 a fresh bitcoind needs: rskj's pool rejects a transaction whose nonce is more than
+ * roughly twenty ahead of the account's mined one (-32010 "transaction nonce too high"), so the batch
+ * dies mid-relay and the caller is left with a half-synced Bridge. Every caller in the repo shares
+ * this helper so the fix cannot drift back apart.
+ *
+ * Call it BEFORE the intent under test exists: on a fresh chain the relay burns ~100 RSK blocks, and
+ * inside an intent's lifetime that expires it (the mistake E19's header comment records).
+ */
+export async function syncHeadersTo(
+  rpc: Rpc, bridge: Bridge, btc: HeaderSource, target: number,
+  opts: { chunk?: number; timeoutMs?: number; onChunk?: (to: number) => void } = {},
+): Promise<void> {
+  const chunk = opts.chunk ?? 10;
+  const timeoutMs = opts.timeoutMs ?? 60000;
+  for (;;) {
+    const from = await bridge.bestChainHeight();
+    if (from >= target) return;
+    const to = Math.min(from + chunk, target);
+    bridge.resetNonce(); // this key signs through other paths between chunks — re-sync each time
+    let last: string | null = null;
+    for (let h = from + 1; h <= to; h++) {
+      last = await bridge.receiveHeader(await btc.getBlockHeaderRaw(await btc.getBlockHash(h)));
+    }
+    if (!last) return;
+    await waitFor(async () => {
+      const r = await rpc.getReceipt(last as string).catch(() => null);
+      return r !== null && r.blockNumber !== null;
+    }, timeoutMs, 500);
+    // A silent stall here is worse than a throw: the caller would go on to build a proof the Bridge
+    // cannot verify, and fail on "btc payout not confirmed" far from the real cause.
+    if ((await bridge.bestChainHeight()) <= from) throw new Error(`header relay stalled at btc height ${from} (target ${target})`);
+    opts.onChunk?.(to);
+  }
 }

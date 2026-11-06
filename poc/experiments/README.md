@@ -42,6 +42,7 @@ The rest of the suite probes the design's own admitted soft spots (the pressure 
 | E19 | BTC exit (the path back) | A solver's REAL Bitcoin payment to the user's address, SPV-proven against the Bridge's headers, settles the exit intent and releases the input; wrong-destination and replayed payouts revert | the wrong address settles, the user's BTC doesn't arrive, the solver isn't repaid, or one payout output settles twice | 1 node + bitcoind, **E19 genesis**; relays headers |
 | E20 | Exit failure containment | A late-but-unraced reserver keeps its bond; re-reserving over a lapsed squat forfeits the old bond into the escrow at reserve time and pays the taker (input + squatter's bond + own bond back); an unpayable contract reserver that has paid real BTC settles anyway — bond + input downgrade to Settlement credits, its failed withdraw is isolated, the user is paid exactly once | the unraced late settle forfeits, the takeover fails or the old bond vanishes, the unpayable reserver's settle reverts (self-brick — a double-payment window opens after the lapse), or the credit ledger mismatches input + bond | 1 node + bitcoind, **E20 genesis** (Settlement credit ledger); relays headers, two 30-block lapses |
 | E21 | Credit claims + auction resolution edges | An unpayable direct solver's overpaid settle succeeds (excess + input credited); credits are COLLECTABLE (toggleable receiver withdraws, ledger zeroes); a blocked ERC-20 outbid refund becomes creditToken and is recovered via withdrawToken while the auction completes; execute after GRACE decay still pays the best bid; reclaim works on the expiry condition | delivery reverts on an unpayable solver's refund, a credit can't be withdrawn or withdraws twice, a poisoned refund blocks the outbid, post-decay execute pays minOut or reverts, or expiry reclaim loses escrow | 1 node, **credit-ledger genesis** |
+| E23 | Entry binding (peg-in ↔ intent) | A bound escrow answers only to the intent it was deposited for: a rival dust-minOut intent naming the victim's btcTxid is ADMITTED but reverts at settle; the victim's own intent settles normally; the same play against a legacy UNBOUND escrow demonstrably steals the input (the B1 theft, kept as evidence); bindings cannot be reassigned, same-H top-ups accumulate | the bound squat succeeds (theft survives the fix), the victim's settle fails, the legacy theft is blocked (hidden enforcement), or a binding is reassignable | 1 node, **entry-binding genesis** (peginIntent) |
 | E22 | Exit bond expiry | A reservation whose window would outlive the intent is rejected; a LIVE reservation cannot be forfeited; once the intent expires, anyone forfeits the bond TO THE USER, the reservation clears, and no double forfeit exists (pre-fix: the bond stranded forever, making squat-to-death free) | a near-expiry reservation is accepted, a live one is forfeitable, the bond misses the user, forfeits twice, or strands | 1 node, **forfeitExpiredExitBond genesis**; ~45-block wait |
 | E18 | Failure containment (pull-payments + lock decay) | An unpayable winner cannot brick the intent (execute succeeds, its input becomes an unclaimable credit); an unpayable outbid bidder cannot block higher bids (refund downgrades to a credit); exclusivity decays GRACE blocks after the deadline, reopening direct settlement at minOut; a failed withdraw is confined to its own tx | execute reverts "winner pay failed" (the brick survives), a higher bid reverts "outbid refund failed", the credit ledger is corrupted by a failed withdraw, or the lock fails to decay / decays inside the grace window | 1 node, **hardened genesis** (down -v + rebuild) |
 
@@ -57,7 +58,7 @@ settle. From `poc/`:
 ```
 docker-compose -f stack/podman-compose.yml build            # once, if rskj-intent:poc isn't built yet
 docker-compose -f stack/docker-compose.reorg.yml up -d
-( cd sdk && npm run e16 )
+npm run sdk -- e16
 docker-compose -f stack/docker-compose.reorg.yml down -v
 ```
 
@@ -113,6 +114,23 @@ These are real and belong in the write-up, not buried:
 - "Instant". The design's own pressure point 3 — admission is gated on the Bridge SPV view, so protocol
   latency is BTC confirmation + header registration, not instant. No experiment yet drives the Bridge
   header cadence to measure it; it needs the peg-in path first.
+
+## Attacks, by surface rather than by number
+
+More than half the table above is adversarial, but the numbering hides that: nothing tells you which
+part of the surface is covered, or where the holes are. `../sdk/attacks/` re-files the same work by
+threat class — admission, entry escrow, settlement atomicity, auction, exit, reorg — with the expected
+outcome declared per attack and the untested surfaces listed rather than omitted:
+
+```
+npm run attack                       # menu (from poc/)
+npm run attacks                      # whole board, CI form
+```
+
+Existing experiments are wrapped, not rewritten. New attacks get richer forensics (revert reasons, gas
+burnt, per-step balance deltas), and the suite has already produced findings the experiments did not —
+see `../sdk/attacks/README.md`, in particular the exit payout hijack (E8) that `reserveExit` does not
+cover.
 
 ## Reading a result
 

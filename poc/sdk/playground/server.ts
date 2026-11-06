@@ -28,14 +28,14 @@ import { Contract, ContractFactory, JsonRpcProvider, Network, Wallet, getBytes, 
 import grieferArtifact from "../src/abi/Griefer.json" with { type: "json" };
 import { buildIntent, btcOutH, randomH } from "../src/intent.js";
 import { Solver } from "../src/solver.js";
-import { depositForPegin, peginOf, settleBtcOut, reserveExit, exitBondFor } from "../src/settlement.js";
+import { depositForPegin, peginOf, settleBtcOut, reserveExit, exitBondFor, bindingOf } from "../src/settlement.js";
 import { branchFromTxOutProof } from "../src/merkle.js";
 import { auction, placeBid, placeBidToken, executeAuction, bidOf, lockedUntil, withdrawCredit, creditOf } from "../src/auction.js";
 import { deployVault, vault, vaultDeposit, vaultApprove, sharesOf, vaultWithdraw } from "../src/vault.js";
 import { deployToken, token, mint, approve, balanceOf } from "../src/token.js";
 import { deployPool, deployTokenVault, pool, tokenVault, reserves, addLiquidity, removeLiquidity, lpBalanceOf, lpApprove, tvDeposit, tvApprove, tvSharesOf, tvWithdraw } from "../src/amm.js";
 import { BtcRpc } from "../src/btcrpc.js";
-import { Bridge } from "../src/bridge.js";
+import { Bridge, syncHeadersTo } from "../src/bridge.js";
 import { Rpc, sleep, waitFor } from "../src/client.js";
 import { RPC_A, SETTLEMENT_ADDR, RBTC, BTC_OUT, COW_KEY } from "../src/config.js";
 
@@ -106,6 +106,15 @@ async function settleInfo(H: string): Promise<{ tx: string; solver: string; bloc
 const btc = new BtcRpc();
 let btcEnabled = false, faucetAddr = "", federationAddr = "";
 let btcChain: Promise<unknown> = Promise.resolve();
+/**
+ * The header source syncHeadersTo reads through, kept inside the viaBtc mutex so a relay does not
+ * interleave its bitcoind calls with the rest of the server's.
+ */
+const headerSrc = {
+  getBlockHash: (h: number) => viaBtc(() => btc.getBlockHash(h)),
+  getBlockHeaderRaw: (hash: string) => viaBtc(() => btc.getBlockHeaderRaw(hash)),
+};
+
 function viaBtc<T>(fn: () => Promise<T>): Promise<T> {
   const p = btcChain.then(fn, fn);
   btcChain = p.catch(() => undefined);
@@ -466,19 +475,16 @@ async function tryFill(s: SolverRec, it: IntentRec): Promise<void> {
     slog(s, `reserved — FILL (exit): paying ${Number(it.minOut) / 1e8} BTC to ${u.btcAddr.slice(0, 12)}… ON BITCOIN`);
     try {
       const { txid, rawHex } = await viaBtc(async () => {
-        const res = await btc.payToAddress(s.btcAddr!, u.btcAddr!, Number(it.minOut) / 1e8);
+        const res = await btc.payToAddress(s.btcAddr!, u.btcAddr!, Number(it.minOut) / 1e8, s.addr);
         await btc.generateToAddress(1, faucetAddr);
         return res;
       });
       slog(s, `paid — payout ${txid.slice(0, 12)}… confirmed on Bitcoin; relaying headers + proving on RSK`);
       const bridge = new Bridge(rpc, s.key);
-      const startH = await bridge.bestChainHeight();
       const bestH = await viaBtc(() => btc.getBlockCount());
-      let lastHeaderTx: string | null = null;
-      for (let h = startH + 1; h <= bestH; h++) {
-        lastHeaderTx = await bridge.receiveHeader(await viaBtc(async () => btc.getBlockHeaderRaw(await btc.getBlockHash(h))));
-      }
-      if (lastHeaderTx) await myReceipt(lastHeaderTx); // batch-send, single receipt wait
+      // Chunked: normally 1-3 headers, but if the startup backlog sync ever failed this is the call
+      // that inherits it, and a single-nonce-run batch dies at -32010 around twenty deep.
+      await syncHeadersTo(rpc, bridge, headerSrc, bestH);
       const v = await viaBtc(() => btc.getRawTransactionVerbose(txid));
       const payHeight = bestH - ((v.confirmations ?? 1) - 1);
       const blockHash = await viaBtc(() => btc.getBlockHash(payHeight));
@@ -587,12 +593,12 @@ async function createIntent(p: { userId: number; type: IntentType; inputRbtc: nu
     const btcDest = await btc.hash160Of(u.btcAddr);
     const H = btcOutH(btcDest, salt);
     const btcTxid = getBytes(randomBytes(32));
-    await viaCow(() => depositForPegin(rpc.url, hexlify(btcTxid), input));
+    await viaCow(() => depositForPegin(rpc.url, hexlify(btcTxid), input, bindingOf(H, u.wallet.address)));
     await sleep(1200);
     const head = await rpc.blockNumber();
     const it: IntentRec = {
       id: ++seq, H: hexlify(H), rawHex: "", userId: p.userId, type: p.type, input, minOut, outputToken,
-      expiry: head + Math.min(p.expiryBlocks || 80, 95), btcTxid: hexlify(btcTxid), viaAuction: false,
+      expiry: head + Math.min(Math.max(p.expiryBlocks || 80, 1), 95), btcTxid: hexlify(btcTxid), viaAuction: false,
       created: Date.now(), salt, btcDest,
     };
     it.rawHex = buildIntent(u.wallet, { H, btcTxid, expiry: it.expiry, minOut, outputToken }).rawHex;
@@ -619,12 +625,12 @@ async function createIntent(p: { userId: number; type: IntentType; inputRbtc: nu
   } else {
     btcTxid = getBytes(randomBytes(32));
   }
-  await viaCow(() => depositForPegin(rpc.url, hexlify(btcTxid), input));
+  await viaCow(() => depositForPegin(rpc.url, hexlify(btcTxid), input, bindingOf(H, u.wallet.address)));
   await sleep(1200);
   const head = await rpc.blockNumber();
   const it: IntentRec = {
     id: ++seq, H: hexlify(H), rawHex: "", userId: p.userId, type: p.type, input, minOut, outputToken,
-    expiry: head + Math.min(p.expiryBlocks || 80, 95), btcTxid: hexlify(btcTxid), viaAuction: !!p.viaAuction, created: Date.now(),
+    expiry: head + Math.min(Math.max(p.expiryBlocks || 80, 1), 95), btcTxid: hexlify(btcTxid), viaAuction: !!p.viaAuction, created: Date.now(),
   };
   const built = buildIntent(u.wallet, { H, btcTxid, expiry: it.expiry, minOut, outputToken });
   it.rawHex = built.rawHex;
@@ -790,22 +796,29 @@ async function main(): Promise<void> {
     federationAddr = await new Bridge(rpc).getFederationAddress();
     btcEnabled = true;
     note(`bitcoind connected — real BTC moves: users get real addresses, peg-ins hit the federation ${federationAddr.slice(0, 12)}…`);
-    // sync the Bridge's SPV view to the BTC tip NOW, so exit fills only relay a couple of new headers
-    // instead of a ~100-header backlog inside an intent's lifetime (which would expire it)
-    await viaCow(async () => {
-      const bridge = new Bridge(rpc);
-      const from = await bridge.bestChainHeight();
-      const to = await btc.getBlockCount();
-      if (to > from) {
-        note(`syncing Bridge headers ${from + 1}…${to} (one-off backlog)…`);
-        let last: string | null = null;
-        for (let h = from + 1; h <= to; h++) last = await bridge.receiveHeader(await btc.getBlockHeaderRaw(await btc.getBlockHash(h)));
-        if (last) await myReceipt(last);
-        note(`Bridge synced to BTC height ${to}`);
-      }
-    });
   } catch (e) {
     note(`bitcoind unreachable (${(e as Error).message.slice(0, 50)}) — BTC side falls back to synthetic txids`);
+  }
+  // Sync the Bridge's SPV view to the BTC tip NOW, so exit fills only relay a couple of new headers
+  // instead of a ~100-header backlog inside an intent's lifetime (which would expire it).
+  //
+  // In its own try, and AFTER btcEnabled is set: this used to sit inside the block above, where a
+  // relay failure was reported as "bitcoind unreachable" and the server carried on with a Bridge that
+  // was silently behind — so every later exit fill relayed the backlog inside an intent's lifetime.
+  if (btcEnabled) {
+    try {
+      await viaCow(async () => {
+        const bridge = new Bridge(rpc);
+        const from = await bridge.bestChainHeight();
+        const to = await btc.getBlockCount();
+        if (to <= from) return;
+        note(`syncing Bridge headers ${from + 1}…${to} (one-off backlog)…`);
+        await syncHeadersTo(rpc, bridge, headerSrc, to, { onChunk: (h) => note(`Bridge at BTC height ${h}…`) });
+        note(`Bridge synced to BTC height ${to}`);
+      });
+    } catch (e) {
+      note(`WARNING: Bridge header sync FAILED (${(e as Error).message.slice(0, 80)}) — exit fills will be slow or expire`);
+    }
   }
 
   createServer(async (req, res) => {

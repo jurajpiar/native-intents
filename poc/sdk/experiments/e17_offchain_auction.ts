@@ -17,7 +17,7 @@
  */
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
 import { Solver } from "../src/solver.js";
-import { depositForPegin } from "../src/settlement.js";
+import { depositForPegin, bindingOf } from "../src/settlement.js";
 import { deployAuction, auction, placeBid, executeAuction, reclaimBid, bidOf, withdrawCredit } from "../src/auction.js";
 import { Report, preflight, requireSettlement, rpcA, fundAccount, waitReceipt, succeeded, reverted } from "./_harness.js";
 import { RBTC } from "../src/config.js";
@@ -45,9 +45,9 @@ async function main(): Promise<number> {
 
   // --- part 1: the auction, respected ---
   const btcTxid1 = getBytes(randomBytes(32));
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid1), INPUT));
   const user1 = freshWallet();
   const H1 = randomH();
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid1), INPUT, bindingOf(H1, user1.address)));
   const h = await rpcA.blockNumber();
   const intent1 = buildIntent(user1, { H: H1, btcTxid: btcTxid1, expiry: h + 90, minOut: MINOUT, outputToken: RBTC });
   await rpcA.sendRaw(intent1.rawHex);
@@ -75,9 +75,9 @@ async function main(): Promise<number> {
 
   // --- part 2: the bypass (unenforced instance) ---
   const btcTxid2 = getBytes(randomBytes(32));
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid2), INPUT));
   const user2 = freshWallet();
   const H2 = randomH();
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid2), INPUT, bindingOf(H2, user2.address)));
   const intent2 = buildIntent(user2, { H: H2, btcTxid: btcTxid2, expiry: (await rpcA.blockNumber()) + 90, minOut: MINOUT, outputToken: RBTC });
   await rpcA.sendRaw(intent2.rawHex);
 

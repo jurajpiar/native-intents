@@ -20,11 +20,10 @@ an env toggle), then drive the peg-in and run E8:
 ```fish
 cd ~/github.com/jurajpiar/native-intents/poc
 set -x INTENT_REQUIRE_TICKET true
-docker-compose -f stack/podman-compose.yml up -d      # recreates nodes with ticket enforcement ON
-cd sdk
-npm run pegin                                          # registers a real peg-in; prints PEGIN_TXID=...
+npm run stack:up                                       # recreates nodes with ticket enforcement ON
+npm run sdk -- pegin                                   # registers a real peg-in; prints PEGIN_TXID=...
 set -x PEGIN_TXID <the txid it printed>
-npm run e8pos                                          # bogus txid rejected; valid-ticket intent admitted
+npm run sdk -- e8pos                                   # bogus txid rejected; valid-ticket intent admitted
 ```
 
 To go back to the main suite, clear the flag and recreate:
@@ -32,7 +31,7 @@ To go back to the main suite, clear the flag and recreate:
 ```fish
 set -e INTENT_REQUIRE_TICKET
 docker-compose -f stack/podman-compose.yml up -d
-cd sdk; npm run all
+npm run all   # from poc/
 ```
 
 ## The refund story this validates

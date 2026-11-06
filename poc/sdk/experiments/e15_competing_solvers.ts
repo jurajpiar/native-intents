@@ -16,7 +16,7 @@
  */
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
 import { Solver } from "../src/solver.js";
-import { depositForPegin } from "../src/settlement.js";
+import { depositForPegin, bindingOf } from "../src/settlement.js";
 import { deployBond, bond, bondUp, isBonded, bondOf, slash, MIN_BOND } from "../src/bond.js";
 import { Report, preflight, requireSettlement, rpcA, fundAccount, waitReceipt, succeeded, reverted } from "./_harness.js";
 import { RBTC } from "../src/config.js";
@@ -46,9 +46,9 @@ async function main(): Promise<number> {
 
   // --- one profitable intent (RBTC output; input escrowed for the winner to claim) ---
   const btcTxid = getBytes(randomBytes(32));
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT));
   const user = freshWallet();
   const H = randomH();
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, bindingOf(H, user.address)));
   const height = await rpcA.blockNumber();
   const intent = buildIntent(user, { H, btcTxid, expiry: height + 95, minOut: MINOUT, outputToken: RBTC });
   await rpcA.sendRaw(intent.rawHex);

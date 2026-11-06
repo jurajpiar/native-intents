@@ -1,5 +1,5 @@
 /** Settlement contract helpers for the fee mechanics (m4): model the peg-in credit and read the escrow. */
-import { Contract, JsonRpcProvider, Network, Wallet } from "ethers";
+import { Contract, JsonRpcProvider, Network, Wallet, keccak256, solidityPacked, hexlify } from "ethers";
 import settlementAbi from "./abi/Settlement.json" with { type: "json" };
 import { CHAIN_ID, COW_KEY, SETTLEMENT_ADDR } from "./config.js";
 
@@ -8,16 +8,62 @@ function contract(rpcUrl: string, key: string = COW_KEY): Contract {
   return new Contract(SETTLEMENT_ADDR, settlementAbi as import("ethers").InterfaceAbi, new Wallet(key, provider));
 }
 
-/** Model the peg-in: escrow `valueWei` of input RBTC against a BTC txid. Returns the tx hash. */
-export async function depositForPegin(rpcUrl: string, btcTxidHex: string, valueWei: bigint, key: string = COW_KEY): Promise<string> {
+/**
+ * Model the peg-in: escrow `valueWei` of input RBTC against a BTC txid, BOUND to intent commitment
+ * `intentH` (the PoC model of RSKIP176 entry binding — sign first, then deposit). Passing the default
+ * zero H models a legacy/unbound peg-in, which stays exposed to txid squatting (atlas B1).
+ */
+/**
+ * The escrow binding the contract keys on: keccak256(H || signer). Mirrors Settlement.bindingOf.
+ *
+ * NOT H alone. H is public the moment an intent is in the mempool, and anyone can sign an intent
+ * carrying it; the signer is what a rival cannot forge. Binding to the pair is what stops a same-H
+ * twin with a dust minOut collecting the victim's escrow (attack B5). In production this is the value
+ * that goes into RSKIP-176's derivationArgumentsHash.
+ */
+export function bindingOf(H: string | Uint8Array, signer: string): string {
+  return keccak256(solidityPacked(["bytes32", "address"], [hexlify(H), signer]));
+}
+
+/**
+ * Model the peg-in credit. `binding` is bindingOf(H, signer) for a bound escrow, or all-zero for the
+ * legacy unbound path. It is deliberately NOT computed here from an H: every caller has to say who the
+ * signer is, because getting that wrong silently produces an escrow nobody can claim.
+ */
+export async function depositForPegin(
+  rpcUrl: string, btcTxidHex: string, valueWei: bigint,
+  binding: string | Uint8Array = "0x" + "0".repeat(64), key: string = COW_KEY,
+): Promise<string> {
   const s = contract(rpcUrl, key);
-  const tx = await s.depositForPegin(btcTxidHex, { value: valueWei, gasLimit: 200_000, gasPrice: 1_000_000, type: 0, chainId: CHAIN_ID });
+  const tx = await s.depositForPegin(btcTxidHex, binding, { value: valueWei, gasLimit: 200_000, gasPrice: 1_000_000, type: 0, chainId: CHAIN_ID });
   return tx.hash;
+}
+
+/** Which intent a modelled escrow is bound to (zero hash = unbound/legacy). */
+export async function peginIntentOf(rpcUrl: string, btcTxidHex: string): Promise<string> {
+  return contract(rpcUrl).peginIntent(btcTxidHex);
 }
 
 /** Read the escrowed input for a BTC txid. */
 export async function peginOf(rpcUrl: string, btcTxidHex: string): Promise<bigint> {
   return contract(rpcUrl).pegin(btcTxidHex);
+}
+
+/** Whether a REAL Bridge peg-in for this txid has already been claimed by a settlement. */
+export async function claimedPeginOf(rpcUrl: string, btcTxidHex: string): Promise<boolean> {
+  return contract(rpcUrl).claimedPegin(btcTxidHex);
+}
+
+/**
+ * Reads the DEPRECATED pre-B6 consumed set: slot == H inside the settlement contract's own storage.
+ *
+ * Only the B6 regression uses this, and it is the half of the pair that makes the fix provable: after
+ * a settlement, isConsumed(H) must be true (the marker was written) while legacyIsConsumedOf(H) is
+ * false (it was not written HERE). Checking only that the old namespace is clean would also pass if
+ * the settlement had silently done nothing.
+ */
+export async function legacyIsConsumedOf(rpcUrl: string, H: string | Uint8Array): Promise<boolean> {
+  return contract(rpcUrl).legacyIsConsumed(hexlify(H));
 }
 
 /**
@@ -29,6 +75,8 @@ export async function settleBtcOut(
   rpcUrl: string,
   p: { rawIntentTx: string; salt: Uint8Array | string; btcDest: string; rawBtcTx: string; btcBlockHash: string; merklePath: number; merkleHashes: string[] },
   key: string = COW_KEY,
+  /** _findPayment scans every output, so a wide payout needs more than the default — see attacks/e5. */
+  gasLimit = 1_500_000,
 ): Promise<string> {
   const s = contract(rpcUrl, key);
   const tx = await s.settleBtcOut(
@@ -36,7 +84,7 @@ export async function settleBtcOut(
     p.rawBtcTx.startsWith("0x") ? p.rawBtcTx : "0x" + p.rawBtcTx,
     p.btcBlockHash.startsWith("0x") ? p.btcBlockHash : "0x" + p.btcBlockHash,
     p.merklePath, p.merkleHashes,
-    { gasLimit: 1_500_000, gasPrice: 1_000_000, type: 0, chainId: CHAIN_ID },
+    { gasLimit, gasPrice: 1_000_000, type: 0, chainId: CHAIN_ID },
   );
   return tx.hash;
 }

@@ -23,6 +23,8 @@ const suite = [
   "e18_failure_containment.ts", // needs the hardened genesis auction (pull-payments + GRACE); exits with instructions if stale
   "e21_credit_claims.ts", // needs the credit-ledger genesis; exits with instructions if stale
   "e22_exit_bond_expiry.ts", // needs forfeitExpiredExitBond; no bitcoind required (the exit is never paid)
+  "e23_entry_binding.ts", // needs the entry-binding genesis (peginIntent); no bitcoind required
+  "e24_mempool_sourced_settlement.ts", // discovery: solver gets an RPC URL and nothing else
 ];
 
 const results: { name: string; code: number }[] = [];

@@ -31,7 +31,7 @@ async function main(): Promise<number> {
   const user = freshWallet();
   const H = randomH();
   const height = await rpcA.blockNumber();
-  const intent = buildIntent(user, { H, btcTxid: new Uint8Array(32), expiry: height + 100, minOut: MINOUT });
+  const intent = buildIntent(user, { H, btcTxid: new Uint8Array(32), expiry: height + 95, minOut: MINOUT });
   await rpcA.sendRaw(intent.rawHex);
   r.check("honest intent admitted", true, intent.hash);
 

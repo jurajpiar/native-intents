@@ -12,11 +12,15 @@ pragma solidity 0.8.19;
  * the RSK-namespace signing hash and ecrecover is impractical in Solidity). This contract STATICCALLs
  * the parse precompile with the raw intent bytes and receives the authenticated fields.
  *
- * The consumed set is this contract's own storage at slot == H (via assembly), so the node's
- * admission check reads it exactly as before, just at this address.
+ * The consumed set is NOT here. It lives at the consumed-set precompile (CONSUMED, below), which owns
+ * its own address and derives its keys under a domain tag. It used to be this contract's own storage
+ * at slot == H, and because H is chosen by the user that put it in the same address space as the
+ * mappings declared below — attack B6 wrote into them through it. `legacyIsConsumed` is retained as a
+ * deprecated reader of that old namespace so the regression test can show it is no longer written.
  */
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address who) external view returns (uint256);
 }
 
 contract Settlement {
@@ -32,11 +36,33 @@ contract Settlement {
     // sentinel outputToken meaning "the output is BTC, delivered ON BITCOIN" (exit intents / E19).
     // No code lives here — it is only a marker an intent's outputToken field can carry.
     address constant BTC_OUT = 0x0000000000000000000000000000000001000023;
+    /**
+     * Consumed-set precompile. The set USED to live in this contract's own storage at slot == H,
+     * which put it in the same address space as every mapping declared below — and H is chosen by
+     * the user, so an intent whose H equalled keccak256(abi.encode(key, declarationIndex)) wrote
+     * straight into one of them. Attack B6 confirmed it on a node. The set now lives at its own
+     * address, under a domain-tagged key, where nothing else can alias with it.
+     */
+    address constant CONSUMED = 0x0000000000000000000000000000000001000024;
     // confirmations the solver's BTC payout needs in the Bridge's SPV view before it settles. Regtest
     // PoC value; mainnet policy would set this per reorg-risk appetite (the solver bears that risk).
     int256 constant MIN_BTC_CONF = 1;
     // blocks a reservation shields the reserver's BTC payment from exit races (see reserveExit)
     uint256 public constant RESERVE_WINDOW = 30;
+    /**
+     * Exit payouts MUST carry a settler commitment: an OP_RETURN output holding
+     * "RSKX" || <20-byte RSK address of the settler>. Rationale (attack E8, "payout hijack"): the
+     * payout is public bytes and the SPV proof is a BEARER object, so without this anyone could
+     * present another solver's payout against their OWN dust intent on the same destination — the
+     * per-output claim then burns the paying solver's bitcoin irreversibly. The reservation gate
+     * cannot help: it keys on H, and the hijacker brings a different H. Committing the SETTLER (not
+     * H) keeps batching intact: one 25-byte output protects every payment in the transaction.
+     * Legitimate here, unlike on the entry side, because the solver BUILDS this transaction and
+     * wants to be repaid — omitting the commitment costs only the omitter.
+     */
+    bytes4 constant SETTLER_TAG = 0x52534b58; // "RSKX"
+    /// Bound on the payout's output count: an unbounded scan lets a wide payout exceed any gas limit.
+    uint256 public constant MAX_PAYOUT_OUTPUTS = 64;
 
     // one real peg-in per btcTxid can be claimed once (the Bridge does not clear its record)
     mapping(bytes32 => bool) public claimedPegin;
@@ -94,6 +120,38 @@ contract Settlement {
         }
     }
 
+    /**
+     * Deliver `amount` of an ERC-20 to `to`, and verify it ARRIVED.
+     *
+     * The obvious form — `require(token.transferFrom(...))` — checks what the token SAYS, not what the
+     * user received, and those differ for two common kinds of token. A fee-on-transfer token moves 90%
+     * and returns true; an outright liar moves nothing and returns true. In both cases the settlement
+     * succeeded, H was consumed and the input released, while the user got less than the minimum they
+     * signed for. `minOut` has to mean "arrived", not "asked", or it guarantees nothing.
+     *
+     * So the balance is measured either side of the call and the DELTA is what must reach minOut. That
+     * is the only check that cannot be talked out of by the token's own return value.
+     *
+     * The call is also made low-level rather than through the typed interface, for the pre-EIP-20
+     * tokens that return no data at all: Solidity cannot decode a missing bool, so the typed form
+     * reverts on tokens that transferred perfectly well. Empty returndata is accepted as success, and
+     * the delta check is what makes that safe — a non-token address returns empty too, and moves
+     * nothing, so it fails on the delta instead of passing on the silence.
+     *
+     * Not defended against, because it cannot be: a token whose issuer can claw the balance back after
+     * this transaction. No on-chain check survives an adversarial issuer, which is why the output asset
+     * being the USER'S OWN signed choice matters — wallets must not offer arbitrary tokens as outputs.
+     */
+    function _deliverToken(address token, address to, uint256 amount) internal {
+        uint256 before = IERC20(token).balanceOf(to);
+        (bool ok, bytes memory ret) = token.call(
+            abi.encodeWithSelector(IERC20.transferFrom.selector, msg.sender, to, amount));
+        require(ok, "erc20 transfer failed");
+        // A token that returns data must return `true`; one that returns nothing is the pre-EIP-20 form.
+        require(ret.length == 0 || abi.decode(ret, (bool)), "erc20 returned false");
+        require(IERC20(token).balanceOf(to) - before >= amount, "erc20 under-delivered");
+    }
+
     /// Claim accrued credits. Effects-first: a failed transfer reverts only this call, never the ledger.
     function withdraw() external {
         uint256 amt = credit[msg.sender];
@@ -104,13 +162,99 @@ contract Settlement {
         emit Withdrawn(msg.sender, amt);
     }
 
-    /// Model the peg-in credit: escrow `msg.value` of input RBTC against a BTC txid.
-    function depositForPegin(bytes32 btcTxid) external payable {
+    /**
+     * Which intent an escrowed input answers to: btcTxid -> BINDING (0 = unbound), where
+     *
+     *     binding = keccak256(H || signer)
+     *
+     * and NOT H alone. H is the pipeline commitment: thirty-two bytes that sit in the clear in every
+     * intent in the public mempool, and that anyone may copy into an intent of their own. The signer is
+     * recovered from the signature at settlement, so a binding that omits it lets a rival sign a twin
+     * of the victim's intent — same H, same btcTxid, dust minOut — and have a solver release the
+     * victim's escrow against it (attack B5). Including the signer means a rival with a different key
+     * computes a different binding and commands no funds.
+     *
+     * This is the PoC model of RSKIP176 entry binding: in production the peg-in's DERIVED DEPOSIT
+     * ADDRESS carries the binding as its derivationArgumentsHash, so the Bridge credits an escrow only
+     * the matching (intent, signer) pair can claim; here the deposit call carries it instead. The same
+     * lesson applies there — the derivation argument MUST be keccak256(H || signer), not H — because
+     * RSKIP176's other derivation inputs (refund address, LBC, LP) do not include the Rootstock signer.
+     */
+    mapping(bytes32 => bytes32) public peginIntent;
+
+    /// The binding an escrow is keyed on. One place, so the SDK, the attacks and the contract cannot
+    /// disagree about it — a mismatched hash here would look exactly like an unbound escrow.
+    function bindingOf(bytes32 h, address signer) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(h, signer));
+    }
+
+    /**
+     * Model the peg-in credit: escrow `msg.value` of input RBTC against a BTC txid, BOUND to
+     * `binding = bindingOf(H, signer)`. Commit-first ordering, as RSKIP176 requires: H and the signer
+     * are known before any coins move, so the binding can determine the deposit address.
+     * binding == 0 models a legacy/unbound peg-in: still claimable by any intent naming the txid, kept
+     * only to mirror the real-pegin path's current exposure (see _releaseInput).
+     */
+    function depositForPegin(bytes32 btcTxid, bytes32 binding) external payable {
+        if (binding != bytes32(0)) {
+            require(peginIntent[btcTxid] == bytes32(0) || peginIntent[btcTxid] == binding, "escrow bound to another intent");
+            peginIntent[btcTxid] = binding;
+        }
         pegin[btcTxid] += msg.value;
     }
 
     /// consumed-set view: true once H has been settled
     function isConsumed(bytes32 h) external view returns (bool) {
+        return _consumedMarker(h) != 0;
+    }
+
+    /**
+     * 0 when unconsumed, else the block number at which H was marked, plus one.
+     *
+     * The two failures are reported separately on purpose. A staticcall to an address with NO code
+     * returns ok=true with an empty result, while a precompile that THROWS returns ok=false — so one
+     * combined require collapses "the precompile is missing" and "the precompile rejected us" into a
+     * single message, and that ambiguity cost a diagnosis round.
+     */
+    function _consumedMarker(bytes32 h) internal view returns (uint256) {
+        (bool ok, bytes memory ret) = CONSUMED.staticcall(abi.encodeWithSignature("isConsumed(bytes32)", h));
+        require(ok, "consumed-set threw");
+        require(ret.length == 32, "consumed-set absent");
+        return abi.decode(ret, (uint256));
+    }
+
+    /**
+     * Diagnostic view: the raw outcome of the consumed-set staticcall, without reverting.
+     *
+     * `eth_call` cannot tell a missing precompile from a throwing one — both come back as `0x` — so
+     * probing 0x…24 directly is not a usable instrument. This asks the question from inside the
+     * contract, where the distinction is visible:
+     *     ok=true,  len=32  the precompile is registered and answering
+     *     ok=false, len=0   registered, but it rejected the call
+     *     ok=true,  len=0   not registered at this address at all
+     */
+    function consumedSetProbe(bytes32 h) external view returns (bool ok, uint256 len, uint256 value) {
+        bytes memory ret;
+        (ok, ret) = CONSUMED.staticcall(abi.encodeWithSignature("isConsumed(bytes32)", h));
+        len = ret.length;
+        value = len == 32 ? abi.decode(ret, (uint256)) : 0;
+    }
+
+    /// Mark H consumed. The precompile refuses any caller but this contract, and refuses a second mark.
+    function _markConsumed(bytes32 h) internal {
+        (bool ok, ) = CONSUMED.call(abi.encodeWithSignature("markConsumed(bytes32)", h));
+        require(ok, "consumed-set: mark failed");
+    }
+
+    /**
+     * @custom:deprecated The pre-B6 consumed set: a marker at slot == H in THIS contract's storage.
+     *
+     * Kept, not deleted, so the regression test can still read the namespace the attack used and show
+     * it is no longer written. Nothing on the live path touches it, and no new code should: an
+     * attacker chooses H, so any read or write keyed on a raw H reintroduces the aliasing this
+     * contract was fixed to remove.
+     */
+    function legacyIsConsumed(bytes32 h) external view returns (bool) {
         uint256 v;
         assembly { v := sload(h) }
         return v != 0;
@@ -140,12 +284,10 @@ contract Settlement {
             }
         }
 
-        uint256 consumed;
-        assembly { consumed := sload(H) }
-        require(consumed == 0, "H already consumed");
+        require(_consumedMarker(H) == 0, "H already consumed");
 
         // effects before interactions: record H consumed up front (a reentrant settle for the same H reverts)
-        assembly { sstore(H, add(number(), 1)) }
+        _markConsumed(H);
 
         // deliver >= minOut of the output asset to the user
         if (outToken == address(0)) {
@@ -156,10 +298,10 @@ contract Settlement {
             _pay(msg.sender, excess); // best-effort refund — an unpayable solver cannot revert delivery
         } else {
             require(msg.value == 0, "no rbtc for token intent");
-            require(IERC20(outToken).transferFrom(msg.sender, user, minOut), "erc20 transfer failed");
+            _deliverToken(outToken, user, minOut);
         }
 
-        uint256 input = _releaseInput(btcTxid);
+        uint256 input = _releaseInput(btcTxid, H, user);
         emit Settled(H, user, outToken, minOut, input);
     }
 
@@ -195,9 +337,7 @@ contract Settlement {
         require(user != address(0), "bad intent");
         require(outToken == BTC_OUT, "not a btc-out intent");
         require(block.number < expiry, "expired");
-        uint256 consumed;
-        assembly { consumed := sload(H) }
-        require(consumed == 0, "H already consumed");
+        require(_consumedMarker(H) == 0, "H already consumed");
 
         // the window must not outlive the intent (Auction.sol:91 precedent) — otherwise an honest
         // reserver could be handed exclusivity it cannot possibly use, and forfeit at expiry (below)
@@ -227,9 +367,7 @@ contract Settlement {
         (address user, bytes32 H,, uint256 expiry,, address outToken) =
             abi.decode(ret, (address, bytes32, bytes32, uint256, uint256, address));
         require(outToken == BTC_OUT, "not a btc-out intent");
-        uint256 consumed;
-        assembly { consumed := sload(H) }
-        require(consumed == 0, "settled - reservation already resolved");
+        require(_consumedMarker(H) == 0, "settled - reservation already resolved");
         require(block.number >= expiry, "intent still live");
         ExitReservation storage r = exitReservations[H];
         require(r.solver != address(0), "no reservation");
@@ -269,8 +407,8 @@ contract Settlement {
         }
 
         _checkAndClaimBtcPayment(rawBtcTx, btcDest, minOut, btcBlockHash, merklePath, merkleHashes);
-        assembly { sstore(H, add(number(), 1)) }
-        uint256 input = _releaseInput(btcTxid);
+        _markConsumed(H);
+        uint256 input = _releaseInput(btcTxid, H, user);
         // best-effort bond refund: a reserver that cannot receive RBTC must not be able to brick its
         // own settle AFTER having paid real, irreversible BTC (the old "bond refund failed" footgun).
         _pay(msg.sender, bondBack);
@@ -291,9 +429,7 @@ contract Settlement {
         require(outToken == BTC_OUT, "not a btc-out intent");
         require(block.number < expiry, "expired");
         require(H == keccak256(abi.encodePacked("BTCOUT", btcDest, salt)), "dest not committed in H");
-        uint256 consumed;
-        assembly { consumed := sload(H) }
-        require(consumed == 0, "H already consumed");
+        require(_consumedMarker(H) == 0, "H already consumed");
     }
 
     /// SPV-verify the solver's BTC payout via the Bridge's header chain, find an unclaimed P2PKH output
@@ -312,13 +448,20 @@ contract Settlement {
             payTxid, btcBlockHash, merklePath, merkleHashes));
         require(okC && retC.length == 32, "confirmations call failed");
         require(abi.decode(retC, (int256)) >= MIN_BTC_CONF, "btc payout not confirmed");
+        require(_settlerOf(rawBtcTx) == msg.sender, "payout not committed to this settler");
         (uint256 voutIdx, ) = _findPayment(rawBtcTx, btcDest, minSats, payTxid);
         claimedBtcOut[keccak256(abi.encodePacked(payTxid, voutIdx))] = true;
     }
 
     /// Release the input to the solver — repayment + spread. Prefer the REAL peg-in credited to this
     /// contract (recorded by the Bridge at peg-in), falling back to the modelled depositForPegin escrow.
-    function _releaseInput(bytes32 btcTxid) internal returns (uint256 input) {
+    /// ENTRY BINDING: a bound modelled escrow answers only to the (intent, signer) pair it was
+    /// deposited for. A rival naming the same txid with its own H reverts here (B1), and so does a
+    /// rival carrying the victim's H under a different key (B5) — the binding includes the signer,
+    /// which the rival cannot forge because settlement recovers it from the signature.
+    /// The REAL-pegin branch cannot carry a binding today (the OP_RETURN has no room for it) — that
+    /// path keeps the B1 exposure by construction and is exactly what RSKIP176 derivation replaces.
+    function _releaseInput(bytes32 btcTxid, bytes32 h, address signer) internal returns (uint256 input) {
         (bool ok2, bytes memory raw) = BRIDGE.staticcall(abi.encodeWithSignature("getPeginInfo(bytes32)", btcTxid));
         if (ok2 && raw.length >= 128 && !claimedPegin[btcTxid]) {
             bytes memory info = abi.decode(raw, (bytes)); // Bridge returns BYTES wrapping 64 bytes
@@ -331,8 +474,13 @@ contract Settlement {
             }
         }
         if (input == 0) {
-            input = pegin[btcTxid];
-            if (input > 0) pegin[btcTxid] = 0;
+            uint256 esc = pegin[btcTxid];
+            if (esc > 0) {
+                bytes32 bound = peginIntent[btcTxid];
+                require(bound == bytes32(0) || bound == bindingOf(h, signer), "input escrow bound to another intent");
+                input = esc;
+                pegin[btcTxid] = 0;
+            }
         }
         _pay(msg.sender, input); // best-effort — an unpayable claimant's input waits as a credit
     }
@@ -352,6 +500,7 @@ contract Settlement {
             o += sl + 4;                              // scriptSig + sequence
         }
         (n, o) = _varint(t, o);                       // outputs
+        require(n <= MAX_PAYOUT_OUTPUTS, "payout too wide");
         for (uint256 i = 0; i < n; i++) {
             uint256 value = 0;
             for (uint256 j = 0; j < 8; j++) { value |= uint256(uint8(t[o + j])) << (8 * j); } // LE sats
@@ -368,6 +517,36 @@ contract Settlement {
             o += sl;
         }
         revert("no unclaimed payout to dest");
+    }
+
+    /**
+     * The RSK address this payout commits to, read from its OP_RETURN settler commitment:
+     * OP_RETURN (0x6a) PUSH24 (0x18) "RSKX" <20-byte address> = a 26-byte scriptPubKey.
+     * Reverts if the payout carries no such output — an uncommitted payout is unclaimable, which is
+     * exactly what stops a hijacker replaying someone else's proof.
+     */
+    function _settlerOf(bytes calldata t) internal pure returns (address settler) {
+        uint256 o = 4;                                // skip version
+        uint256 n;
+        (n, o) = _varint(t, o);                       // inputs
+        for (uint256 i = 0; i < n; i++) {
+            o += 36;
+            uint256 sl;
+            (sl, o) = _varint(t, o);
+            o += sl + 4;
+        }
+        (n, o) = _varint(t, o);                       // outputs
+        require(n <= MAX_PAYOUT_OUTPUTS, "payout too wide");
+        for (uint256 i = 0; i < n; i++) {
+            o += 8;                                   // value
+            uint256 sl;
+            (sl, o) = _varint(t, o);
+            if (sl == 26 && t[o] == 0x6a && t[o + 1] == 0x18 && bytes4(t[o + 2:o + 6]) == SETTLER_TAG) {
+                return address(bytes20(t[o + 6:o + 26]));
+            }
+            o += sl;
+        }
+        revert("payout carries no settler commitment");
     }
 
     function _varint(bytes calldata t, uint256 o) internal pure returns (uint256 v, uint256 no) {

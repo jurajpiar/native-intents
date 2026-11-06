@@ -17,6 +17,12 @@ export const AUCTION_ADDR = "0x0000000000000000000000000000000001000022";
 
 /** RSK Bridge precompile (peg-in / SPV) */
 export const BRIDGE_ADDR = "0x0000000000000000000000000000000001000006";
+/**
+ * Consumed-set precompile: isConsumed(bytes32) / markConsumed(bytes32). Owns the set at its own
+ * address under a domain-tagged key, so no contract mapping shares its namespace — the B6 fix.
+ * Only the settlement contract may mark.
+ */
+export const CONSUMED_SET_ADDR = "0x0000000000000000000000000000000001000024";
 
 /** zero address == native RBTC output */
 export const RBTC = "0x0000000000000000000000000000000000000000";

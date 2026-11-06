@@ -12,21 +12,21 @@
  *          are blocked (PoisonToken) cannot block the higher bid; its refund becomes creditToken,
  *          recovered via withdrawToken once unblocked. The auction still executes: user gets the
  *          best bid in tokens.
- *  part 4: EXECUTE AFTER DECAY — exclusivity decay (F3) reopens direct settlement but execute()
- *          remains valid until H is consumed: a post-decay execute still pays the user the BEST BID,
+ *  part 4: TIME ALONE DOES NOT DECAY EXCLUSIVITY — waiting past deadline + GRACE with nobody
+ *          executing leaves the lock intact, and execute() still pays the user the BEST BID,
  *          not minOut.
  *  part 5: RECLAIM AT EXPIRY — a bid-upon intent that expires unexecuted returns its escrow via
  *          reclaim() on the expiry condition (E17/E18 only ever exercised the H-consumed condition).
  *
  * Falsifier: delivery reverts on an unpayable solver's refund, a credited amount cannot be withdrawn
- * (or withdraws twice), a blocked-token refund blocks the outbid or vanishes, a post-decay execute
+ * (or withdraws twice), a blocked-token refund blocks the outbid or vanishes, a slow auction decays
  * pays minOut instead of the bid (or reverts), or the expiry reclaim loses escrow.
  *
  * Needs the E21 genesis (Settlement credit ledger + hardened auction): down -v + rebuild if the probe fails.
  */
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
-import { depositForPegin, settlementCreditOf } from "../src/settlement.js";
-import { auction, placeBid, placeBidToken, executeAuction, reclaimBid, bidOf, lockedUntil, withdrawCredit, creditOf } from "../src/auction.js";
+import { depositForPegin, settlementCreditOf, bindingOf } from "../src/settlement.js";
+import { auction, placeBid, placeBidToken, executeAuction, reclaimBid, bidOf, lockedUntil, failedAtOf, withdrawCredit, creditOf } from "../src/auction.js";
 import { Report, preflight, requireSettlement, rpcA, fundAccount, waitReceipt, succeeded, reverted } from "./_harness.js";
 import { AUCTION_ADDR, CHAIN_ID, COW_KEY, RBTC, SETTLEMENT_ADDR } from "../src/config.js";
 import { waitFor } from "../src/client.js";
@@ -64,9 +64,9 @@ async function main(): Promise<number> {
   /** fresh rbtc intent with escrow deposited and raw tx broadcast */
   async function freshRbtc(expiryBlocks: number, outputToken: string = RBTC) {
     const btcTxid = getBytes(randomBytes(32));
-    await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT));
     const user = freshWallet();
     const H = randomH();
+    await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, bindingOf(H, user.address)));
     const intent = buildIntent(user, { H, btcTxid, expiry: (await rpcA.blockNumber()) + expiryBlocks, minOut: MINOUT, outputToken });
     await rpcA.sendRaw(intent.rawHex);
     return { user, H, intent };
@@ -139,16 +139,24 @@ async function main(): Promise<number> {
   r.check("p3: auction still executes over all of it", succeeded(await waitReceipt(rpcA, await executeAuction(a1, p3.intent.rawHex))));
   r.check("p3: user received the best bid in tokens", (await poison.balanceOf(p3.user.address)) === BID2);
 
-  // ---- part 4: execute AFTER decay still pays the best bid ----
+  // ---- part 4: a slow auction is not a decayed one, and it still pays the best bid ----
+  //
+  // This part asserted the reverse until exclusivity stopped decaying on elapsed time: waiting out
+  // deadline + GRACE used to release the intent for direct settlement at minOut, which is exactly the
+  // lever a block producer pulled to take an auctioned intent at the floor (attack M3). Decay now
+  // keys on execute() being SEEN to fail, so simply being slow changes nothing — and the user gets
+  // the price the auction found rather than their floor.
   const p4 = await freshRbtc(60);
   const BID = MINOUT + 300_000_000_000_000n;
   await waitReceipt(rpcA, await placeBid(a1, p4.intent.rawHex, BID));
   const b4 = await bidOf(a1, p4.H);
   const grace: bigint = await (a1 as Contract).GRACE();
-  console.log(`p4: waiting past deadline + GRACE (block ${b4.deadline + grace})…`);
+  console.log(`p4: waiting past deadline + GRACE (block ${b4.deadline + grace}) with nobody executing…`);
   await waitFor(async () => BigInt(await rpcA.blockNumber()) >= b4.deadline + grace, 90000, 1000);
-  r.check("p4: lock decayed", (await lockedUntil(a1, p4.H)) === 0n);
-  r.check("p4: execute still valid post-decay", succeeded(await waitReceipt(rpcA, await executeAuction(a1, p4.intent.rawHex))));
+  r.check("p4: the lock did NOT decay — nothing failed, so nothing was released",
+    (await lockedUntil(a1, p4.H)) === b4.deadline, `lockedUntil=${await lockedUntil(a1, p4.H)}`);
+  r.check("p4: and no failure is on record", (await failedAtOf(a1, p4.H)) === 0n);
+  r.check("p4: execute still valid long after the window", succeeded(await waitReceipt(rpcA, await executeAuction(a1, p4.intent.rawHex))));
   r.check("p4: user got the BEST BID, not minOut", BigInt(await rpcA.getBalance(p4.user.address)) === BID);
   r.check("p4: winner's input credited for sweep", (await creditOf(a1, cow.address)) >= INPUT);
   await waitReceipt(rpcA, await withdrawCredit(a1)); // tidy the ledger for part 5's balance check

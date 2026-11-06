@@ -32,6 +32,7 @@ pragma solidity 0.8.19;
  */
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
+    function balanceOf(address who) external view returns (uint256);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function approve(address spender, uint256 amount) external returns (bool);
 }
@@ -48,6 +49,16 @@ contract Auction {
     uint256 public constant WINDOW = 10; // blocks of bidding after the first bid
     uint256 public constant GRACE = 10;  // blocks after the deadline before exclusivity decays
     uint256 constant PUSH_GAS = 30_000; // stipend for best-effort pushes (surplus, outbid refunds)
+    /**
+     * Floor on the gas execute() must be given, so the settle it wraps cannot be starved.
+     *
+     * EIP-150 forwards 63/64 of the remaining gas to a call, keeping 1/64 for the caller. Without a
+     * floor, anyone could call execute() with just enough gas that the inner settle dies OOG while the
+     * catch block still runs — recording a "failure" against a perfectly healthy auction and decaying
+     * its exclusivity early. Requiring a floor well above a real settle (~150k observed; execute ~246k
+     * end to end) means the inner call always receives more than it can spend.
+     */
+    uint256 public constant MIN_EXECUTE_GAS = 500_000;
 
     struct Bid {
         address bidder;    // current best bidder
@@ -59,6 +70,10 @@ contract Auction {
     }
     mapping(bytes32 => Bid) public bids;
 
+    /// Block at which execute() was first OBSERVED to fail for H. Zero means never attempted, or
+    /// attempted and succeeded. Exclusivity decays from this, not from the bidding deadline.
+    mapping(bytes32 => uint256) public failedAt;
+
     /// Pull-payment ledgers. `credit` is native RBTC owed; `creditToken` is token => payee => amount.
     /// Credits are backed 1:1 by RBTC/tokens already held by this contract when they are recorded.
     mapping(address => uint256) public credit;
@@ -67,6 +82,10 @@ contract Auction {
     event BidPlaced(bytes32 indexed h, address indexed bidder, uint256 amount, uint256 deadline);
     event Executed(bytes32 indexed h, address indexed winner, uint256 paidToUser, uint256 inputToWinner);
     event Reclaimed(bytes32 indexed h, address indexed bidder, uint256 amount);
+    /// execute() ran and the settlement inside it reverted. The auction keeps the intent for GRACE
+    /// more blocks, then releases it. Emitted rather than reverted, because a revert would roll the
+    /// record back and there would be nothing to decay from.
+    event ExecuteFailed(bytes32 indexed h, uint256 atBlock);
     event Credited(address indexed payee, address indexed token, uint256 amount);
     event Withdrawn(address indexed payee, address indexed token, uint256 amount);
 
@@ -79,15 +98,32 @@ contract Auction {
     /// Nonzero (the bidding deadline) while an auction for H is open — i.e. bid upon and not yet
     /// executed/reclaimed. Settlement (genesis deployment only) consults this and, while nonzero,
     /// rejects settle() from anyone but this contract; 0 means no lock.
-    /// DECAY: exclusivity is time-bounded. If execute() has not landed within GRACE blocks of the
-    /// deadline, this returns 0 and direct settlement reopens at minOut. Deliberately a pure view-time
-    /// rule (no new write path): releasing the lock on OBSERVED settle failure instead would require
-    /// try/catch in execute(), and EIP-150's 63/64 rule would then let anyone under-gas execute() so
-    /// the inner settle dies OOG while the catch still runs — aborting a healthy auction.
+    /**
+     * DECAY: exclusivity ends GRACE blocks after execute() was SEEN TO FAIL — not GRACE blocks after
+     * the deadline.
+     *
+     * The earlier rule decayed on elapsed time alone, which handed the intent to whoever controlled
+     * block production: decline to include execute(), wait out the grace window, and settle directly
+     * at minOut around a higher standing bid (attack M3). Worse, for an RBTC intent that path had no
+     * legitimate use at all — the auction holds the winning bid, so the settle inside execute() cannot
+     * fail for want of funds, and the only party who ever reached a time-based decay was one who chose
+     * not to execute.
+     *
+     * Keyed on demonstrated failure, a producer that withholds execute() decays nothing and can settle
+     * nothing: the attack stops paying. The S4 property it was introduced for survives — a genuinely
+     * wedged auction still releases the intent — but someone must first call execute() and have it
+     * fail, which any solver wanting the intent back has every reason to do.
+     *
+     * The trade this makes, stated plainly: the user's old fallback of "minOut after GRACE, whatever
+     * happens" becomes "the best bid, or nothing until expiry". That is the better bargain only
+     * because withholding execute() now gains the withholder nothing, so there is no longer a reason
+     * to withhold it beyond censorship for its own sake.
+     */
     function lockedUntil(bytes32 h) external view returns (uint256) {
         Bid storage b = bids[h];
         if (b.deadline == 0 || b.settledHere) return 0;
-        if (block.number >= b.deadline + GRACE) return 0; // exclusivity decayed
+        uint256 f = failedAt[h];
+        if (f != 0 && block.number >= f + GRACE) return 0; // exclusivity decayed after a real failure
         return b.deadline;
     }
 
@@ -151,7 +187,14 @@ contract Auction {
         (, bytes32 H, uint256 expiry, uint256 minOut, address outToken) = parse(rawIntentTx);
         require(outToken != address(0), "use bid for rbtc outputs");
         (address prev, uint256 prevAmt) = _book(H, expiry, minOut, outToken, amount);
+        // Measure what ARRIVED, not what the token claims — the same rule the settlement's delivery
+        // uses. A fee-on-transfer token would otherwise let a bidder register a bid of `amount` while
+        // escrowing less, and the auction would owe the user a price it is not holding. Requiring the
+        // delta to be exact (rather than crediting the received amount) keeps one rule across both
+        // contracts: a token that skims cannot be an intent's output asset anywhere.
+        uint256 held = IERC20(outToken).balanceOf(address(this));
         require(IERC20(outToken).transferFrom(msg.sender, address(this), amount), "bid escrow failed");
+        require(IERC20(outToken).balanceOf(address(this)) - held == amount, "bid escrow short");
         if (prev != address(0)) {
             // best-effort refund, credited on failure — see bid() above.
             (bool s, bytes memory rd) = outToken.call(
@@ -172,14 +215,20 @@ contract Auction {
         Bid storage b = bids[H];
         require(b.deadline != 0 && !b.settledHere, "no open auction");
         require(block.number >= b.deadline, "bidding still open");
-        b.settledHere = true;                          // effect first
+        // See MIN_EXECUTE_GAS: without this floor, an under-gassed call could make the settle below
+        // die OOG while the catch still runs, recording a failure against a healthy auction.
+        require(gasleft() >= MIN_EXECUTE_GAS, "execute needs more gas");
+        b.settledHere = true;                          // effect first; undone by _noteFailure
 
         uint256 balBefore = address(this).balance;
         uint256 inputClaimed;
         uint256 surplus = b.amount - minOut;
         if (b.outToken == address(0)) {
-            ISettlement(SETTLEMENT).settle{value: minOut}(rawIntentTx);
-            inputClaimed = address(this).balance - (balBefore - minOut);
+            try ISettlement(SETTLEMENT).settle{value: minOut}(rawIntentTx) {
+                inputClaimed = address(this).balance - (balBefore - minOut);
+            } catch {
+                return _noteFailure(H, b);
+            }
             if (surplus > 0) {
                 // best-effort push (gas-capped, require-free): an unpayable or gas-burning user
                 // cannot revert execute(); their surplus falls back to a pull-payment credit.
@@ -191,8 +240,14 @@ contract Auction {
             }
         } else {
             require(IERC20(b.outToken).approve(SETTLEMENT, minOut), "approve failed");
-            ISettlement(SETTLEMENT).settle(rawIntentTx);
-            inputClaimed = address(this).balance - balBefore;
+            try ISettlement(SETTLEMENT).settle(rawIntentTx) {
+                inputClaimed = address(this).balance - balBefore;
+            } catch {
+                // The allowance granted just above survives the failed attempt. That is harmless:
+                // Settlement only ever pulls from its own caller, so this allowance is reachable only
+                // when THIS contract calls settle — i.e. from a later execute() for this same intent.
+                return _noteFailure(H, b);
+            }
             if (surplus > 0) {
                 // require-free push: a token that reverts or returns false on transfer-to-user
                 // (e.g. ERC-777 hooks) downgrades to a credit instead of bricking the auction.
@@ -212,6 +267,23 @@ contract Auction {
             emit Credited(b.bidder, address(0), inputClaimed);
         }
         emit Executed(H, b.bidder, minOut + surplus, inputClaimed);
+    }
+
+    /**
+     * Record that the settlement inside execute() reverted, and hand the auction back its open state.
+     *
+     * execute() returns NORMALLY on this path rather than reverting, which is the only way the record
+     * can survive — a revert would roll `failedAt` back and leave nothing to decay from. The caller
+     * therefore pays gas for a transaction that changed little; `settledHere` staying false and the
+     * ExecuteFailed event are what tell them (and any watcher) what happened.
+     *
+     * Only the FIRST failure counts. Otherwise repeated calls would keep pushing the decay away, and
+     * anyone could hold an intent hostage by re-failing it once per block.
+     */
+    function _noteFailure(bytes32 H, Bid storage b) internal {
+        b.settledHere = false;                         // the auction is still open for a retry
+        if (failedAt[H] == 0) failedAt[H] = block.number;
+        emit ExecuteFailed(H, failedAt[H]);
     }
 
     /// Claim accrued native-RBTC credits (winner input, fallen-back surplus). Effects-first, so a

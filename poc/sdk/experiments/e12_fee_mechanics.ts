@@ -14,7 +14,7 @@
 import { buildIntent, freshWallet, isConsumed, randomH } from "../src/intent.js";
 import { Solver } from "../src/solver.js";
 import { deployToken, token, mint, approve, balanceOf } from "../src/token.js";
-import { depositForPegin, peginOf } from "../src/settlement.js";
+import { depositForPegin, peginOf, bindingOf } from "../src/settlement.js";
 import { Report, preflight, requireSettlement, rpcA, waitReceipt, succeeded } from "./_harness.js";
 import { cowWallet, SETTLEMENT_ADDR } from "../src/config.js";
 import { getBytes, hexlify, randomBytes } from "ethers";
@@ -34,13 +34,12 @@ async function main(): Promise<number> {
   await waitReceipt(rpcA, await mint(cowToken, cowWallet().address, MINOUT * 10n));
   await waitReceipt(rpcA, await approve(cowToken, SETTLEMENT_ADDR, MINOUT * 10n));
 
-  // model the peg-in: escrow INPUT rbtc for a unique btcTxid (ticket off, so any txid is fine)
+  // model the peg-in: escrow INPUT rbtc for a unique btcTxid, BOUND to the intent's H (sign-first)
   const btcTxid = getBytes(randomBytes(32));
-  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT));
-  r.check("input escrowed for the peg-in", (await peginOf(rpcA.url, hexlify(btcTxid))) === INPUT);
-
   const user = freshWallet();
   const H = randomH();
+  await waitReceipt(rpcA, await depositForPegin(rpcA.url, hexlify(btcTxid), INPUT, bindingOf(H, user.address)));
+  r.check("input escrowed for the peg-in", (await peginOf(rpcA.url, hexlify(btcTxid))) === INPUT);
   const height = await rpcA.blockNumber();
   const intent = buildIntent(user, { H, btcTxid, expiry: height + 95, minOut: MINOUT, outputToken: tokenAddr });
   await rpcA.sendRaw(intent.rawHex);

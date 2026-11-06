@@ -49,11 +49,28 @@ export function encodeIntentData(p: IntentParams): Uint8Array {
 }
 
 /** Build and sign an intent with a fresh key (SDK derives a new address per intent — see README). */
+/**
+ * Sign an intent over ARBITRARY data bytes, skipping encodeIntentData's 160-byte assert.
+ *
+ * Only the red-team board needs this: admission's length rule is a node-side check, and an attacker
+ * hand-rolls its bytes rather than going through an SDK. Everything else about the envelope stays
+ * canonical, so a rejection can only be the payload's length or content — see attacks/a5.
+ */
+export function buildRawIntent(signer: SigningKey | BaseWallet, data: Uint8Array, opts: { nonce?: number; gasLimit?: number } = {}): BuiltIntent {
+  return buildIntentFromData(signer, data, opts.nonce ?? 0, opts.gasLimit ?? 100_000, new Uint8Array(32));
+}
+
 export function buildIntent(signer: SigningKey | BaseWallet, p: IntentParams): BuiltIntent {
-  const sk = signer instanceof SigningKey ? signer : new SigningKey(signer.privateKey);
   const nonce = p.nonce ?? 0;
   const gasLimit = p.gasLimit ?? 100_000;
   const data = encodeIntentData(p);
+  return buildIntentFromData(signer, data, nonce, gasLimit, p.H);
+}
+
+function buildIntentFromData(
+  signer: SigningKey | BaseWallet, data: Uint8Array, nonce: number, gasLimit: number, H: Uint8Array,
+): BuiltIntent {
+  const sk = signer instanceof SigningKey ? signer : new SigningKey(signer.privateKey);
 
   const fields = [
     encNonce(nonce),
@@ -82,7 +99,7 @@ export function buildIntent(signer: SigningKey | BaseWallet, p: IntentParams): B
   // Recover from the signature (not from the privkey) so `sender` reflects exactly what rskj's
   // verify() will recover. If the encoding were wrong, this would not equal the signer.
   const sender = recoverAddress(sigHash, { r: sig.r, s: sig.s, yParity: sig.yParity });
-  return { rawHex, hash: keccak256(signed), sender, sigHash, H: p.H, data };
+  return { rawHex, hash: keccak256(signed), sender, sigHash, H, data };
 }
 
 // --- settlement helpers ---
