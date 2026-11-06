@@ -45,7 +45,8 @@
     "e23": "tsx experiments/e23_entry_binding.ts",
     "e24": "tsx experiments/e24_mempool_sourced_settlement.ts",
     "m01": "tsx measure/m01_admission_staircase.ts",
-    "measure": "tsx measure/m01_admission_staircase.ts"
+    "measure": "tsx measure/m01_admission_staircase.ts",
+    "m02": "tsx measure/m02_p2p_flood.ts"
   },
   "dependencies": {
     "ethers": "^6.13.0"

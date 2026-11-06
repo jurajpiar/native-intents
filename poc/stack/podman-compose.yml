@@ -11,6 +11,10 @@
 #   rskj-a    patched rskj, mines regtest blocks, RPC on host :4444
 #   rskj-b    patched rskj, non-mining peer of A, RPC on host :4445 (gossip half of claim 1)
 #
+# INTENT_SPAN_A / INTENT_SPAN_B set each node's expiry horizon (default 100 blocks). The horizon is node
+# configuration, not consensus (RSKIP: Expiry horizon), so the two may differ; M02 relies on that.
+# B_JAVA_OPTS adds JVM system properties to node B only (M02's cost mode lifts B's per-peer message limits).
+#
 # INTENT_OPTS default requires a BTC ticket. For the pure pre-inclusion experiments (E1/E2/E3)
 # set -Dintent.requireBtcTicket=false (already done for both nodes below); flip to true for E8.
 
@@ -44,7 +48,7 @@ services:
     environment:
       RSK_CONF: /config/node-a.conf
       JVM_OPTS: "-Xmx2g"
-      INTENT_OPTS: "-Dintent.requireBtcTicket=${INTENT_REQUIRE_TICKET:-false} -Dintent.maxExpirySpan=100"
+      INTENT_OPTS: "-Dintent.requireBtcTicket=${INTENT_REQUIRE_TICKET:-false} -Dintent.maxExpirySpan=${INTENT_SPAN_A:-100}"
     ports:
       - "4444:4444"
     networks:
@@ -60,7 +64,7 @@ services:
     environment:
       RSK_CONF: /config/node-b.conf
       JVM_OPTS: "-Xmx2g"
-      INTENT_OPTS: "-Dintent.requireBtcTicket=${INTENT_REQUIRE_TICKET:-false} -Dintent.maxExpirySpan=100"
+      INTENT_OPTS: "-Dintent.requireBtcTicket=${INTENT_REQUIRE_TICKET:-false} -Dintent.maxExpirySpan=${INTENT_SPAN_B:-100} ${B_JAVA_OPTS:-}"
     ports:
       - "4445:4444"
     networks:

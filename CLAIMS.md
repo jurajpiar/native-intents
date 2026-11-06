@@ -41,7 +41,7 @@ number changes.
 | 5 | Escrow answers only to the `(H, signer)` pair it was deposited for | demonstrated | `b1`, `b5`, `e23` |
 | 6 | The anti-spam ticket bounds entry, not volume — one peg-in admits unlimited intents | measured (41 intents, 1 ticket) | `a6` |
 | 6b | A chosen `H` cannot write into the settlement contract's own storage | **demonstrated, after a fix** — the attack landed first, then was closed by moving the consumed set to a precompile | `b6` |
-| 7 | Rejection is cheap enough that free admission is not a DoS surface | **asserted** — `m01` measures the RPC path only, not the p2p path an attacker would use | `m01` |
+| 7 | Rejection is cheap enough that free admission is not a DoS surface | measured on the p2p path, verdict **not drawn**: see [M02](#m02-the-peer-to-peer-path) | `m01`, `m02` |
 | 8 | Verifying a Bitcoin merkle branch at admission would be marginal next to work already done per intent | denominator **measured**, numerator **asserted** | `m01` run 2026-09-04T07-40-30Z |
 | 9 | The mempool gives *common* discovery, so no single dApp becomes the liveness provider | **asserted** | no multi-solver-over-gossip run exists |
 | 10 | Contracts cannot provide payer-less admission or pre-inclusion invalidity | **asserted** | ERC-4337 is a counter-case the spec names but does not measure against |
@@ -119,6 +119,51 @@ Three findings that were not the point of the run:
   common to both — gives 140, 242, 188, 206, 191, 33, 238, 254 µs across the run. That scatter is
   larger than any trend in it. Within this range and resolution insertion looks flat; it is not
   evidence of O(1), because 550 entries is a small pool and the noise is ±100 µs. Row 23, partially.
+
+### M02: the peer-to-peer path
+
+Source: `measurements/m02_p2p_flood.staircase.2026-11-06T17-41-18-762Z.jsonl`,
+`measurements/m02_p2p_flood.cost.2026-11-06T18-08-13-904Z.jsonl`, and node B's log for each
+(`measurements/m02-rskj-b-staircase.log`, `m02-rskj-b-cost.log`). Regtest, two nodes; intents are sent
+to node A over RPC, which admits them and gossips them to node B; B is measured. B runs a narrower
+expiry horizon than A (30 against 100 blocks), so A relays intents B must refuse. Container CPU of B,
+read from its cgroup. Harness: `poc/sdk/measure/m02_p2p_flood.ts`, whose header records the two
+attempts that did not measure what they were built for, and why.
+
+| What | Value | How |
+|---|---|---|
+| B's CPU per intent refused at admission (rule 4) | **2.3 ms** (2.15, 2.28, 2.32) | cost mode, 3 rounds × 3,000 intents at 50/s, idle subtracted |
+| B's CPU per intent admitted | **2.8 ms** (2.64, 2.83, 2.91) | same |
+| B's p2p processing rate when backlogged | 75–100 intents/s | B's log timestamps, two bursts of 1,500 |
+| rskj's default per-peer limit | 1,000 messages a minute | source: `peer.messageQueue.thresholdPerMinutePerPeer`, `Stats.update`, `NodeMessageHandler.allowByScore` |
+| Rate through one relaying peer at which B starts muting it | between 15 and 20 intents/s | staircase: lag ≤ 1 block at 5, 10, 15/s; 11, 28, 43 blocks at 20, 30, 60/s |
+| Pool residency of an admitted intent on a default node | 10 blocks | source: `transaction.outdated.threshold`; cost mode pool plateau 443–470 at 50/s |
+
+**What it shows.**
+
+- **A relaying peer is muted, not overloaded.** Above 1,000 messages in a calendar minute, rskj gives the
+  sending peer score −1 and drops every message from it for the rest of the minute, blocks included.
+  A relays each RPC-submitted intent as its own message, so about 17 intents/s through one honest node
+  is enough. B's log shows block imports stopping for 12, 28 and 44 s and resuming exactly on minute
+  boundaries, and B accepting just under 1,000 intents per minute. The limit is rskj's general
+  defence, not intent-specific; what is intent-specific is that the flood costs the sender nothing.
+- **Per-intent cost on the receiving node is ~2.3 ms of CPU**, about four times the RPC path's 0.54 ms
+  of signature work (M01). It is container CPU for everything B does per received intent: message
+  handling, peer scoring, the per-account quota (each intent's fresh key creates a quota entry), admission
+  and DEBUG-level file logging. It is not admission alone, and logging may be a large share of it.
+- **Admitting costs ~0.5 ms more than refusing**, the direction the pre-inclusion argument wants.
+- **An admitted intent leaves a default node's pool after 10 blocks**, whatever its `E`. On mainnet that
+  is about five minutes, against an expiry horizon of up to 100 blocks.
+
+**What it cannot show.** A is the attacker's entry point, so rates are what an RPC-only attacker gets
+through one honest node. A wire-protocol flooder could batch intents per message, which changes how fast
+the per-peer message limit is reached. B had one peer; a real node with many loses only the muted
+peer's blocks. The 2.3 ms comes from one machine (Apple M4 Pro, podman) and three rounds. Whether these
+costs make free admission acceptable is the judgement this file leaves to a person, on the record.
+
+**Unexplained.** In the staircase run, B imported no blocks for 85 s ending 17:29:02, between an aborted
+attempt and the rerun, outside any measured step. In the first burst-mode cost attempt, a canary sent
+after the burst was not visible at B within 30 s although B's log shows the burst arriving.
 
 ## Costs nobody has measured
 
